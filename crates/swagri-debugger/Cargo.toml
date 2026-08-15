@@ -12,3 +12,6 @@ anyhow.workspace = true
 eframe.workspace = true
 egui_plot.workspace = true
 sysinfo.workspace = true
+rfd.workspace = true
+semver.workspace = true
+webbrowser.workspace = true

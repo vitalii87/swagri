@@ -18,6 +18,10 @@ pub fn execute(request: TaskRequest) -> TaskResponse {
     }
 
     let result = match request.task {
+        Task::NodeInfo => TaskResult::NodeInfo {
+            agent_version: env!("CARGO_PKG_VERSION").into(),
+            protocol_version: 1,
+        },
         Task::Echo { message } => TaskResult::Echo { message },
         Task::Sum { values } => TaskResult::Sum {
             value: values.into_iter().sum(),
@@ -90,6 +94,21 @@ mod tests {
         assert!(matches!(
             response.outcome,
             TaskOutcome::Failure { ref code, .. } if code == "invalid_task"
+        ));
+    }
+
+    #[test]
+    fn reports_agent_version() {
+        let response = execute(TaskRequest {
+            id: "info-1".into(),
+            task: Task::NodeInfo,
+        });
+
+        assert!(matches!(
+            response.outcome,
+            TaskOutcome::Success {
+                result: TaskResult::NodeInfo { ref agent_version, protocol_version: 1 }
+            } if agent_version == env!("CARGO_PKG_VERSION")
         ));
     }
 }

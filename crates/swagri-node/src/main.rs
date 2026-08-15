@@ -15,7 +15,7 @@ use libp2p::{
     request_response::{self, ProtocolSupport},
     swarm::{NetworkBehaviour, SwarmEvent},
 };
-use swagri_core::{TASK_PROTOCOL_V1, Task, TaskRequest, TaskResponse};
+use swagri_core::{TASK_PROTOCOL_V1, Task, TaskOutcome, TaskRequest, TaskResponse, TaskResult};
 use swagri_executor::execute;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
@@ -128,6 +128,10 @@ async fn main() -> Result<()> {
     println!("Swagri agent '{}'", args.name);
     println!("Peer ID: {local_peer_id}");
     println!("Identity: {}", identity_path.display());
+    emit_event(
+        "STARTED",
+        &[&local_peer_id.to_string(), env!("CARGO_PKG_VERSION")],
+    );
     print_help();
 
     loop {
@@ -219,7 +223,10 @@ fn build_swarm(
 
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_env_filter(filter)
+        .init();
 }
 
 fn load_or_create_identity(path: &Path) -> Result<identity::Keypair> {
@@ -257,13 +264,24 @@ fn handle_swarm_event(
     match event {
         SwarmEvent::NewListenAddr { address, .. } => {
             println!("Listening on {address}");
+            emit_event("LISTENING", &[&address.to_string()]);
         }
         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
             known_peers.entry(peer_id).or_default();
             info!(peer = %peer_id, "peer connected");
+            emit_event("PEER_CONNECTED", &[&peer_id.to_string()]);
         }
         SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
             info!(peer = %peer_id, ?cause, "peer disconnected");
+            emit_event("PEER_DISCONNECTED", &[&peer_id.to_string()]);
+        }
+        SwarmEvent::OutgoingConnectionError {
+            peer_id: Some(peer_id),
+            error,
+            ..
+        } => {
+            warn!(peer = %peer_id, %error, "peer connection failed");
+            emit_event("PEER_FAILED", &[&peer_id.to_string(), &error.to_string()]);
         }
         SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
             for (peer_id, address) in peers {
@@ -272,7 +290,17 @@ fn handle_swarm_event(
                     .entry(peer_id)
                     .or_default()
                     .insert(address.clone());
+                emit_event(
+                    "PEER_DISCOVERED",
+                    &[&peer_id.to_string(), &address.to_string()],
+                );
                 swarm.add_peer_address(peer_id, address);
+                if !swarm.is_connected(&peer_id) {
+                    match swarm.dial(peer_id) {
+                        Ok(()) => emit_event("PEER_CONNECTING", &[&peer_id.to_string()]),
+                        Err(error) => debug!(peer = %peer_id, %error, "automatic dial deferred"),
+                    }
+                }
             }
         }
         SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Expired(peers))) => {
@@ -287,7 +315,16 @@ fn handle_swarm_event(
             handle_request_response(event, completed_tx);
         }
         SwarmEvent::Behaviour(BehaviourEvent::Identify(event)) => {
-            debug!(?event, "identify event");
+            if let identify::Event::Received { peer_id, info, .. } = *event {
+                let version = info
+                    .agent_version
+                    .strip_prefix("swagri/")
+                    .and_then(|value| value.split_whitespace().next())
+                    .unwrap_or(&info.agent_version);
+                emit_event("PEER_VERSION", &[&peer_id.to_string(), version, "1"]);
+            } else {
+                debug!(?event, "identify event");
+            }
         }
         SwarmEvent::Behaviour(BehaviourEvent::Ping(event)) => {
             debug!(?event, "ping event");
@@ -321,6 +358,31 @@ fn handle_request_response(
             message: request_response::Message::Response { response, .. },
             ..
         } => {
+            if let TaskOutcome::Success {
+                result:
+                    TaskResult::NodeInfo {
+                        agent_version,
+                        protocol_version,
+                    },
+            } = &response.outcome
+            {
+                emit_event(
+                    "PEER_VERSION",
+                    &[
+                        &peer.to_string(),
+                        agent_version,
+                        &protocol_version.to_string(),
+                    ],
+                );
+            }
+            emit_event(
+                "TASK_RESULT",
+                &[
+                    &peer.to_string(),
+                    &response.id,
+                    &response.duration_ms.to_string(),
+                ],
+            );
             println!(
                 "Result from {peer}: id={} duration={}ms outcome={:?}",
                 response.id, response.duration_ms, response.outcome
@@ -333,6 +395,7 @@ fn handle_request_response(
             ..
         } => {
             warn!(peer = %peer, ?request_id, %error, "outbound task failed");
+            emit_event("TASK_FAILED", &[&peer.to_string(), &error.to_string()]);
         }
         request_response::Event::InboundFailure {
             peer,
@@ -369,7 +432,41 @@ fn handle_command(
         "help" => print_help(),
         "id" => println!("{local_peer_id}"),
         "peers" => print_peers(known_peers),
+        "connect" => {
+            match parse_peer(&mut parts).and_then(|peer| {
+                swarm
+                    .dial(peer)
+                    .context("could not start peer connection")?;
+                Ok(peer)
+            }) {
+                Ok(peer) => {
+                    println!("Connecting to {peer}...");
+                    emit_event("PEER_CONNECTING", &[&peer.to_string()]);
+                }
+                Err(error) => println!("Connection failed: {error:#}"),
+            }
+        }
+        "dial" => {
+            let result = parts
+                .next()
+                .context("dial requires a multiaddress")
+                .and_then(|value| value.parse::<Multiaddr>().context("invalid multiaddress"))
+                .and_then(|address| {
+                    swarm
+                        .dial(address.clone())
+                        .with_context(|| format!("could not dial {address}"))?;
+                    Ok(address)
+                });
+            match result {
+                Ok(address) => println!("Dialing {address}..."),
+                Err(error) => println!("Dial failed: {error:#}"),
+            }
+        }
         "quit" | "exit" => return false,
+        "info" => {
+            let result = parse_peer(&mut parts).map(|peer| (peer, Task::NodeInfo));
+            submit_parsed(result, swarm, local_peer_id, request_counter);
+        }
         "echo" => {
             let result = parse_peer(&mut parts).and_then(|peer| {
                 let message = parts.collect::<Vec<_>>().join(" ");
@@ -474,12 +571,23 @@ fn print_help() {
          help                              Show this help\n\
          id                                Print this node's peer ID\n\
          peers                             List discovered or connected peers\n\
+         connect <peer-id>                 Connect using a discovered address\n\
+         dial <multiaddr>                  Connect using an explicit address\n\
+         info <peer-id>                    Read the remote agent version\n\
          echo <peer-id> <text>             Return text from the remote node\n\
          sum <peer-id> <numbers...>         Sum finite numbers remotely\n\
          sha256 <peer-id> <text>            Hash text remotely\n\
          benchmark <peer-id> <iterations>   Run bounded synthetic CPU work\n\
          quit                              Stop the node"
     );
+}
+
+fn emit_event(kind: &str, fields: &[&str]) {
+    print!("SWAGRI_EVENT\t{kind}");
+    for field in fields {
+        print!("\t{}", field.replace(['\t', '\r', '\n'], " "));
+    }
+    println!();
 }
 
 #[cfg(test)]

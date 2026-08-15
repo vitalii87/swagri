@@ -33,10 +33,10 @@ jobs:
 
       - name: Create packages
         shell: pwsh
-        run: ./scripts/package-windows.ps1 -Version "0.1.0-alpha"
+        run: ./scripts/package-windows.ps1 -Version "0.2.0-alpha"
 
       - name: Upload packages
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: swagri-windows-x64
           path: |

@@ -27,6 +27,7 @@ pub struct TaskRequest {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Task {
+    NodeInfo,
     Echo { message: String },
     Sum { values: Vec<f64> },
     Sha256 { text: String },
@@ -36,6 +37,7 @@ pub enum Task {
 impl Task {
     pub fn kind(&self) -> TaskKind {
         match self {
+            Self::NodeInfo => TaskKind::NodeInfo,
             Self::Echo { .. } => TaskKind::Echo,
             Self::Sum { .. } => TaskKind::Sum,
             Self::Sha256 { .. } => TaskKind::Sha256,
@@ -70,6 +72,7 @@ impl Task {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskKind {
+    NodeInfo,
     Echo,
     Sum,
     Sha256,
@@ -88,6 +91,7 @@ impl Default for NodeCapabilities {
         Self {
             protocol_version: 1,
             task_kinds: vec![
+                TaskKind::NodeInfo,
                 TaskKind::Echo,
                 TaskKind::Sum,
                 TaskKind::Sha256,
@@ -141,10 +145,23 @@ pub enum TaskOutcome {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TaskResult {
-    Echo { message: String },
-    Sum { value: f64 },
-    Sha256 { digest_hex: String },
-    CpuBenchmark { checksum: u64, iterations: u64 },
+    NodeInfo {
+        agent_version: String,
+        protocol_version: u16,
+    },
+    Echo {
+        message: String,
+    },
+    Sum {
+        value: f64,
+    },
+    Sha256 {
+        digest_hex: String,
+    },
+    CpuBenchmark {
+        checksum: u64,
+        iterations: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]

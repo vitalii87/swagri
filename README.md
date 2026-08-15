@@ -93,6 +93,11 @@ benchmark <peer-id> 1000000
 Use `help` for all commands. If mDNS is unavailable, start a node with an
 explicit `--dial <multiaddr>` copied from the other node's listen output.
 
+The desktop Debugger provides buttons for discovery, connection testing,
+allowlisted sample tasks, version comparison, firewall help, and manual update
+installation. Agents automatically attempt a QUIC connection after mDNS
+discovery; advanced users can also use `connect`, `dial`, and `info` commands.
+
 ## Workspace
 
 ```text

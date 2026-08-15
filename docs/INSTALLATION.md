@@ -5,8 +5,9 @@ Swagri currently provides two Windows x64 applications.
 - **Swagri Agent** is the lightweight, headless peer for computers that donate
   resources. It contains no GUI.
 - **Swagri Debugger** is the desktop test console. Its package also contains an
-  agent, so it can start and control a local peer, display host CPU and memory,
-  stream logs, and send commands.
+  agent, so it can start and control a local peer, discover nearby agents,
+  test connections and tasks with buttons, compare versions, display host CPU
+  and memory, and provide an optional technical console.
 
 ## Ready-made packages
 
@@ -50,6 +51,19 @@ Tagged versions can later publish the same files as release assets.
 The Agent stores its identity in `%LOCALAPPDATA%\Swagri\identity.key`. Debugger
 uses `%LOCALAPPDATA%\Swagri\debugger.key`. Keep these files if the devices
 should retain their peer identities.
+
+## Updating test agents
+
+Version 0.2 agents exchange their versions after connecting. Debugger highlights
+when the selected peer is newer. Open **Updates** and use **Update from
+installer...** with an official `Swagri-Debugger-Setup-x64.exe`; Debugger stops
+its bundled agent, launches the installer, and closes so both executables can be
+replaced.
+
+Automatic peer-to-peer executable transfer remains disabled until Swagri has a
+signed update feed and trusted-peer enrollment. A peer may announce that a
+newer version exists, but an unauthenticated peer is never allowed to silently
+replace an executable. This boundary is intentional for the current LAN alpha.
 
 ## Build packages locally
 
