@@ -1,21 +1,29 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
+    fs::{self, File},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    process::Command,
     str::FromStr,
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use futures::StreamExt;
 use libp2p::{
     Multiaddr, PeerId, StreamProtocol, SwarmBuilder, identify, identity, mdns, ping,
     request_response::{self, ProtocolSupport},
     swarm::{NetworkBehaviour, SwarmEvent},
 };
-use swagri_core::{TASK_PROTOCOL_V1, Task, TaskOutcome, TaskRequest, TaskResponse, TaskResult};
+use semver::Version;
+use sha2::{Digest, Sha256};
+use swagri_core::{
+    MAX_UPDATE_BYTES, SignedUpdateManifest, TASK_PROTOCOL_V1, Task, TaskOutcome, TaskRequest,
+    TaskResponse, TaskResult, UPDATE_CHUNK_BYTES, UPDATE_PROTOCOL_V1, UpdateManifest,
+    UpdateRequest, UpdateResponse,
+};
 use swagri_executor::execute;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
@@ -50,6 +58,33 @@ struct Args {
     /// Timeout applied to outbound task requests.
     #[arg(long, default_value_t = 30)]
     request_timeout_seconds: u64,
+
+    /// Apply updates only from explicitly trusted peer IDs.
+    #[arg(long, value_enum, default_value_t = UpdatePolicy::Manual)]
+    update_policy: UpdatePolicy,
+
+    /// File containing peer IDs trusted to provide signed updates.
+    #[arg(long)]
+    update_trust: Option<PathBuf>,
+
+    /// Directory used for verified update downloads.
+    #[arg(long)]
+    update_staging: Option<PathBuf>,
+
+    /// Separate updater helper used to replace the running executable.
+    #[arg(long)]
+    updater: Option<PathBuf>,
+
+    /// Keep running when standard input is closed (used after self-update).
+    #[arg(long)]
+    daemon: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum UpdatePolicy {
+    Disabled,
+    Manual,
+    Automatic,
 }
 
 #[derive(NetworkBehaviour)]
@@ -57,6 +92,7 @@ struct Args {
 struct Behaviour {
     mdns: mdns::tokio::Behaviour,
     request_response: request_response::cbor::Behaviour<TaskRequest, TaskResponse>,
+    updates: request_response::cbor::Behaviour<UpdateRequest, UpdateResponse>,
     identify: identify::Behaviour,
     ping: ping::Behaviour,
 }
@@ -65,6 +101,7 @@ struct Behaviour {
 enum BehaviourEvent {
     Mdns(mdns::Event),
     RequestResponse(request_response::Event<TaskRequest, TaskResponse>),
+    Update(request_response::Event<UpdateRequest, UpdateResponse>),
     Identify(Box<identify::Event>),
     Ping(ping::Event),
 }
@@ -78,6 +115,12 @@ impl From<mdns::Event> for BehaviourEvent {
 impl From<request_response::Event<TaskRequest, TaskResponse>> for BehaviourEvent {
     fn from(event: request_response::Event<TaskRequest, TaskResponse>) -> Self {
         Self::RequestResponse(event)
+    }
+}
+
+impl From<request_response::Event<UpdateRequest, UpdateResponse>> for BehaviourEvent {
+    fn from(event: request_response::Event<UpdateRequest, UpdateResponse>) -> Self {
+        Self::Update(event)
     }
 }
 
@@ -98,14 +141,52 @@ struct CompletedResponse {
     response: TaskResponse,
 }
 
+struct UpdateSource {
+    path: PathBuf,
+    signed: SignedUpdateManifest,
+}
+
+struct PendingDownload {
+    peer: PeerId,
+    signed: SignedUpdateManifest,
+    path: PathBuf,
+    file: File,
+    received: u64,
+    apply_when_ready: bool,
+}
+
+struct UpdateManager {
+    policy: UpdatePolicy,
+    trust_path: PathBuf,
+    staging: PathBuf,
+    updater: PathBuf,
+    trusted: BTreeSet<PeerId>,
+    source: UpdateSource,
+    requested: Option<(PeerId, bool)>,
+    pending: Option<PendingDownload>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
     let args = Args::parse();
-    let identity_path = args.identity.unwrap_or_else(default_identity_path);
+    let identity_path = args.identity.clone().unwrap_or_else(default_identity_path);
     let keypair = load_or_create_identity(&identity_path)?;
     let local_peer_id = PeerId::from(keypair.public());
     let request_timeout = Duration::from_secs(args.request_timeout_seconds);
+    let trust_path = args
+        .update_trust
+        .clone()
+        .unwrap_or_else(|| identity_path.with_file_name("trusted-update-peers.txt"));
+    let staging = args
+        .update_staging
+        .clone()
+        .unwrap_or_else(default_update_staging);
+    let updater = args.updater.clone().unwrap_or_else(default_updater_path);
+    let restart_arguments =
+        restart_arguments(&args, &identity_path, &trust_path, &staging, &updater);
+    let source = build_update_source(&keypair)?;
+    let mut updates = UpdateManager::new(args.update_policy, trust_path, staging, updater, source)?;
 
     let mut swarm = build_swarm(keypair, &args.name, request_timeout)?;
 
@@ -113,7 +194,7 @@ async fn main() -> Result<()> {
         .listen_on(args.listen.clone())
         .with_context(|| format!("could not listen on {}", args.listen))?;
 
-    for address in args.dial {
+    for address in &args.dial {
         info!(%address, "dialing explicit peer address");
         swarm
             .dial(address.clone())
@@ -124,6 +205,7 @@ async fn main() -> Result<()> {
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut known_peers = BTreeMap::<PeerId, BTreeSet<Multiaddr>>::new();
     let request_counter = AtomicU64::new(1);
+    let mut stdin_closed = false;
 
     println!("Swagri agent '{}'", args.name);
     println!("Peer ID: {local_peer_id}");
@@ -132,11 +214,14 @@ async fn main() -> Result<()> {
         "STARTED",
         &[&local_peer_id.to_string(), env!("CARGO_PKG_VERSION")],
     );
+    for peer in &updates.trusted {
+        emit_event("UPDATE_TRUSTED", &[&peer.to_string()]);
+    }
     print_help();
 
     loop {
         tokio::select! {
-            maybe_line = lines.next_line() => {
+            maybe_line = lines.next_line(), if !stdin_closed => {
                 match maybe_line.context("failed to read stdin")? {
                     Some(line) if !handle_command(
                         &line,
@@ -144,13 +229,25 @@ async fn main() -> Result<()> {
                         local_peer_id,
                         &request_counter,
                         &known_peers,
+                        &mut updates,
+                        &restart_arguments,
                     ) => break,
                     Some(_) => {}
+                    None if args.daemon => stdin_closed = true,
                     None => break,
                 }
             }
             event = swarm.select_next_some() => {
-                handle_swarm_event(event, &mut swarm, &completed_tx, &mut known_peers);
+                if handle_swarm_event(
+                    event,
+                    &mut swarm,
+                    &completed_tx,
+                    &mut known_peers,
+                    &mut updates,
+                    &restart_arguments,
+                ) {
+                    break;
+                }
             }
             Some(completed) = completed_rx.recv() => {
                 if swarm
@@ -190,6 +287,152 @@ fn default_identity_path() -> PathBuf {
     PathBuf::from(".swagri").join("identity.key")
 }
 
+fn default_update_staging() -> PathBuf {
+    default_identity_path()
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("updates")
+}
+
+fn default_updater_path() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.join(updater_filename())))
+        .unwrap_or_else(|| PathBuf::from(updater_filename()))
+}
+
+fn updater_filename() -> &'static str {
+    if cfg!(windows) {
+        "swagri-updater.exe"
+    } else {
+        "swagri-updater"
+    }
+}
+
+fn build_update_source(keypair: &identity::Keypair) -> Result<UpdateSource> {
+    let path = std::env::current_exe().context("could not locate running agent executable")?;
+    let mut file = File::open(&path)
+        .with_context(|| format!("could not open update source {}", path.display()))?;
+    let size = file.metadata()?.len();
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let manifest = UpdateManifest {
+        version: env!("CARGO_PKG_VERSION").into(),
+        target_os: std::env::consts::OS.into(),
+        target_arch: std::env::consts::ARCH.into(),
+        size,
+        sha256_hex: hex::encode(hasher.finalize()),
+    };
+    let signature = keypair
+        .sign(&manifest.signing_payload())
+        .context("node identity could not sign its update manifest")?;
+    Ok(UpdateSource {
+        path,
+        signed: SignedUpdateManifest {
+            manifest,
+            signer_public_key: keypair.public().encode_protobuf(),
+            signature,
+        },
+    })
+}
+
+impl UpdateManager {
+    fn new(
+        policy: UpdatePolicy,
+        trust_path: PathBuf,
+        staging: PathBuf,
+        updater: PathBuf,
+        source: UpdateSource,
+    ) -> Result<Self> {
+        fs::create_dir_all(&staging)
+            .with_context(|| format!("could not create update staging at {}", staging.display()))?;
+        let trusted = load_trusted_peers(&trust_path)?;
+        Ok(Self {
+            policy,
+            trust_path,
+            staging,
+            updater,
+            trusted,
+            source,
+            requested: None,
+            pending: None,
+        })
+    }
+
+    fn persist_trust(&self) -> Result<()> {
+        if let Some(parent) = self.trust_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let text = self
+            .trusted
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&self.trust_path, format!("{text}\n"))
+            .with_context(|| format!("could not save {}", self.trust_path.display()))
+    }
+}
+
+fn load_trusted_peers(path: &Path) -> Result<BTreeSet<PeerId>> {
+    if !path.exists() {
+        return Ok(BTreeSet::new());
+    }
+    fs::read_to_string(path)?
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            PeerId::from_str(line).with_context(|| format!("invalid trusted peer ID: {line}"))
+        })
+        .collect()
+}
+
+fn restart_arguments(
+    args: &Args,
+    identity: &Path,
+    trust: &Path,
+    staging: &Path,
+    updater: &Path,
+) -> Vec<String> {
+    let mut result = vec![
+        "--name".into(),
+        args.name.clone(),
+        "--identity".into(),
+        identity.to_string_lossy().into_owned(),
+        "--listen".into(),
+        args.listen.to_string(),
+        "--request-timeout-seconds".into(),
+        args.request_timeout_seconds.to_string(),
+        "--update-policy".into(),
+        match args.update_policy {
+            UpdatePolicy::Disabled => "disabled",
+            UpdatePolicy::Manual => "manual",
+            UpdatePolicy::Automatic => "automatic",
+        }
+        .into(),
+        "--update-trust".into(),
+        trust.to_string_lossy().into_owned(),
+        "--update-staging".into(),
+        staging.to_string_lossy().into_owned(),
+        "--updater".into(),
+        updater.to_string_lossy().into_owned(),
+        "--daemon".into(),
+    ];
+    for address in &args.dial {
+        result.push("--dial".into());
+        result.push(address.to_string());
+    }
+    result
+}
+
 fn build_swarm(
     keypair: identity::Keypair,
     node_name: &str,
@@ -206,10 +449,18 @@ fn build_swarm(
                 [(StreamProtocol::new(TASK_PROTOCOL_V1), ProtocolSupport::Full)],
                 request_response::Config::default().with_request_timeout(request_timeout),
             );
+            let updates = request_response::cbor::Behaviour::new(
+                [(
+                    StreamProtocol::new(UPDATE_PROTOCOL_V1),
+                    ProtocolSupport::Full,
+                )],
+                request_response::Config::default().with_request_timeout(request_timeout),
+            );
 
             Ok(Behaviour {
                 mdns: mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)?,
                 request_response,
+                updates,
                 identify: identify::Behaviour::new(
                     identify::Config::new("/swagri/identify/1".into(), key.public())
                         .with_agent_version(agent_version),
@@ -260,7 +511,10 @@ fn handle_swarm_event(
     swarm: &mut libp2p::Swarm<Behaviour>,
     completed_tx: &mpsc::UnboundedSender<CompletedResponse>,
     known_peers: &mut BTreeMap<PeerId, BTreeSet<Multiaddr>>,
-) {
+    updates: &mut UpdateManager,
+    restart_arguments: &[String],
+) -> bool {
+    let mut shutdown = false;
     match event {
         SwarmEvent::NewListenAddr { address, .. } => {
             println!("Listening on {address}");
@@ -314,6 +568,9 @@ fn handle_swarm_event(
         SwarmEvent::Behaviour(BehaviourEvent::RequestResponse(event)) => {
             handle_request_response(event, completed_tx);
         }
+        SwarmEvent::Behaviour(BehaviourEvent::Update(event)) => {
+            shutdown = handle_update_event(event, swarm, updates, restart_arguments);
+        }
         SwarmEvent::Behaviour(BehaviourEvent::Identify(event)) => {
             if let identify::Event::Received { peer_id, info, .. } = *event {
                 let version = info
@@ -322,6 +579,13 @@ fn handle_swarm_event(
                     .and_then(|value| value.split_whitespace().next())
                     .unwrap_or(&info.agent_version);
                 emit_event("PEER_VERSION", &[&peer_id.to_string(), version, "1"]);
+                if updates.policy == UpdatePolicy::Automatic
+                    && updates.trusted.contains(&peer_id)
+                    && updates.pending.is_none()
+                    && is_newer_version(version)
+                {
+                    begin_update_request(swarm, updates, peer_id, true);
+                }
             } else {
                 debug!(?event, "identify event");
             }
@@ -331,6 +595,7 @@ fn handle_swarm_event(
         }
         _ => {}
     }
+    shutdown
 }
 
 fn handle_request_response(
@@ -413,12 +678,362 @@ fn handle_request_response(
     }
 }
 
+fn begin_update_request(
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    updates: &mut UpdateManager,
+    peer: PeerId,
+    apply_when_ready: bool,
+) {
+    if updates.policy == UpdatePolicy::Disabled {
+        emit_event(
+            "UPDATE_FAILED",
+            &[&peer.to_string(), "updates are disabled"],
+        );
+        return;
+    }
+    if !updates.trusted.contains(&peer) {
+        emit_event(
+            "UPDATE_FAILED",
+            &[&peer.to_string(), "peer is not trusted for updates"],
+        );
+        return;
+    }
+    if updates.pending.is_some() || updates.requested.is_some() {
+        emit_event(
+            "UPDATE_FAILED",
+            &[&peer.to_string(), "another update is already active"],
+        );
+        return;
+    }
+    updates.requested = Some((peer, apply_when_ready));
+    swarm
+        .behaviour_mut()
+        .updates
+        .send_request(&peer, UpdateRequest::Manifest);
+    emit_event("UPDATE_REQUESTED", &[&peer.to_string()]);
+}
+
+fn handle_update_event(
+    event: request_response::Event<UpdateRequest, UpdateResponse>,
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    updates: &mut UpdateManager,
+    restart_arguments: &[String],
+) -> bool {
+    match event {
+        request_response::Event::Message {
+            peer,
+            message:
+                request_response::Message::Request {
+                    request, channel, ..
+                },
+            ..
+        } => {
+            let response = serve_update_request(&request, &updates.source);
+            if swarm
+                .behaviour_mut()
+                .updates
+                .send_response(channel, response)
+                .is_err()
+            {
+                warn!(%peer, "update requester disconnected before response");
+            }
+        }
+        request_response::Event::Message {
+            peer,
+            message: request_response::Message::Response { response, .. },
+            ..
+        } => match response {
+            UpdateResponse::Manifest { signed } => {
+                let Some((requested_peer, apply_when_ready)) = updates.requested.take() else {
+                    warn!(%peer, "ignored unsolicited update manifest");
+                    return false;
+                };
+                if requested_peer != peer {
+                    emit_event(
+                        "UPDATE_FAILED",
+                        &[&peer.to_string(), "unexpected update source"],
+                    );
+                    return false;
+                }
+                if let Err(error) = verify_update_manifest(peer, &signed) {
+                    emit_event("UPDATE_FAILED", &[&peer.to_string(), &error.to_string()]);
+                    return false;
+                }
+                let filename =
+                    format!("swagri-agent-{}-{}.download", signed.manifest.version, peer);
+                let path = updates.staging.join(filename);
+                let file = match File::create(&path) {
+                    Ok(file) => file,
+                    Err(error) => {
+                        emit_event("UPDATE_FAILED", &[&peer.to_string(), &error.to_string()]);
+                        return false;
+                    }
+                };
+                updates.pending = Some(PendingDownload {
+                    peer,
+                    signed,
+                    path,
+                    file,
+                    received: 0,
+                    apply_when_ready,
+                });
+                request_next_update_chunk(swarm, updates);
+            }
+            UpdateResponse::Chunk { offset, data } => {
+                let Some(mut pending) = updates.pending.take() else {
+                    warn!(%peer, "ignored unsolicited update chunk");
+                    return false;
+                };
+                if pending.peer != peer || offset != pending.received {
+                    emit_event(
+                        "UPDATE_FAILED",
+                        &[&peer.to_string(), "invalid update chunk order"],
+                    );
+                    let _ = fs::remove_file(&pending.path);
+                    return false;
+                }
+                if data.is_empty()
+                    || pending.received.saturating_add(data.len() as u64)
+                        > pending.signed.manifest.size
+                {
+                    emit_event(
+                        "UPDATE_FAILED",
+                        &[&peer.to_string(), "invalid update chunk size"],
+                    );
+                    let _ = fs::remove_file(&pending.path);
+                    return false;
+                }
+                if let Err(error) = pending.file.write_all(&data) {
+                    emit_event("UPDATE_FAILED", &[&peer.to_string(), &error.to_string()]);
+                    let _ = fs::remove_file(&pending.path);
+                    return false;
+                }
+                pending.received += data.len() as u64;
+                emit_event(
+                    "UPDATE_PROGRESS",
+                    &[
+                        &peer.to_string(),
+                        &pending.received.to_string(),
+                        &pending.signed.manifest.size.to_string(),
+                    ],
+                );
+                if pending.received == pending.signed.manifest.size {
+                    if let Err(error) = pending.file.flush().and_then(|_| pending.file.sync_all()) {
+                        emit_event("UPDATE_FAILED", &[&peer.to_string(), &error.to_string()]);
+                        let _ = fs::remove_file(&pending.path);
+                        return false;
+                    }
+                    if let Err(error) = verify_download(&pending.path, &pending.signed.manifest) {
+                        emit_event("UPDATE_FAILED", &[&peer.to_string(), &error.to_string()]);
+                        let _ = fs::remove_file(&pending.path);
+                        return false;
+                    }
+                    emit_event(
+                        "UPDATE_READY",
+                        &[
+                            &peer.to_string(),
+                            &pending.signed.manifest.version,
+                            &pending.path.to_string_lossy(),
+                        ],
+                    );
+                    if pending.apply_when_ready {
+                        return schedule_self_update(
+                            updates,
+                            &pending.path,
+                            restart_arguments,
+                            peer,
+                        );
+                    }
+                } else {
+                    updates.pending = Some(pending);
+                    request_next_update_chunk(swarm, updates);
+                }
+            }
+            UpdateResponse::Error { message } => {
+                updates.requested = None;
+                updates.pending = None;
+                emit_event("UPDATE_FAILED", &[&peer.to_string(), &message]);
+            }
+        },
+        request_response::Event::OutboundFailure { peer, error, .. } => {
+            updates.requested = None;
+            if let Some(pending) = updates.pending.take() {
+                let _ = fs::remove_file(pending.path);
+            }
+            emit_event("UPDATE_FAILED", &[&peer.to_string(), &error.to_string()]);
+        }
+        request_response::Event::InboundFailure { peer, error, .. } => {
+            warn!(%peer, %error, "inbound update request failed");
+        }
+        request_response::Event::ResponseSent { .. } => {}
+    }
+    false
+}
+
+fn serve_update_request(request: &UpdateRequest, source: &UpdateSource) -> UpdateResponse {
+    match request {
+        UpdateRequest::Manifest => UpdateResponse::Manifest {
+            signed: source.signed.clone(),
+        },
+        UpdateRequest::Chunk {
+            version,
+            offset,
+            length,
+        } => {
+            if version != &source.signed.manifest.version {
+                return UpdateResponse::Error {
+                    message: "requested update version is unavailable".into(),
+                };
+            }
+            if *offset >= source.signed.manifest.size {
+                return UpdateResponse::Error {
+                    message: "update offset is outside the package".into(),
+                };
+            }
+            let remaining = source.signed.manifest.size - offset;
+            let length = u64::from((*length).min(UPDATE_CHUNK_BYTES)).min(remaining) as usize;
+            let result = (|| -> Result<Vec<u8>> {
+                let mut file = File::open(&source.path)?;
+                file.seek(SeekFrom::Start(*offset))?;
+                let mut data = vec![0; length];
+                file.read_exact(&mut data)?;
+                Ok(data)
+            })();
+            match result {
+                Ok(data) => UpdateResponse::Chunk {
+                    offset: *offset,
+                    data,
+                },
+                Err(error) => UpdateResponse::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
+    }
+}
+
+fn request_next_update_chunk(swarm: &mut libp2p::Swarm<Behaviour>, updates: &UpdateManager) {
+    if let Some(pending) = &updates.pending {
+        swarm.behaviour_mut().updates.send_request(
+            &pending.peer,
+            UpdateRequest::Chunk {
+                version: pending.signed.manifest.version.clone(),
+                offset: pending.received,
+                length: UPDATE_CHUNK_BYTES,
+            },
+        );
+    }
+}
+
+fn verify_update_manifest(peer: PeerId, signed: &SignedUpdateManifest) -> Result<()> {
+    let manifest = &signed.manifest;
+    if manifest.target_os != std::env::consts::OS || manifest.target_arch != std::env::consts::ARCH
+    {
+        bail!("update target does not match this device");
+    }
+    if manifest.size == 0 || manifest.size > MAX_UPDATE_BYTES {
+        bail!("update package size is outside the allowed range");
+    }
+    if !is_newer_version(&manifest.version) {
+        bail!("offered version is not newer than the running agent");
+    }
+    let public = identity::PublicKey::try_decode_protobuf(&signed.signer_public_key)
+        .context("update signer key is invalid")?;
+    if PeerId::from_public_key(&public) != peer {
+        bail!("update signature key does not match the connected peer");
+    }
+    if !public.verify(&manifest.signing_payload(), &signed.signature) {
+        bail!("update manifest signature is invalid");
+    }
+    Ok(())
+}
+
+fn is_newer_version(version: &str) -> bool {
+    Version::parse(version)
+        .ok()
+        .zip(Version::parse(env!("CARGO_PKG_VERSION")).ok())
+        .is_some_and(|(remote, local)| remote > local)
+}
+
+fn verify_download(path: &Path, manifest: &UpdateManifest) -> Result<()> {
+    let mut file = File::open(path)?;
+    if file.metadata()?.len() != manifest.size {
+        bail!("downloaded update size does not match its manifest");
+    }
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    if hex::encode(hasher.finalize()) != manifest.sha256_hex {
+        bail!("downloaded update SHA-256 does not match its manifest");
+    }
+    Ok(())
+}
+
+fn schedule_self_update(
+    updates: &UpdateManager,
+    replacement: &Path,
+    restart_arguments: &[String],
+    peer: PeerId,
+) -> bool {
+    if !updates.updater.is_file() {
+        emit_event(
+            "UPDATE_FAILED",
+            &[
+                &peer.to_string(),
+                &format!("updater helper not found: {}", updates.updater.display()),
+            ],
+        );
+        return false;
+    }
+    let target = &updates.source.path;
+    let backup = target.with_extension("previous.exe");
+    let args_path = updates
+        .staging
+        .join(format!("restart-{}.json", std::process::id()));
+    let result = (|| -> Result<()> {
+        fs::write(&args_path, serde_json::to_vec(restart_arguments)?)?;
+        Command::new(&updates.updater)
+            .arg("--target")
+            .arg(target)
+            .arg("--replacement")
+            .arg(replacement)
+            .arg("--backup")
+            .arg(&backup)
+            .arg("--restart-args")
+            .arg(&args_path)
+            .spawn()
+            .context("could not start updater helper")?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            emit_event(
+                "UPDATE_APPLYING",
+                &[&peer.to_string(), &target.to_string_lossy()],
+            );
+            true
+        }
+        Err(error) => {
+            emit_event("UPDATE_FAILED", &[&peer.to_string(), &error.to_string()]);
+            false
+        }
+    }
+}
+
 fn handle_command(
     line: &str,
     swarm: &mut libp2p::Swarm<Behaviour>,
     local_peer_id: PeerId,
     request_counter: &AtomicU64,
     known_peers: &BTreeMap<PeerId, BTreeSet<Multiaddr>>,
+    updates: &mut UpdateManager,
+    restart_arguments: &[String],
 ) -> bool {
     let line = line.trim();
     if line.is_empty() {
@@ -432,6 +1047,59 @@ fn handle_command(
         "help" => print_help(),
         "id" => println!("{local_peer_id}"),
         "peers" => print_peers(known_peers),
+        "trusted" => {
+            if updates.trusted.is_empty() {
+                println!("No peers are trusted for updates.");
+            }
+            for peer in &updates.trusted {
+                println!("Trusted update peer: {peer}");
+                emit_event("UPDATE_TRUSTED", &[&peer.to_string()]);
+            }
+        }
+        "trust" => match parse_peer(&mut parts) {
+            Ok(peer) => {
+                updates.trusted.insert(peer);
+                match updates.persist_trust() {
+                    Ok(()) => {
+                        println!("Trusted {peer} for signed agent updates.");
+                        emit_event("UPDATE_TRUSTED", &[&peer.to_string()]);
+                    }
+                    Err(error) => println!("Could not save update trust: {error:#}"),
+                }
+            }
+            Err(error) => println!("Invalid trust command: {error:#}"),
+        },
+        "untrust" => match parse_peer(&mut parts) {
+            Ok(peer) => {
+                updates.trusted.remove(&peer);
+                match updates.persist_trust() {
+                    Ok(()) => {
+                        println!("Removed update trust for {peer}.");
+                        emit_event("UPDATE_UNTRUSTED", &[&peer.to_string()]);
+                    }
+                    Err(error) => println!("Could not save update trust: {error:#}"),
+                }
+            }
+            Err(error) => println!("Invalid untrust command: {error:#}"),
+        },
+        "update" => match parse_peer(&mut parts) {
+            Ok(peer) => begin_update_request(swarm, updates, peer, true),
+            Err(error) => println!("Invalid update command: {error:#}"),
+        },
+        "download-update" => match parse_peer(&mut parts) {
+            Ok(peer) => begin_update_request(swarm, updates, peer, false),
+            Err(error) => println!("Invalid update command: {error:#}"),
+        },
+        "apply-update" => {
+            let peer = parse_peer(&mut parts);
+            let path = parts.next().map(PathBuf::from);
+            match (peer, path) {
+                (Ok(peer), Some(path)) if path.is_file() => {
+                    return !schedule_self_update(updates, &path, restart_arguments, peer);
+                }
+                _ => println!("apply-update requires a peer ID and verified update path"),
+            }
+        }
         "connect" => {
             match parse_peer(&mut parts).and_then(|peer| {
                 swarm
@@ -571,6 +1239,11 @@ fn print_help() {
          help                              Show this help\n\
          id                                Print this node's peer ID\n\
          peers                             List discovered or connected peers\n\
+         trusted                           List peers trusted for updates\n\
+         trust <peer-id>                   Trust a peer identity for signed updates\n\
+         untrust <peer-id>                 Remove update trust\n\
+         update <peer-id>                  Download, verify, apply, and restart\n\
+         download-update <peer-id>         Download and verify without applying\n\
          connect <peer-id>                 Connect using a discovered address\n\
          dial <multiaddr>                  Connect using an explicit address\n\
          info <peer-id>                    Read the remote agent version\n\
@@ -597,6 +1270,42 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
+
+    fn signed_manifest(keypair: &identity::Keypair, version: &str) -> SignedUpdateManifest {
+        let manifest = UpdateManifest {
+            version: version.into(),
+            target_os: std::env::consts::OS.into(),
+            target_arch: std::env::consts::ARCH.into(),
+            size: 64,
+            sha256_hex: "00".repeat(32),
+        };
+        SignedUpdateManifest {
+            signature: keypair.sign(&manifest.signing_payload()).unwrap(),
+            signer_public_key: keypair.public().encode_protobuf(),
+            manifest,
+        }
+    }
+
+    #[test]
+    fn accepts_only_manifest_signed_by_connected_peer() {
+        let signer = identity::Keypair::generate_ed25519();
+        let peer = PeerId::from(signer.public());
+        let signed = signed_manifest(&signer, "999.0.0");
+        assert!(verify_update_manifest(peer, &signed).is_ok());
+
+        let attacker = identity::Keypair::generate_ed25519();
+        let attacker_peer = PeerId::from(attacker.public());
+        assert!(verify_update_manifest(attacker_peer, &signed).is_err());
+    }
+
+    #[test]
+    fn rejects_tampered_manifest() {
+        let signer = identity::Keypair::generate_ed25519();
+        let peer = PeerId::from(signer.public());
+        let mut signed = signed_manifest(&signer, "999.0.0");
+        signed.manifest.size += 1;
+        assert!(verify_update_manifest(peer, &signed).is_err());
+    }
 
     #[tokio::test]
     async fn two_nodes_execute_tasks_in_both_directions() -> Result<()> {

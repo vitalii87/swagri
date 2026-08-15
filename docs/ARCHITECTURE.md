@@ -37,6 +37,7 @@ Every node has the same role and can initiate or execute requests. The MVP uses:
 - explicit multiaddresses as a fallback;
 - libp2p PeerId values derived from persistent Ed25519 identities;
 - CBOR messages on versioned protocol `/swagri/task/1`;
+- signed Agent manifests and chunks on `/swagri/update/1`;
 - small, allowlisted task kinds;
 - request limits, execution limits, deadlines, and structured failures.
 
@@ -89,6 +90,12 @@ will distinguish:
 
 Sensitive tasks must not leave their allowed trust boundary. Trust policy and
 resource capability are separate scheduler inputs.
+
+Update trust is implemented separately from task authorization. The owner
+enrolls a specific Peer ID, and manifests must verify against the public key
+that derives that ID. A dedicated updater performs replacement only after the
+complete executable matches its signed manifest, retains the previous binary,
+and rolls back after an activation or health-check failure.
 
 ## Adaptive scheduling direction
 
@@ -143,4 +150,3 @@ Future protocol families are expected for:
 - content-addressed artifacts;
 - task graphs and result aggregation;
 - scheduler observations and measurements.
-

@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "0.2.0-alpha",
+    [string]$Version = "0.3.0-alpha",
     [string]$Configuration = "release"
 )
 
@@ -14,6 +14,9 @@ if (-not (Test-Path -LiteralPath (Join-Path $buildDirectory "swagri-agent.exe"))
 }
 if (-not (Test-Path -LiteralPath (Join-Path $buildDirectory "swagri-debugger.exe"))) {
     throw "swagri-debugger.exe was not found. Run cargo build --release first."
+}
+if (-not (Test-Path -LiteralPath (Join-Path $buildDirectory "swagri-updater.exe"))) {
+    throw "swagri-updater.exe was not found. Run cargo build --release first."
 }
 
 $resolvedOutput = [System.IO.Path]::GetFullPath($outputDirectory)
@@ -36,8 +39,9 @@ Agent package:
   Run swagri-agent.exe --name <device-name>
   Type help for commands. The persistent identity is stored under LocalAppData.
 
-Security: use only on trusted test networks. This prototype has no peer
-authorization yet. Documentation: https://github.com/vitalii87/swagri
+Updates: both packages include swagri-updater.exe. Trust a specific Peer ID
+before receiving signed P2P Agent updates. Use only on trusted test networks.
+Documentation: https://github.com/vitalii87/swagri
 "@
 Set-Content -LiteralPath (Join-Path $packageDirectory "README.txt") -Value $readme -Encoding utf8
 
@@ -45,8 +49,10 @@ $agentPortable = Join-Path $outputDirectory "agent-portable"
 $debuggerPortable = Join-Path $outputDirectory "debugger-portable"
 New-Item -ItemType Directory -Path $agentPortable, $debuggerPortable -Force | Out-Null
 Copy-Item -LiteralPath (Join-Path $buildDirectory "swagri-agent.exe") -Destination $agentPortable
+Copy-Item -LiteralPath (Join-Path $buildDirectory "swagri-updater.exe") -Destination $agentPortable
 Copy-Item -LiteralPath (Join-Path $buildDirectory "swagri-agent.exe") -Destination $debuggerPortable
 Copy-Item -LiteralPath (Join-Path $buildDirectory "swagri-debugger.exe") -Destination $debuggerPortable
+Copy-Item -LiteralPath (Join-Path $buildDirectory "swagri-updater.exe") -Destination $debuggerPortable
 Copy-Item -LiteralPath (Join-Path $packageDirectory "README.txt") -Destination $agentPortable
 Copy-Item -LiteralPath (Join-Path $packageDirectory "README.txt") -Destination $debuggerPortable
 

@@ -53,6 +53,7 @@ binaries, or arbitrary remote code.
 - mDNS discovery on local networks
 - CBOR request/response messages
 - persistent Ed25519 node identities
+- trusted-peer, signed and chunked P2P Agent updates with rollback
 - native Rust desktop Debugger with live logs, commands, and host metrics
 
 See [Architecture](docs/ARCHITECTURE.md) for the design boundaries and
@@ -94,8 +95,9 @@ Use `help` for all commands. If mDNS is unavailable, start a node with an
 explicit `--dial <multiaddr>` copied from the other node's listen output.
 
 The desktop Debugger provides buttons for discovery, connection testing,
-allowlisted sample tasks, version comparison, firewall help, and manual update
-installation. Agents automatically attempt a QUIC connection after mDNS
+allowlisted sample tasks, version comparison, trusted P2P Agent updates,
+firewall help, and manual Debugger update installation. Agents automatically
+attempt a QUIC connection after mDNS
 discovery; advanced users can also use `connect`, `dial`, and `info` commands.
 
 ## Workspace
@@ -105,7 +107,8 @@ crates/
 ├── swagri-core/       Protocol-neutral task and result types
 ├── swagri-executor/   Allowlisted local task execution
 ├── swagri-node/       Lightweight P2P Agent implementation
-└── swagri-debugger/   Desktop test console and host telemetry
+├── swagri-debugger/   Desktop test console and host telemetry
+└── swagri-updater/    Atomic Agent replacement and rollback helper
 ```
 
 ## Safety

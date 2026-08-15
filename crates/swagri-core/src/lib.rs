@@ -6,6 +6,15 @@ use thiserror::Error;
 /// Wire protocol negotiated by the MVP request/response behaviour.
 pub const TASK_PROTOCOL_V1: &str = "/swagri/task/1";
 
+/// Signed, chunked agent-update protocol.
+pub const UPDATE_PROTOCOL_V1: &str = "/swagri/update/1";
+
+/// Maximum executable size accepted through the update protocol.
+pub const MAX_UPDATE_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Maximum payload returned by one update chunk request.
+pub const UPDATE_CHUNK_BYTES: u32 = 256 * 1024;
+
 /// Maximum text payload accepted by the built-in prototype tasks.
 pub const MAX_TEXT_BYTES: usize = 1024 * 1024;
 
@@ -17,6 +26,62 @@ pub const MAX_BENCHMARK_ITERATIONS: u64 = 50_000_000;
 
 /// A request identifier is unique from the perspective of the originating node.
 pub type TaskId = String;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UpdateManifest {
+    pub version: String,
+    pub target_os: String,
+    pub target_arch: String,
+    pub size: u64,
+    pub sha256_hex: String,
+}
+
+impl UpdateManifest {
+    /// Stable bytes signed by the peer identity key.
+    pub fn signing_payload(&self) -> Vec<u8> {
+        format!(
+            "swagri-update-v1\n{}\n{}\n{}\n{}\n{}\n",
+            self.version, self.target_os, self.target_arch, self.size, self.sha256_hex
+        )
+        .into_bytes()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SignedUpdateManifest {
+    pub manifest: UpdateManifest,
+    #[serde(with = "serde_bytes")]
+    pub signer_public_key: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    pub signature: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UpdateRequest {
+    Manifest,
+    Chunk {
+        version: String,
+        offset: u64,
+        length: u32,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UpdateResponse {
+    Manifest {
+        signed: SignedUpdateManifest,
+    },
+    Chunk {
+        offset: u64,
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+    },
+    Error {
+        message: String,
+    },
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TaskRequest {
@@ -196,6 +261,22 @@ mod tests {
         assert_eq!(
             task.validate(),
             Err(TaskValidationError::InvalidBenchmarkIterations)
+        );
+    }
+
+    #[test]
+    fn update_signing_payload_is_stable() {
+        let manifest = UpdateManifest {
+            version: "1.2.3".into(),
+            target_os: "windows".into(),
+            target_arch: "x86_64".into(),
+            size: 42,
+            sha256_hex: "abc".into(),
+        };
+
+        assert_eq!(
+            manifest.signing_payload(),
+            b"swagri-update-v1\n1.2.3\nwindows\nx86_64\n42\nabc\n"
         );
     }
 }

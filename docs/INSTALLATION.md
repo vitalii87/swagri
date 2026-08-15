@@ -52,18 +52,34 @@ The Agent stores its identity in `%LOCALAPPDATA%\Swagri\identity.key`. Debugger
 uses `%LOCALAPPDATA%\Swagri\debugger.key`. Keep these files if the devices
 should retain their peer identities.
 
-## Updating test agents
+## Updating test agents through the swarm
 
-Version 0.2 agents exchange their versions after connecting. Debugger highlights
-when the selected peer is newer. Open **Updates** and use **Update from
-installer...** with an official `Swagri-Debugger-Setup-x64.exe`; Debugger stops
-its bundled agent, launches the installer, and closes so both executables can be
-replaced.
+Version 0.3 introduces signed, chunked peer-to-peer Agent updates. Install 0.3
+manually once on every device; earlier agents do not yet understand the update
+protocol. Later Agent versions can be received from a connected newer Agent.
 
-Automatic peer-to-peer executable transfer remains disabled until Swagri has a
-signed update feed and trusted-peer enrollment. A peer may announce that a
-newer version exists, but an unauthenticated peer is never allowed to silently
-replace an executable. This boundary is intentional for the current LAN alpha.
+In Debugger, select a newer peer and click **Trust and update through P2P**. The
+local Agent persists that exact Peer ID, requests its signed manifest, downloads
+the executable in 256 KiB chunks, and verifies the platform, version, size,
+Ed25519 signature, and SHA-256 before replacement. `swagri-updater` keeps the
+previous executable and restores it when activation or the health check fails.
+
+After the first explicit trust decision, **Automatically update from already
+trusted agents** may be enabled. A newly discovered peer never becomes trusted
+just because it is on the same LAN. Headless nodes provide equivalent commands:
+
+```text
+trust <peer-id>
+update <peer-id>
+untrust <peer-id>
+```
+
+For unattended headless operation, start the Agent with
+`--update-policy automatic`; only peers already present in the trust file are
+eligible. `--update-policy disabled` turns receiving updates off.
+
+P2P updates replace the lightweight Agent only. Debugger itself is updated with
+`Swagri-Debugger-Setup-x64.exe` because it owns and supervises the bundled Agent.
 
 ## Build packages locally
 
@@ -71,7 +87,7 @@ Install Rust stable, Microsoft C++ Build Tools, and NSIS, then run:
 
 ```powershell
 cargo test --workspace --all-targets
-cargo build --release -p swagri-agent -p swagri-debugger
+cargo build --release -p swagri-agent -p swagri-debugger -p swagri-updater
 .\scripts\package-windows.ps1
 ```
 
