@@ -106,32 +106,7 @@ async fn main() -> Result<()> {
     let local_peer_id = PeerId::from(keypair.public());
     let request_timeout = Duration::from_secs(args.request_timeout_seconds);
 
-    let mut swarm = SwarmBuilder::with_existing_identity(keypair)
-        .with_tokio()
-        .with_quic()
-        .with_behaviour(|key| {
-            let local_peer_id = PeerId::from(key.public());
-            let request_response = request_response::cbor::Behaviour::new(
-                [(StreamProtocol::new(TASK_PROTOCOL_V1), ProtocolSupport::Full)],
-                request_response::Config::default().with_request_timeout(request_timeout),
-            );
-
-            Ok(Behaviour {
-                mdns: mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)?,
-                request_response,
-                identify: identify::Behaviour::new(
-                    identify::Config::new("/swagri/identify/1".into(), key.public())
-                        .with_agent_version(format!(
-                            "swagri/{} ({})",
-                            env!("CARGO_PKG_VERSION"),
-                            args.name
-                        )),
-                ),
-                ping: ping::Behaviour::default(),
-            })
-        })?
-        .with_swarm_config(|config| config.with_idle_connection_timeout(Duration::from_secs(60)))
-        .build();
+    let mut swarm = build_swarm(keypair, &args.name, request_timeout)?;
 
     swarm
         .listen_on(args.listen.clone())
@@ -190,6 +165,37 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn build_swarm(
+    keypair: identity::Keypair,
+    node_name: &str,
+    request_timeout: Duration,
+) -> Result<libp2p::Swarm<Behaviour>> {
+    let agent_version = format!("swagri/{} ({node_name})", env!("CARGO_PKG_VERSION"));
+
+    Ok(SwarmBuilder::with_existing_identity(keypair)
+        .with_tokio()
+        .with_quic()
+        .with_behaviour(move |key| {
+            let local_peer_id = PeerId::from(key.public());
+            let request_response = request_response::cbor::Behaviour::new(
+                [(StreamProtocol::new(TASK_PROTOCOL_V1), ProtocolSupport::Full)],
+                request_response::Config::default().with_request_timeout(request_timeout),
+            );
+
+            Ok(Behaviour {
+                mdns: mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)?,
+                request_response,
+                identify: identify::Behaviour::new(
+                    identify::Config::new("/swagri/identify/1".into(), key.public())
+                        .with_agent_version(agent_version),
+                ),
+                ping: ping::Behaviour::default(),
+            })
+        })?
+        .with_swarm_config(|config| config.with_idle_connection_timeout(Duration::from_secs(60)))
+        .build())
 }
 
 fn init_tracing() {
@@ -455,4 +461,131 @@ fn print_help() {
          benchmark <peer-id> <iterations>   Run bounded synthetic CPU work\n\
          quit                              Stop the node"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use libp2p::multiaddr::Protocol;
+    use swagri_core::{TaskOutcome, TaskResult};
+    use tokio::time::timeout;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn two_nodes_execute_tasks_in_both_directions() -> Result<()> {
+        timeout(Duration::from_secs(20), async {
+            let mut alpha = build_swarm(
+                identity::Keypair::generate_ed25519(),
+                "alpha-test",
+                Duration::from_secs(5),
+            )?;
+            let mut beta = build_swarm(
+                identity::Keypair::generate_ed25519(),
+                "beta-test",
+                Duration::from_secs(5),
+            )?;
+            let alpha_id = *alpha.local_peer_id();
+            let beta_id = *beta.local_peer_id();
+
+            alpha.listen_on(
+                "/ip4/127.0.0.1/udp/0/quic-v1"
+                    .parse()
+                    .expect("valid test listen address"),
+            )?;
+
+            let alpha_address = loop {
+                if let SwarmEvent::NewListenAddr { address, .. } = alpha.select_next_some().await {
+                    break address.with(Protocol::P2p(alpha_id));
+                }
+            };
+
+            beta.dial(alpha_address)?;
+            let mut beta_request_sent = false;
+            let mut alpha_request_sent = false;
+
+            loop {
+                tokio::select! {
+                    event = alpha.select_next_some() => {
+                        if let SwarmEvent::Behaviour(BehaviourEvent::RequestResponse(
+                            request_response::Event::Message { message, .. }
+                        )) = event {
+                            match message {
+                                request_response::Message::Request { request, channel, .. } => {
+                                    let response = execute(request);
+                                    alpha.behaviour_mut().request_response
+                                        .send_response(channel, response)
+                                        .expect("alpha response channel is open");
+                                }
+                                request_response::Message::Response { response, .. } => {
+                                    assert_eq!(response.id, "alpha-to-beta");
+                                    assert_eq!(
+                                        response.outcome,
+                                        TaskOutcome::Success {
+                                            result: TaskResult::Sum { value: 6.0 }
+                                        }
+                                    );
+                                    return Ok::<(), anyhow::Error>(());
+                                }
+                            }
+                        }
+                    }
+                    event = beta.select_next_some() => {
+                        match event {
+                            SwarmEvent::ConnectionEstablished { peer_id, .. }
+                                if peer_id == alpha_id && !beta_request_sent =>
+                            {
+                                beta_request_sent = true;
+                                beta.behaviour_mut().request_response.send_request(
+                                    &alpha_id,
+                                    TaskRequest {
+                                        id: "beta-to-alpha".into(),
+                                        task: Task::Echo { message: "hello alpha".into() },
+                                    },
+                                );
+                            }
+                            SwarmEvent::Behaviour(BehaviourEvent::RequestResponse(
+                                request_response::Event::Message { message, .. }
+                            )) => {
+                                match message {
+                                    request_response::Message::Request { request, channel, .. } => {
+                                        let response = execute(request);
+                                        beta.behaviour_mut().request_response
+                                            .send_response(channel, response)
+                                            .expect("beta response channel is open");
+                                    }
+                                    request_response::Message::Response { response, .. } => {
+                                        assert_eq!(response.id, "beta-to-alpha");
+                                        assert_eq!(
+                                            response.outcome,
+                                            TaskOutcome::Success {
+                                                result: TaskResult::Echo {
+                                                    message: "hello alpha".into()
+                                                }
+                                            }
+                                        );
+
+                                        if !alpha_request_sent {
+                                            alpha_request_sent = true;
+                                            alpha.behaviour_mut().request_response.send_request(
+                                                &beta_id,
+                                                TaskRequest {
+                                                    id: "alpha-to-beta".into(),
+                                                    task: Task::Sum { values: vec![1.0, 2.0, 3.0] },
+                                                },
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .context("two-node round trip timed out")??;
+
+        Ok(())
+    }
 }
