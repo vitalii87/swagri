@@ -26,18 +26,18 @@ use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "swagri-node",
+    name = "swagri-agent",
     version,
-    about = "Run an experimental Swagri peer"
+    about = "Run a lightweight headless Swagri agent"
 )]
 struct Args {
     /// Human-readable name shown in identify metadata and local output.
-    #[arg(long, default_value = "swagri-node")]
+    #[arg(long, default_value = "swagri-agent")]
     name: String,
 
     /// File containing the persistent Ed25519 node identity.
-    #[arg(long, default_value = ".swagri/identity.key")]
-    identity: PathBuf,
+    #[arg(long)]
+    identity: Option<PathBuf>,
 
     /// QUIC multiaddress on which to accept peer connections.
     #[arg(long, default_value = "/ip4/0.0.0.0/udp/0/quic-v1")]
@@ -102,7 +102,8 @@ struct CompletedResponse {
 async fn main() -> Result<()> {
     init_tracing();
     let args = Args::parse();
-    let keypair = load_or_create_identity(&args.identity)?;
+    let identity_path = args.identity.unwrap_or_else(default_identity_path);
+    let keypair = load_or_create_identity(&identity_path)?;
     let local_peer_id = PeerId::from(keypair.public());
     let request_timeout = Duration::from_secs(args.request_timeout_seconds);
 
@@ -124,9 +125,9 @@ async fn main() -> Result<()> {
     let mut known_peers = BTreeMap::<PeerId, BTreeSet<Multiaddr>>::new();
     let request_counter = AtomicU64::new(1);
 
-    println!("Swagri node '{}'", args.name);
+    println!("Swagri agent '{}'", args.name);
     println!("Peer ID: {local_peer_id}");
-    println!("Identity: {}", args.identity.display());
+    println!("Identity: {}", identity_path.display());
     print_help();
 
     loop {
@@ -165,6 +166,24 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn default_identity_path() -> PathBuf {
+    if let Some(local_data) = std::env::var_os("LOCALAPPDATA") {
+        return PathBuf::from(local_data)
+            .join("Swagri")
+            .join("identity.key");
+    }
+
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home)
+            .join(".local")
+            .join("share")
+            .join("swagri")
+            .join("identity.key");
+    }
+
+    PathBuf::from(".swagri").join("identity.key")
 }
 
 fn build_swarm(

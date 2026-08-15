@@ -40,8 +40,9 @@ goal is intentionally small:
 > requests in both directions, execute a small allowlisted task, and return a
 > structured result.
 
-The first prototype is a CLI application. It does **not** execute shell
-commands, downloaded binaries, or arbitrary remote code.
+The first prototype includes a lightweight headless Agent and a desktop
+Debugger for test networks. It does **not** execute shell commands, downloaded
+binaries, or arbitrary remote code.
 
 ## Technology
 
@@ -52,15 +53,17 @@ commands, downloaded binaries, or arbitrary remote code.
 - mDNS discovery on local networks
 - CBOR request/response messages
 - persistent Ed25519 node identities
+- native Rust desktop Debugger with live logs, commands, and host metrics
 
 See [Architecture](docs/ARCHITECTURE.md) for the design boundaries and
-[Roadmap](docs/ROADMAP.md) for the staged research plan.
+[Roadmap](docs/ROADMAP.md) for the staged research plan. Ready-made and portable
+Windows packages are described in [Installation](docs/INSTALLATION.md).
 
 ## Quick start
 
 ### Prerequisites
 
-- Rust stable toolchain (Rust 1.85 or newer)
+- Rust stable toolchain (Rust 1.95 or newer)
 - two terminals, or two computers on the same local network
 
 ### Run two local nodes
@@ -68,13 +71,13 @@ See [Architecture](docs/ARCHITECTURE.md) for the design boundaries and
 In the first terminal:
 
 ```console
-cargo run -p swagri-node -- --name alpha --identity .swagri/alpha.key
+cargo run -p swagri-agent -- --name alpha --identity .swagri/alpha.key
 ```
 
 In the second terminal:
 
 ```console
-cargo run -p swagri-node -- --name beta --identity .swagri/beta.key
+cargo run -p swagri-agent -- --name beta --identity .swagri/beta.key
 ```
 
 The nodes should discover each other through mDNS. Type `peers` to list known
@@ -96,7 +99,8 @@ explicit `--dial <multiaddr>` copied from the other node's listen output.
 crates/
 ├── swagri-core/       Protocol-neutral task and result types
 ├── swagri-executor/   Allowlisted local task execution
-└── swagri-node/       P2P networking and interactive CLI
+├── swagri-node/       Lightweight P2P Agent implementation
+└── swagri-debugger/   Desktop test console and host telemetry
 ```
 
 ## Safety

@@ -1,0 +1,14 @@
+[package]
+name = "swagri-debugger"
+description = "Desktop control panel and live console for a local Swagri agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+eframe.workspace = true
+egui_plot.workspace = true
+sysinfo.workspace = true

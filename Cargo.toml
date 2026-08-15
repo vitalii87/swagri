@@ -3,13 +3,14 @@ members = [
     "crates/swagri-core",
     "crates/swagri-executor",
     "crates/swagri-node",
+    "crates/swagri-debugger",
 ]
 resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.95"
 authors = ["Vitalii <vitalii87@users.noreply.github.com>"]
 repository = "https://github.com/vitalii87/swagri"
 
@@ -43,4 +44,6 @@ tokio = { version = "1", features = [
 ] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-
+eframe = "0.35"
+egui_plot = "0.36"
+sysinfo = "0.39"
