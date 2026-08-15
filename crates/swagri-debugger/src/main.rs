@@ -147,10 +147,10 @@ impl DebuggerApp {
             if let Some(value) = line.strip_prefix("Peer ID: ") {
                 self.peer_id = Some(value.to_owned());
             }
-            if let Some(value) = line.strip_prefix("Listening on ") {
-                if !self.listen_addresses.iter().any(|item| item == value) {
-                    self.listen_addresses.push(value.to_owned());
-                }
+            if let Some(value) = line.strip_prefix("Listening on ")
+                && !self.listen_addresses.iter().any(|item| item == value)
+            {
+                self.listen_addresses.push(value.to_owned());
             }
             if line.starts_with("Result from ") {
                 self.completed_tasks += 1;
