@@ -22,6 +22,13 @@ const MAX_METRIC_SAMPLES: usize = 240;
 const DOWNLOADS_URL: &str = "https://github.com/vitalii87/swagri/actions/workflows/packages.yml";
 
 fn main() -> eframe::Result {
+    if std::env::args_os().skip(1).any(|argument| {
+        argument == std::ffi::OsStr::new("--version") || argument == std::ffi::OsStr::new("-V")
+    }) {
+        println!("swagri-debugger {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1180.0, 820.0]),
         ..Default::default()
