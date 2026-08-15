@@ -27,6 +27,39 @@ pub const MAX_BENCHMARK_ITERATIONS: u64 = 50_000_000;
 /// A request identifier is unique from the perspective of the originating node.
 pub type TaskId = String;
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ResourceSnapshot {
+    pub observed_at_unix_ms: u64,
+    pub os: String,
+    pub arch: String,
+    pub cpu_brand: String,
+    pub physical_cores: u16,
+    pub logical_cores: u16,
+    pub total_memory_bytes: u64,
+    pub available_memory_bytes: u64,
+    pub host_cpu_percent: f32,
+    pub agent_cpu_percent: f32,
+    pub agent_memory_bytes: u64,
+    pub active_tasks: u32,
+    pub cpu_limit_percent: f32,
+    pub memory_limit_percent: f32,
+    pub allocatable_memory_bytes: u64,
+    pub calibrated_cpu_score: f64,
+    pub effective_cpu_score: f64,
+}
+
+pub fn effective_cpu_score(
+    calibrated_score: f64,
+    host_cpu_percent: f32,
+    agent_cpu_percent: f32,
+    cpu_limit_percent: f32,
+) -> f64 {
+    let host_free = (100.0 - host_cpu_percent.clamp(0.0, 100.0)).max(0.0);
+    let policy_free =
+        (cpu_limit_percent.clamp(0.0, 100.0) - agent_cpu_percent.clamp(0.0, 100.0)).max(0.0);
+    calibrated_score.max(0.0) * f64::from(host_free.min(policy_free)) / 100.0
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UpdateManifest {
     pub version: String,
@@ -154,7 +187,7 @@ pub struct NodeCapabilities {
 impl Default for NodeCapabilities {
     fn default() -> Self {
         Self {
-            protocol_version: 1,
+            protocol_version: 2,
             task_kinds: vec![
                 TaskKind::NodeInfo,
                 TaskKind::Echo,
@@ -213,6 +246,8 @@ pub enum TaskResult {
     NodeInfo {
         agent_version: String,
         protocol_version: u16,
+        #[serde(default)]
+        resources: Option<ResourceSnapshot>,
     },
     Echo {
         message: String,
@@ -278,5 +313,12 @@ mod tests {
             manifest.signing_payload(),
             b"swagri-update-v1\n1.2.3\nwindows\nx86_64\n42\nabc\n"
         );
+    }
+
+    #[test]
+    fn effective_score_combines_machine_power_and_current_headroom() {
+        assert_eq!(effective_cpu_score(400.0, 72.0, 0.0, 100.0), 112.0);
+        assert_eq!(effective_cpu_score(100.0, 12.0, 0.0, 100.0), 88.0);
+        assert_eq!(effective_cpu_score(400.0, 10.0, 20.0, 25.0), 20.0);
     }
 }

@@ -20,7 +20,8 @@ pub fn execute(request: TaskRequest) -> TaskResponse {
     let result = match request.task {
         Task::NodeInfo => TaskResult::NodeInfo {
             agent_version: env!("CARGO_PKG_VERSION").into(),
-            protocol_version: 1,
+            protocol_version: 2,
+            resources: None,
         },
         Task::Echo { message } => TaskResult::Echo { message },
         Task::Sum { values } => TaskResult::Sum {
@@ -107,7 +108,11 @@ mod tests {
         assert!(matches!(
             response.outcome,
             TaskOutcome::Success {
-                result: TaskResult::NodeInfo { ref agent_version, protocol_version: 1 }
+                result: TaskResult::NodeInfo {
+                    ref agent_version,
+                    protocol_version: 2,
+                    resources: None,
+                }
             } if agent_version == env!("CARGO_PKG_VERSION")
         ));
     }

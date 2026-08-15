@@ -14,8 +14,10 @@ futures.workspace = true
 libp2p.workspace = true
 hex.workspace = true
 semver.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+sysinfo.workspace = true
 swagri-core = { path = "../swagri-core" }
 swagri-executor = { path = "../swagri-executor" }
 tokio.workspace = true

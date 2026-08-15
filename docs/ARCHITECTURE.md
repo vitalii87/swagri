@@ -39,10 +39,13 @@ Every node has the same role and can initiate or execute requests. The MVP uses:
 - CBOR messages on versioned protocol `/swagri/task/1`;
 - signed Agent manifests and chunks on `/swagri/update/1`;
 - small, allowlisted task kinds;
+- aggregate resource snapshots in `NodeInfo` responses;
+- cached one-time CPU calibration and five-second dynamic sampling;
 - request limits, execution limits, deadlines, and structured failures.
 
 The prototype has no global discovery, relay, reputation, payment, arbitrary
-code execution, or automatic distributed scheduler.
+code execution, or automatic distributed scheduler. Resource scores currently
+inform the operator; they do not place tasks automatically.
 
 ## Workspace boundaries
 
@@ -97,17 +100,34 @@ that derives that ID. A dedicated updater performs replacement only after the
 complete executable matches its signed manifest, retains the previous binary,
 and rolls back after an activation or health-check failure.
 
-## Adaptive scheduling direction
+## Resource snapshots and scoring
 
-A future node capability snapshot may contain:
+Version 0.4 advertises a deliberately small aggregate snapshot:
 
 ```text
-static:  architecture, cores, memory, accelerators, runtimes
-dynamic: load, free memory, temperature, power, battery, user activity
-network: latency, bandwidth, reachability
-state:   cached data, loaded models, active tasks
-policy:  trust class, contribution limits, quiet hours
+static:  OS, architecture, CPU model, physical/logical cores, total memory
+dynamic: smoothed host/Agent CPU, free memory, Agent memory, active tasks
+policy:  owner CPU and memory contribution limits
+score:   cached CPU calibration and effective available CPU score
 ```
+
+The CPU calibration is a bounded 200 ms single-thread calculation, cached by a
+hardware fingerprint and reused on later starts. Dynamic data is sampled every
+five seconds by default. Agents exchange only totals and percentages—not
+process names, files, user activity, or other private host details.
+
+The initial effective CPU score is:
+
+```text
+calibrated strength × min(host free CPU, policy CPU remaining) / 100
+```
+
+Advertised allocatable memory is the smaller of currently available RAM and the
+remaining owner-configured memory budget. These limits are scheduler signals,
+not OS-enforced hard quotas yet. Temperature, accelerators, network quality,
+energy state, and workload-specific benchmarks remain planned inputs.
+
+## Adaptive scheduling direction
 
 The scheduler should expand its candidate area in stages:
 

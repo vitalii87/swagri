@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "0.3.0-alpha",
+    [string]$Version = "0.4.0-alpha",
     [string]$Configuration = "release"
 )
 
@@ -33,11 +33,12 @@ Swagri $Version experimental build
 
 Debugger package:
   Run swagri-debugger.exe. It starts the bundled agent, shows host metrics,
-  streams logs, and accepts Swagri console commands.
+  peer capacity scores, streams logs, and accepts Swagri console commands.
 
 Agent package:
   Run swagri-agent.exe --name <device-name>
   Type help for commands. The persistent identity is stored under LocalAppData.
+  Resource sampling defaults to 5 seconds; CPU calibration is cached after one run.
 
 Updates: both packages include swagri-updater.exe. Trust a specific Peer ID
 before receiving signed P2P Agent updates. Use only on trusted test networks.

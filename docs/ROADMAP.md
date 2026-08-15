@@ -32,7 +32,8 @@ data.
 
 ## Phase 2 — Local cloud
 
-- capability and dynamic resource advertisement;
+- [x] Baseline CPU/memory capability and dynamic resource advertisement;
+- [x] Cached CPU calibration and an operator-visible effective-capacity score;
 - trust allowlists for the user's devices;
 - task queue, cancellation, deadlines, and retry policy;
 - resource budgets and contribution limits;
@@ -84,4 +85,3 @@ well-characterized workload without regressing unsuitable workloads.
 - How can a node prove or estimate capability without trusting every claim?
 - When is redundant execution worth its cost?
 - Which swarm-AI workflows benefit from heterogeneous edge devices?
-

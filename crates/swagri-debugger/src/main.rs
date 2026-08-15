@@ -93,6 +93,28 @@ struct PeerView {
     last_message: String,
     trusted_for_updates: bool,
     update_progress: Option<(u64, u64)>,
+    resources: Option<ResourceView>,
+}
+
+#[derive(Clone, Debug)]
+struct ResourceView {
+    observed_at_unix_ms: u64,
+    os: String,
+    arch: String,
+    cpu_brand: String,
+    physical_cores: u16,
+    logical_cores: u16,
+    total_memory_bytes: u64,
+    available_memory_bytes: u64,
+    host_cpu_percent: f32,
+    agent_cpu_percent: f32,
+    agent_memory_bytes: u64,
+    active_tasks: u32,
+    cpu_limit_percent: f32,
+    memory_limit_percent: f32,
+    allocatable_memory_bytes: u64,
+    calibrated_cpu_score: f64,
+    effective_cpu_score: f64,
 }
 
 struct DebuggerApp {
@@ -118,6 +140,9 @@ struct DebuggerApp {
     ready_update: Option<(String, String, PathBuf)>,
     updater_child: Option<Child>,
     completed_tasks: u64,
+    local_resources: Option<ResourceView>,
+    max_cpu_percent: f32,
+    max_memory_percent: f32,
     show_raw_console: bool,
     close_requested: bool,
     system: System,
@@ -158,6 +183,9 @@ impl DebuggerApp {
             ready_update: None,
             updater_child: None,
             completed_tasks: 0,
+            local_resources: None,
+            max_cpu_percent: 75.0,
+            max_memory_percent: 50.0,
             show_raw_console: false,
             close_requested: false,
             system: System::new_all(),
@@ -173,6 +201,7 @@ impl DebuggerApp {
             return;
         }
         self.local_peer_id = None;
+        self.local_resources = None;
         self.listen_addresses.clear();
         self.peers.clear();
         self.selected_peer = None;
@@ -183,6 +212,8 @@ impl DebuggerApp {
             &self.identity_path,
             &self.listen_address,
             &self.updater_path,
+            self.max_cpu_percent,
+            self.max_memory_percent,
             &self.output_tx,
         ) {
             Ok(agent) => {
@@ -220,6 +251,10 @@ impl DebuggerApp {
     fn find_agents(&mut self) {
         self.notice("Пошук у локальній мережі активний. Очікуємо mDNS-відповіді...");
         self.send("peers");
+        let peers = self.peers.keys().cloned().collect::<Vec<_>>();
+        for peer in peers {
+            self.send(format!("resources {peer}"));
+        }
     }
 
     fn test_connection(&mut self) {
@@ -413,6 +448,7 @@ impl DebuggerApp {
             ["PEER_CONNECTED", peer_id, ..] => {
                 self.peers.entry((*peer_id).into()).or_default().state = PeerState::Connected;
                 self.notice(format!("З'єднання з {} встановлено.", short_peer(peer_id)));
+                self.send(format!("resources {peer_id}"));
             }
             ["PEER_DISCONNECTED", peer_id, ..] => {
                 self.peers.entry((*peer_id).into()).or_default().state = PeerState::Disconnected;
@@ -439,6 +475,16 @@ impl DebuggerApp {
                 ));
                 if should_update {
                     self.request_peer_update((*peer_id).into());
+                }
+            }
+            ["LOCAL_RESOURCES", _, values @ ..] => {
+                if let Some(resources) = parse_resource_view(values) {
+                    self.local_resources = Some(resources);
+                }
+            }
+            ["PEER_RESOURCES", peer_id, values @ ..] => {
+                if let Some(resources) = parse_resource_view(values) {
+                    self.peers.entry((*peer_id).into()).or_default().resources = Some(resources);
                 }
             }
             ["UPDATE_TRUSTED", peer_id, ..] => {
@@ -561,7 +607,7 @@ impl DebuggerApp {
                 if ui
                     .add_enabled(
                         !self.peers.is_empty(),
-                        egui::Button::new("↻ Перевірити версії"),
+                        egui::Button::new("↻ Оновити ресурси й версії"),
                     )
                     .clicked()
                 {
@@ -614,6 +660,106 @@ impl DebuggerApp {
                 }
             }
         });
+
+        ui.add_space(4.0);
+        ui.label(RichText::new("Ресурси рою").strong());
+        let recommended = self
+            .peers
+            .iter()
+            .filter(|(_, peer)| peer.state == PeerState::Connected)
+            .filter_map(|(peer_id, peer)| {
+                peer.resources
+                    .as_ref()
+                    .map(|resources| (peer_id, resources.effective_cpu_score))
+            })
+            .max_by(|left, right| left.1.total_cmp(&right.1))
+            .map(|(peer_id, _)| peer_id.clone());
+
+        egui::ScrollArea::horizontal().show(ui, |ui| {
+            egui::Grid::new("resource_table")
+                .striped(true)
+                .num_columns(8)
+                .show(ui, |ui| {
+                    ui.strong("Агент");
+                    ui.strong("Процесор");
+                    ui.strong("Ядра");
+                    ui.strong("CPU пристрою");
+                    ui.strong("Вільна RAM");
+                    ui.strong("Swagri");
+                    ui.strong("Ефективна сила");
+                    ui.strong("Вибір");
+                    ui.end_row();
+
+                    for (peer_id, peer) in &self.peers {
+                        ui.label(short_peer(peer_id)).on_hover_text(peer_id);
+                        if let Some(resources) = &peer.resources {
+                            ui.label(short_cpu(&resources.cpu_brand))
+                                .on_hover_text(format!(
+                                    "{} / {} {} · калібрована сила {:.1}",
+                                    resources.os,
+                                    resources.arch,
+                                    resources.cpu_brand,
+                                    resources.calibrated_cpu_score
+                                ));
+                            ui.label(format!(
+                                "{}/{}",
+                                resources.physical_cores, resources.logical_cores
+                            ));
+                            ui.label(format!("{:.1}%", resources.host_cpu_percent));
+                            ui.label(format_gib(resources.available_memory_bytes))
+                                .on_hover_text(format!(
+                                    "Потенційно доступно Swagri: {} з {}",
+                                    format_gib(resources.allocatable_memory_bytes),
+                                    format_gib(resources.total_memory_bytes)
+                                ));
+                            ui.label(format!(
+                                "CPU {:.1}% · RAM {} · задач {}",
+                                resources.agent_cpu_percent,
+                                format_gib(resources.agent_memory_bytes),
+                                resources.active_tasks
+                            ))
+                            .on_hover_text(format!(
+                                "Ліміти: CPU {:.0}%, RAM {:.0}% · знімок {}",
+                                resources.cpu_limit_percent,
+                                resources.memory_limit_percent,
+                                resources.observed_at_unix_ms
+                            ));
+                            ui.label(format!("{:.1}", resources.effective_cpu_score));
+                            if recommended.as_deref() == Some(peer_id.as_str()) {
+                                ui.label(
+                                    RichText::new("рекомендовано")
+                                        .color(Color32::from_rgb(70, 210, 130))
+                                        .strong(),
+                                );
+                            } else {
+                                ui.label("—");
+                            }
+                        } else {
+                            ui.label("очікуємо дані");
+                            for _ in 0..6 {
+                                ui.label("—");
+                            }
+                        }
+                        ui.end_row();
+                    }
+                });
+        });
+
+        if let Some(peer_id) = recommended
+            && let Some(resources) = self
+                .peers
+                .get(&peer_id)
+                .and_then(|peer| peer.resources.as_ref())
+        {
+            ui.small(format!(
+                "Зараз найкращий кандидат: {} — ефективна сила {:.1} із каліброваних {:.1}; CPU пристрою зайнятий на {:.1}%, доступно {} RAM.",
+                short_peer(&peer_id),
+                resources.effective_cpu_score,
+                resources.calibrated_cpu_score,
+                resources.host_cpu_percent,
+                format_gib(resources.allocatable_memory_bytes)
+            ));
+        }
     }
 
     fn draw_metrics(&self, ui: &mut egui::Ui) {
@@ -623,6 +769,14 @@ impl DebuggerApp {
         ui.label(format!(
             "CPU {cpu:.1}%    Пам'ять {used_gib:.2}/{total_gib:.2} GiB"
         ));
+        if let Some(resources) = &self.local_resources {
+            ui.small(format!(
+                "Локальний Agent: CPU {:.1}% · RAM {} · доступна рою ефективна сила {:.1}",
+                resources.agent_cpu_percent,
+                format_gib(resources.agent_memory_bytes),
+                resources.effective_cpu_score
+            ));
+        }
         Plot::new("host_metrics")
             .height(130.0)
             .include_y(0.0)
@@ -742,7 +896,20 @@ impl DebuggerApp {
                 ui.label("Listen address");
                 ui.text_edit_singleline(&mut self.listen_address);
                 ui.end_row();
+                ui.label("Максимум CPU для Swagri");
+                ui.add_enabled(
+                    self.agent.is_none(),
+                    egui::Slider::new(&mut self.max_cpu_percent, 5.0..=100.0).suffix("%"),
+                );
+                ui.end_row();
+                ui.label("Максимум RAM для Swagri");
+                ui.add_enabled(
+                    self.agent.is_none(),
+                    egui::Slider::new(&mut self.max_memory_percent, 5.0..=100.0).suffix("%"),
+                );
+                ui.end_row();
             });
+        ui.small("Ліміти визначають, скільки вільного ресурсу агент може запропонувати рою. Змінюються після перезапуску агента; це ще не жорсткі обмеження ОС.");
         ui.label(format!(
             "Local Peer ID: {}",
             self.local_peer_id.as_deref().unwrap_or("ще не отримано")
@@ -800,19 +967,21 @@ impl eframe::App for DebuggerApp {
         self.refresh_metrics();
 
         egui::CentralPanel::default().show(root, |ui| {
-            self.draw_header(ui);
-            ui.separator();
-            self.draw_main_actions(ui);
-            ui.separator();
-            self.draw_peers(ui);
-            ui.separator();
-            self.draw_metrics(ui);
-            ui.separator();
-            ui.collapsing("Оновлення", |ui| self.draw_updates(ui));
-            ui.collapsing(
-                "Розширені налаштування та debug",
-                |ui| self.draw_debug_tools(ui),
-            );
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                self.draw_header(ui);
+                ui.separator();
+                self.draw_main_actions(ui);
+                ui.separator();
+                self.draw_peers(ui);
+                ui.separator();
+                self.draw_metrics(ui);
+                ui.separator();
+                ui.collapsing("Оновлення", |ui| self.draw_updates(ui));
+                ui.collapsing(
+                    "Розширені налаштування та debug",
+                    |ui| self.draw_debug_tools(ui),
+                );
+            });
         });
 
         if self.close_requested {
@@ -822,12 +991,15 @@ impl eframe::App for DebuggerApp {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_agent(
     path: &Path,
     node_name: &str,
     identity_path: &Path,
     listen_address: &str,
     updater_path: &Path,
+    max_cpu_percent: f32,
+    max_memory_percent: f32,
     output_tx: &Sender<String>,
 ) -> Result<ManagedAgent> {
     if !path.is_file() {
@@ -840,6 +1012,10 @@ fn spawn_agent(
         .args(["--listen", listen_address])
         .args(["--update-policy", "manual", "--updater"])
         .arg(updater_path)
+        .arg("--max-cpu-percent")
+        .arg(max_cpu_percent.to_string())
+        .arg("--max-memory-percent")
+        .arg(max_memory_percent.to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -947,6 +1123,44 @@ fn short_peer(peer: &str) -> String {
     }
 }
 
+fn short_cpu(cpu: &str) -> String {
+    let shortened = cpu.chars().take(30).collect::<String>();
+    if shortened.chars().count() < cpu.chars().count() {
+        format!("{shortened}…")
+    } else {
+        shortened
+    }
+}
+
+fn format_gib(bytes: u64) -> String {
+    format!("{:.2} GiB", bytes as f64 / 1024.0 / 1024.0 / 1024.0)
+}
+
+fn parse_resource_view(values: &[&str]) -> Option<ResourceView> {
+    if values.len() < 17 {
+        return None;
+    }
+    Some(ResourceView {
+        observed_at_unix_ms: values[0].parse().ok()?,
+        os: values[1].into(),
+        arch: values[2].into(),
+        cpu_brand: values[3].into(),
+        physical_cores: values[4].parse().ok()?,
+        logical_cores: values[5].parse().ok()?,
+        total_memory_bytes: values[6].parse().ok()?,
+        available_memory_bytes: values[7].parse().ok()?,
+        host_cpu_percent: values[8].parse().ok()?,
+        agent_cpu_percent: values[9].parse().ok()?,
+        agent_memory_bytes: values[10].parse().ok()?,
+        active_tasks: values[11].parse().ok()?,
+        cpu_limit_percent: values[12].parse().ok()?,
+        memory_limit_percent: values[13].parse().ok()?,
+        allocatable_memory_bytes: values[14].parse().ok()?,
+        calibrated_cpu_score: values[15].parse().ok()?,
+        effective_cpu_score: values[16].parse().ok()?,
+    })
+}
+
 fn is_newer(candidate: &str, current: &str) -> bool {
     match (Version::parse(candidate), Version::parse(current)) {
         (Ok(candidate), Ok(current)) => candidate > current,
@@ -990,5 +1204,32 @@ mod tests {
         let command = firewall_command(&PathBuf::from("C:\\Swagri\\swagri-agent.exe"));
         assert!(command.contains("swagri-agent.exe"));
         assert!(command.contains("-Protocol UDP"));
+    }
+
+    #[test]
+    fn parses_resource_event_payload() {
+        let fields = [
+            "123",
+            "windows",
+            "x86_64",
+            "Example CPU",
+            "8",
+            "16",
+            "34359738368",
+            "17179869184",
+            "72.5",
+            "2.5",
+            "104857600",
+            "1",
+            "75",
+            "50",
+            "8589934592",
+            "400.0",
+            "110.0",
+        ];
+        let resources = parse_resource_view(&fields).expect("valid resource event");
+        assert_eq!(resources.logical_cores, 16);
+        assert_eq!(resources.allocatable_memory_bytes, 8_589_934_592);
+        assert_eq!(resources.effective_cpu_score, 110.0);
     }
 }

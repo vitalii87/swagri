@@ -6,8 +6,8 @@ Swagri currently provides two Windows x64 applications.
   resources. It contains no GUI.
 - **Swagri Debugger** is the desktop test console. Its package also contains an
   agent, so it can start and control a local peer, discover nearby agents,
-  test connections and tasks with buttons, compare versions, display host CPU
-  and memory, and provide an optional technical console.
+  test connections and tasks with buttons, compare versions, display local and
+  peer resource capacity, and provide an optional technical console.
 
 ## Ready-made packages
 
@@ -52,11 +52,32 @@ The Agent stores its identity in `%LOCALAPPDATA%\Swagri\identity.key`. Debugger
 uses `%LOCALAPPDATA%\Swagri\debugger.key`. Keep these files if the devices
 should retain their peer identities.
 
+## Resource collection in 0.4
+
+The Agent samples aggregate CPU and memory data every five seconds and exposes
+it to connected peers through `resources <peer-id>` (the `info` command is an
+alias). A short CPU calibration runs only when the hardware cache is missing or
+no longer matches the device. Debugger shows calibrated strength, current host
+load, free and potentially allocatable RAM, Agent usage, active tasks, and an
+effective-capacity recommendation.
+
+Use the Debugger's advanced settings before starting its Agent, or configure a
+headless Agent directly:
+
+```console
+swagri-agent.exe --name second-computer --max-cpu-percent 60 --max-memory-percent 40
+```
+
+These percentages currently control what the Agent advertises as available to
+future scheduling. They are not yet hard operating-system quotas. Swagri sends
+no process list, filenames, or user-activity details in the snapshot.
+
 ## Updating test agents through the swarm
 
-Version 0.3 introduces signed, chunked peer-to-peer Agent updates. Install 0.3
+Version 0.3 introduced signed, chunked peer-to-peer Agent updates. Install 0.3
 manually once on every device; earlier agents do not yet understand the update
-protocol. Later Agent versions can be received from a connected newer Agent.
+protocol. Version 0.4 can then be received from a connected newer Agent, making
+0.3 → 0.4 the first practical upgrade test for the mechanism.
 
 In Debugger, select a newer peer and click **Trust and update through P2P**. The
 local Agent persists that exact Peer ID, requests its signed manifest, downloads

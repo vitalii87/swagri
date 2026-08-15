@@ -1,12 +1,16 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
+    hint::black_box,
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::Command,
     str::FromStr,
-    sync::atomic::{AtomicU64, Ordering},
-    time::Duration,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, AtomicU64, Ordering},
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
@@ -18,13 +22,15 @@ use libp2p::{
     swarm::{NetworkBehaviour, SwarmEvent},
 };
 use semver::Version;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use swagri_core::{
-    MAX_UPDATE_BYTES, SignedUpdateManifest, TASK_PROTOCOL_V1, Task, TaskOutcome, TaskRequest,
-    TaskResponse, TaskResult, UPDATE_CHUNK_BYTES, UPDATE_PROTOCOL_V1, UpdateManifest,
-    UpdateRequest, UpdateResponse,
+    MAX_UPDATE_BYTES, ResourceSnapshot, SignedUpdateManifest, TASK_PROTOCOL_V1, Task, TaskOutcome,
+    TaskRequest, TaskResponse, TaskResult, UPDATE_CHUNK_BYTES, UPDATE_PROTOCOL_V1, UpdateManifest,
+    UpdateRequest, UpdateResponse, effective_cpu_score,
 };
 use swagri_executor::execute;
+use sysinfo::{Pid, ProcessesToUpdate, System};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     sync::mpsc,
@@ -78,6 +84,22 @@ struct Args {
     /// Keep running when standard input is closed (used after self-update).
     #[arg(long)]
     daemon: bool,
+
+    /// Maximum share of total CPU capacity Swagri may advertise as usable.
+    #[arg(long, default_value_t = 75.0)]
+    max_cpu_percent: f32,
+
+    /// Maximum share of physical memory Swagri may advertise as usable.
+    #[arg(long, default_value_t = 50.0)]
+    max_memory_percent: f32,
+
+    /// Seconds between lightweight local resource samples.
+    #[arg(long, default_value_t = 5)]
+    resource_poll_seconds: u64,
+
+    /// File containing the cached one-time CPU calibration.
+    #[arg(long)]
+    calibration: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -166,10 +188,188 @@ struct UpdateManager {
     pending: Option<PendingDownload>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct CalibrationCache {
+    hardware_key: String,
+    score: f64,
+}
+
+struct ResourceMonitor {
+    system: System,
+    pid: Pid,
+    snapshot: ResourceSnapshot,
+    active_tasks: Arc<AtomicU32>,
+    ewma_host_cpu: Option<f32>,
+    ewma_agent_cpu: Option<f32>,
+}
+
+impl ResourceMonitor {
+    fn new(
+        calibration_path: &Path,
+        cpu_limit_percent: f32,
+        memory_limit_percent: f32,
+        active_tasks: Arc<AtomicU32>,
+    ) -> Result<Self> {
+        let mut system = System::new_all();
+        system.refresh_cpu_usage();
+        system.refresh_memory();
+        let pid = Pid::from_u32(std::process::id());
+        system.refresh_processes(ProcessesToUpdate::Some(&[pid]), false);
+
+        let logical_cores = system.cpus().len().max(1).min(u16::MAX as usize) as u16;
+        let physical_cores = System::physical_core_count()
+            .unwrap_or(logical_cores as usize)
+            .max(1)
+            .min(u16::MAX as usize) as u16;
+        let cpu_brand = system
+            .cpus()
+            .first()
+            .map(|cpu| cpu.brand().trim().to_owned())
+            .filter(|brand| !brand.is_empty())
+            .unwrap_or_else(|| "unknown CPU".into());
+        let total_memory_bytes = system.total_memory();
+        let hardware_key = format!(
+            "{}|{}|{}|{}",
+            cpu_brand,
+            logical_cores,
+            total_memory_bytes,
+            std::env::consts::ARCH
+        );
+        let calibrated_cpu_score =
+            load_or_calibrate_cpu(calibration_path, &hardware_key, logical_cores)?;
+
+        let snapshot = ResourceSnapshot {
+            observed_at_unix_ms: unix_time_ms(),
+            os: std::env::consts::OS.into(),
+            arch: std::env::consts::ARCH.into(),
+            cpu_brand,
+            physical_cores,
+            logical_cores,
+            total_memory_bytes,
+            available_memory_bytes: system.available_memory(),
+            host_cpu_percent: system.global_cpu_usage(),
+            agent_cpu_percent: 0.0,
+            agent_memory_bytes: system.process(pid).map_or(0, |process| process.memory()),
+            active_tasks: 0,
+            cpu_limit_percent,
+            memory_limit_percent,
+            allocatable_memory_bytes: 0,
+            calibrated_cpu_score,
+            effective_cpu_score: 0.0,
+        };
+        let mut monitor = Self {
+            system,
+            pid,
+            snapshot,
+            active_tasks,
+            ewma_host_cpu: None,
+            ewma_agent_cpu: None,
+        };
+        monitor.refresh();
+        Ok(monitor)
+    }
+
+    fn refresh(&mut self) {
+        self.system.refresh_cpu_usage();
+        self.system.refresh_memory();
+        self.system
+            .refresh_processes(ProcessesToUpdate::Some(&[self.pid]), false);
+
+        let host_cpu = self.system.global_cpu_usage().clamp(0.0, 100.0);
+        let process_cpu = self
+            .system
+            .process(self.pid)
+            .map_or(0.0, |process| process.cpu_usage());
+        let agent_cpu =
+            (process_cpu / f32::from(self.snapshot.logical_cores.max(1))).clamp(0.0, 100.0);
+        let host_cpu = ewma(&mut self.ewma_host_cpu, host_cpu);
+        let agent_cpu = ewma(&mut self.ewma_agent_cpu, agent_cpu);
+        let agent_memory = self
+            .system
+            .process(self.pid)
+            .map_or(0, |process| process.memory());
+        let memory_policy_bytes = (self.snapshot.total_memory_bytes as f64
+            * f64::from(self.snapshot.memory_limit_percent)
+            / 100.0) as u64;
+
+        self.snapshot.observed_at_unix_ms = unix_time_ms();
+        self.snapshot.available_memory_bytes = self.system.available_memory();
+        self.snapshot.host_cpu_percent = host_cpu;
+        self.snapshot.agent_cpu_percent = agent_cpu;
+        self.snapshot.agent_memory_bytes = agent_memory;
+        self.snapshot.active_tasks = self.active_tasks.load(Ordering::Relaxed);
+        self.snapshot.allocatable_memory_bytes = self
+            .snapshot
+            .available_memory_bytes
+            .min(memory_policy_bytes.saturating_sub(agent_memory));
+        self.snapshot.effective_cpu_score = effective_cpu_score(
+            self.snapshot.calibrated_cpu_score,
+            host_cpu,
+            agent_cpu,
+            self.snapshot.cpu_limit_percent,
+        );
+    }
+}
+
+fn ewma(previous: &mut Option<f32>, sample: f32) -> f32 {
+    let value = previous.map_or(sample, |old| old * 0.75 + sample * 0.25);
+    *previous = Some(value);
+    value
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn load_or_calibrate_cpu(path: &Path, hardware_key: &str, logical_cores: u16) -> Result<f64> {
+    if let Ok(bytes) = fs::read(path)
+        && let Ok(cache) = serde_json::from_slice::<CalibrationCache>(&bytes)
+        && cache.hardware_key == hardware_key
+        && cache.score.is_finite()
+        && cache.score > 0.0
+    {
+        return Ok(cache.score);
+    }
+
+    let start = Instant::now();
+    let duration = Duration::from_millis(200);
+    let mut iterations = 0_u64;
+    let mut value = 0x9e37_79b9_7f4a_7c15_u64;
+    while start.elapsed() < duration {
+        for _ in 0..4096 {
+            value ^= value << 13;
+            value ^= value >> 7;
+            value ^= value << 17;
+            iterations += 1;
+        }
+        black_box(value);
+    }
+    let score = iterations as f64 / start.elapsed().as_secs_f64() / 1_000_000.0
+        * f64::from(logical_cores.max(1));
+    let cache = CalibrationCache {
+        hardware_key: hardware_key.into(),
+        score,
+    };
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_vec_pretty(&cache)?)
+        .with_context(|| format!("could not save CPU calibration to {}", path.display()))?;
+    Ok(score)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
     let args = Args::parse();
+    validate_resource_limits(&args)?;
     let identity_path = args.identity.clone().unwrap_or_else(default_identity_path);
     let keypair = load_or_create_identity(&identity_path)?;
     let local_peer_id = PeerId::from(keypair.public());
@@ -183,8 +383,18 @@ async fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(default_update_staging);
     let updater = args.updater.clone().unwrap_or_else(default_updater_path);
-    let restart_arguments =
-        restart_arguments(&args, &identity_path, &trust_path, &staging, &updater);
+    let calibration_path = args
+        .calibration
+        .clone()
+        .unwrap_or_else(|| identity_path.with_file_name("cpu-calibration.json"));
+    let restart_arguments = restart_arguments(
+        &args,
+        &identity_path,
+        &trust_path,
+        &staging,
+        &updater,
+        &calibration_path,
+    );
     let source = build_update_source(&keypair)?;
     let mut updates = UpdateManager::new(args.update_policy, trust_path, staging, updater, source)?;
 
@@ -204,7 +414,17 @@ async fn main() -> Result<()> {
     let (completed_tx, mut completed_rx) = mpsc::unbounded_channel::<CompletedResponse>();
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut known_peers = BTreeMap::<PeerId, BTreeSet<Multiaddr>>::new();
+    let mut connected_peers = BTreeSet::<PeerId>::new();
     let request_counter = AtomicU64::new(1);
+    let active_tasks = Arc::new(AtomicU32::new(0));
+    let mut resources = ResourceMonitor::new(
+        &calibration_path,
+        args.max_cpu_percent,
+        args.max_memory_percent,
+        active_tasks.clone(),
+    )?;
+    let mut resource_tick = tokio::time::interval(Duration::from_secs(args.resource_poll_seconds));
+    resource_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut stdin_closed = false;
 
     println!("Swagri agent '{}'", args.name);
@@ -231,6 +451,7 @@ async fn main() -> Result<()> {
                         &known_peers,
                         &mut updates,
                         &restart_arguments,
+                        &resources.snapshot,
                     ) => break,
                     Some(_) => {}
                     None if args.daemon => stdin_closed = true,
@@ -243,8 +464,11 @@ async fn main() -> Result<()> {
                     &mut swarm,
                     &completed_tx,
                     &mut known_peers,
+                    &mut connected_peers,
                     &mut updates,
                     &restart_arguments,
+                    &resources.snapshot,
+                    &active_tasks,
                 ) {
                     break;
                 }
@@ -259,6 +483,19 @@ async fn main() -> Result<()> {
                     warn!("requester disconnected before the response was sent");
                 }
             }
+            _ = resource_tick.tick() => {
+                resources.refresh();
+                emit_resource_event("LOCAL_RESOURCES", &local_peer_id.to_string(), &resources.snapshot);
+                for peer in &connected_peers {
+                    submit_task(
+                        &mut swarm,
+                        *peer,
+                        Task::NodeInfo,
+                        local_peer_id,
+                        &request_counter,
+                    );
+                }
+            }
             _ = tokio::signal::ctrl_c() => {
                 info!("received shutdown signal");
                 break;
@@ -266,6 +503,19 @@ async fn main() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn validate_resource_limits(args: &Args) -> Result<()> {
+    if !(1.0..=100.0).contains(&args.max_cpu_percent) {
+        bail!("--max-cpu-percent must be between 1 and 100");
+    }
+    if !(1.0..=100.0).contains(&args.max_memory_percent) {
+        bail!("--max-memory-percent must be between 1 and 100");
+    }
+    if args.resource_poll_seconds < 2 {
+        bail!("--resource-poll-seconds must be at least 2");
+    }
     Ok(())
 }
 
@@ -401,6 +651,7 @@ fn restart_arguments(
     trust: &Path,
     staging: &Path,
     updater: &Path,
+    calibration: &Path,
 ) -> Vec<String> {
     let mut result = vec![
         "--name".into(),
@@ -424,6 +675,14 @@ fn restart_arguments(
         staging.to_string_lossy().into_owned(),
         "--updater".into(),
         updater.to_string_lossy().into_owned(),
+        "--max-cpu-percent".into(),
+        args.max_cpu_percent.to_string(),
+        "--max-memory-percent".into(),
+        args.max_memory_percent.to_string(),
+        "--resource-poll-seconds".into(),
+        args.resource_poll_seconds.to_string(),
+        "--calibration".into(),
+        calibration.to_string_lossy().into_owned(),
         "--daemon".into(),
     ];
     for address in &args.dial {
@@ -506,13 +765,17 @@ fn load_or_create_identity(path: &Path) -> Result<identity::Keypair> {
     Ok(keypair)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_swarm_event(
     event: SwarmEvent<BehaviourEvent>,
     swarm: &mut libp2p::Swarm<Behaviour>,
     completed_tx: &mpsc::UnboundedSender<CompletedResponse>,
     known_peers: &mut BTreeMap<PeerId, BTreeSet<Multiaddr>>,
+    connected_peers: &mut BTreeSet<PeerId>,
     updates: &mut UpdateManager,
     restart_arguments: &[String],
+    resources: &ResourceSnapshot,
+    active_tasks: &Arc<AtomicU32>,
 ) -> bool {
     let mut shutdown = false;
     match event {
@@ -522,10 +785,12 @@ fn handle_swarm_event(
         }
         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
             known_peers.entry(peer_id).or_default();
+            connected_peers.insert(peer_id);
             info!(peer = %peer_id, "peer connected");
             emit_event("PEER_CONNECTED", &[&peer_id.to_string()]);
         }
         SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
+            connected_peers.remove(&peer_id);
             info!(peer = %peer_id, ?cause, "peer disconnected");
             emit_event("PEER_DISCONNECTED", &[&peer_id.to_string()]);
         }
@@ -566,7 +831,7 @@ fn handle_swarm_event(
             }
         }
         SwarmEvent::Behaviour(BehaviourEvent::RequestResponse(event)) => {
-            handle_request_response(event, completed_tx);
+            handle_request_response(event, completed_tx, resources, active_tasks);
         }
         SwarmEvent::Behaviour(BehaviourEvent::Update(event)) => {
             shutdown = handle_update_event(event, swarm, updates, restart_arguments);
@@ -578,7 +843,7 @@ fn handle_swarm_event(
                     .strip_prefix("swagri/")
                     .and_then(|value| value.split_whitespace().next())
                     .unwrap_or(&info.agent_version);
-                emit_event("PEER_VERSION", &[&peer_id.to_string(), version, "1"]);
+                emit_event("PEER_VERSION", &[&peer_id.to_string(), version, "2"]);
                 if updates.policy == UpdatePolicy::Automatic
                     && updates.trusted.contains(&peer_id)
                     && updates.pending.is_none()
@@ -601,6 +866,8 @@ fn handle_swarm_event(
 fn handle_request_response(
     event: request_response::Event<TaskRequest, TaskResponse>,
     completed_tx: &mpsc::UnboundedSender<CompletedResponse>,
+    resources: &ResourceSnapshot,
+    active_tasks: &Arc<AtomicU32>,
 ) {
     match event {
         request_response::Event::Message {
@@ -612,9 +879,25 @@ fn handle_request_response(
             ..
         } => {
             info!(peer = %peer, task_id = %request.id, kind = ?request.task.kind(), "received task");
+            if request.task == Task::NodeInfo {
+                let response = TaskResponse::success(
+                    request.id,
+                    0,
+                    TaskResult::NodeInfo {
+                        agent_version: env!("CARGO_PKG_VERSION").into(),
+                        protocol_version: 2,
+                        resources: Some(resources.clone()),
+                    },
+                );
+                let _ = completed_tx.send(CompletedResponse { channel, response });
+                return;
+            }
             let completed_tx = completed_tx.clone();
+            let active_tasks = active_tasks.clone();
+            active_tasks.fetch_add(1, Ordering::Relaxed);
             tokio::task::spawn_blocking(move || {
                 let response = execute(request);
+                active_tasks.fetch_sub(1, Ordering::Relaxed);
                 let _ = completed_tx.send(CompletedResponse { channel, response });
             });
         }
@@ -623,11 +906,12 @@ fn handle_request_response(
             message: request_response::Message::Response { response, .. },
             ..
         } => {
-            if let TaskOutcome::Success {
+            let is_node_info = if let TaskOutcome::Success {
                 result:
                     TaskResult::NodeInfo {
                         agent_version,
                         protocol_version,
+                        resources,
                     },
             } = &response.outcome
             {
@@ -639,15 +923,23 @@ fn handle_request_response(
                         &protocol_version.to_string(),
                     ],
                 );
+                if let Some(resources) = resources {
+                    emit_resource_event("PEER_RESOURCES", &peer.to_string(), resources);
+                }
+                true
+            } else {
+                false
+            };
+            if !is_node_info {
+                emit_event(
+                    "TASK_RESULT",
+                    &[
+                        &peer.to_string(),
+                        &response.id,
+                        &response.duration_ms.to_string(),
+                    ],
+                );
             }
-            emit_event(
-                "TASK_RESULT",
-                &[
-                    &peer.to_string(),
-                    &response.id,
-                    &response.duration_ms.to_string(),
-                ],
-            );
             println!(
                 "Result from {peer}: id={} duration={}ms outcome={:?}",
                 response.id, response.duration_ms, response.outcome
@@ -1026,6 +1318,7 @@ fn schedule_self_update(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_command(
     line: &str,
     swarm: &mut libp2p::Swarm<Behaviour>,
@@ -1034,6 +1327,7 @@ fn handle_command(
     known_peers: &BTreeMap<PeerId, BTreeSet<Multiaddr>>,
     updates: &mut UpdateManager,
     restart_arguments: &[String],
+    resources: &ResourceSnapshot,
 ) -> bool {
     let line = line.trim();
     if line.is_empty() {
@@ -1131,7 +1425,11 @@ fn handle_command(
             }
         }
         "quit" | "exit" => return false,
-        "info" => {
+        "local-resources" => {
+            println!("{resources:#?}");
+            emit_resource_event("LOCAL_RESOURCES", &local_peer_id.to_string(), resources);
+        }
+        "info" | "resources" => {
             let result = parse_peer(&mut parts).map(|peer| (peer, Task::NodeInfo));
             submit_parsed(result, swarm, local_peer_id, request_counter);
         }
@@ -1203,20 +1501,30 @@ fn submit_parsed(
                 return;
             }
 
-            let sequence = request_counter.fetch_add(1, Ordering::Relaxed);
-            let id = format!("{local_peer_id}-{sequence}");
-            let task_kind = task.kind();
-            swarm.behaviour_mut().request_response.send_request(
-                &peer,
-                TaskRequest {
-                    id: id.clone(),
-                    task,
-                },
-            );
-            println!("Submitted {task_kind:?} task {id} to {peer}");
+            submit_task(swarm, peer, task, local_peer_id, request_counter);
         }
         Err(error) => println!("Invalid command: {error:#}"),
     }
+}
+
+fn submit_task(
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    peer: PeerId,
+    task: Task,
+    local_peer_id: PeerId,
+    request_counter: &AtomicU64,
+) {
+    let sequence = request_counter.fetch_add(1, Ordering::Relaxed);
+    let id = format!("{local_peer_id}-{sequence}");
+    let task_kind = task.kind();
+    swarm.behaviour_mut().request_response.send_request(
+        &peer,
+        TaskRequest {
+            id: id.clone(),
+            task,
+        },
+    );
+    debug!(%peer, %id, ?task_kind, "submitted task");
 }
 
 fn print_peers(peers: &BTreeMap<PeerId, BTreeSet<Multiaddr>>) {
@@ -1246,7 +1554,8 @@ fn print_help() {
          download-update <peer-id>         Download and verify without applying\n\
          connect <peer-id>                 Connect using a discovered address\n\
          dial <multiaddr>                  Connect using an explicit address\n\
-         info <peer-id>                    Read the remote agent version\n\
+         local-resources                   Show this device resource snapshot\n\
+         info|resources <peer-id>          Read remote version and resources\n\
          echo <peer-id> <text>             Return text from the remote node\n\
          sum <peer-id> <numbers...>         Sum finite numbers remotely\n\
          sha256 <peer-id> <text>            Hash text remotely\n\
@@ -1261,6 +1570,31 @@ fn emit_event(kind: &str, fields: &[&str]) {
         print!("\t{}", field.replace(['\t', '\r', '\n'], " "));
     }
     println!();
+}
+
+fn emit_resource_event(kind: &str, peer: &str, resources: &ResourceSnapshot) {
+    let fields = vec![
+        peer.to_owned(),
+        resources.observed_at_unix_ms.to_string(),
+        resources.os.clone(),
+        resources.arch.clone(),
+        resources.cpu_brand.clone(),
+        resources.physical_cores.to_string(),
+        resources.logical_cores.to_string(),
+        resources.total_memory_bytes.to_string(),
+        resources.available_memory_bytes.to_string(),
+        format!("{:.2}", resources.host_cpu_percent),
+        format!("{:.2}", resources.agent_cpu_percent),
+        resources.agent_memory_bytes.to_string(),
+        resources.active_tasks.to_string(),
+        format!("{:.2}", resources.cpu_limit_percent),
+        format!("{:.2}", resources.memory_limit_percent),
+        resources.allocatable_memory_bytes.to_string(),
+        format!("{:.3}", resources.calibrated_cpu_score),
+        format!("{:.3}", resources.effective_cpu_score),
+    ];
+    let refs = fields.iter().map(String::as_str).collect::<Vec<_>>();
+    emit_event(kind, &refs);
 }
 
 #[cfg(test)]
