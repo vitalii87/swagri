@@ -1,0 +1,31 @@
+name: Feature request
+description: Propose a scoped capability or improvement.
+title: "feature: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Which concrete user or research problem should this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+      description: Include local execution or a smaller implementation where relevant.
+  - type: textarea
+    id: safety
+    attributes:
+      label: Safety and resource impact
+      description: Consider trust, network, energy, thermal load, and data movement.
+    validations:
+      required: true
+

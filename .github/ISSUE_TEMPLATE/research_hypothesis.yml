@@ -1,0 +1,33 @@
+name: Research hypothesis
+description: Propose a measurable Swagri experiment.
+title: "research: "
+labels: ["research"]
+body:
+  - type: textarea
+    id: hypothesis
+    attributes:
+      label: Hypothesis
+      description: Write a claim that an experiment could reject.
+    validations:
+      required: true
+  - type: textarea
+    id: baseline
+    attributes:
+      label: Baseline
+      description: What local or fixed policy will be used for comparison?
+    validations:
+      required: true
+  - type: textarea
+    id: method
+    attributes:
+      label: Experiment
+      description: Workload, nodes, conditions, and repeated measurements.
+    validations:
+      required: true
+  - type: textarea
+    id: metrics
+    attributes:
+      label: Metrics and acceptance criteria
+    validations:
+      required: true
+

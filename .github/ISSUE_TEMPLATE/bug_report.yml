@@ -1,0 +1,43 @@
+name: Bug report
+description: Report reproducible incorrect behavior.
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: Do not include private keys, tokens, or sensitive task data.
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Observed behavior
+      description: What happened?
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Include commands and the smallest reproducible setup.
+    validations:
+      required: true
+  - type: input
+    id: revision
+    attributes:
+      label: Swagri revision
+      placeholder: Commit SHA or branch
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, hardware, Rust version, network topology, and number of nodes.
+    validations:
+      required: true
+

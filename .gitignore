@@ -1,0 +1,14 @@
+/target/
+/.swagri/
+*.key
+*.log
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
