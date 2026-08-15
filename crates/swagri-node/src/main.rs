@@ -247,10 +247,7 @@ fn handle_swarm_event(
                     .entry(peer_id)
                     .or_default()
                     .insert(address.clone());
-                swarm
-                    .behaviour_mut()
-                    .request_response
-                    .add_address(&peer_id, address);
+                swarm.add_peer_address(peer_id, address);
             }
         }
         SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Expired(peers))) => {
@@ -259,10 +256,6 @@ fn handle_swarm_event(
                 if let Some(addresses) = known_peers.get_mut(&peer_id) {
                     addresses.remove(&address);
                 }
-                swarm
-                    .behaviour_mut()
-                    .request_response
-                    .remove_address(&peer_id, &address);
             }
         }
         SwarmEvent::Behaviour(BehaviourEvent::RequestResponse(event)) => {
@@ -353,12 +346,12 @@ fn handle_command(
         "peers" => print_peers(known_peers),
         "quit" | "exit" => return false,
         "echo" => {
-            let result = parse_peer(&mut parts).map(|peer| {
+            let result = parse_peer(&mut parts).and_then(|peer| {
                 let message = parts.collect::<Vec<_>>().join(" ");
                 if message.is_empty() {
                     bail!("echo requires a message");
                 }
-                (peer, Task::Echo { message })
+                Ok((peer, Task::Echo { message }))
             });
             submit_parsed(result, swarm, local_peer_id, request_counter);
         }
