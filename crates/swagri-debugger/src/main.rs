@@ -972,7 +972,7 @@ impl DebuggerApp {
             ui.small(format!(
                 "Локально-перший вибір: цей комп'ютер має силу {:.1}; найсильніший peer {} має {:.1}, але для мережевого виконання потрібно щонайменше {:.1}.",
                 local.effective_cpu_score,
-                short_peer(&peer_id),
+                short_peer(peer_id),
                 remote.effective_cpu_score,
                 local.effective_cpu_score * REMOTE_CPU_MINIMUM_GAIN
             ));
