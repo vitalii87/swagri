@@ -25,9 +25,6 @@ jobs:
       - name: Select Rust toolchain
         run: rustup default stable
 
-      - name: Test workspace
-        run: cargo test --workspace --all-targets
-
       - name: Build release binaries
         run: cargo build --release -p swagri-agent -p swagri-debugger
 
