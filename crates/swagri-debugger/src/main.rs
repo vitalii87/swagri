@@ -3,7 +3,7 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     io::{BufRead, BufReader, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     sync::mpsc::{self, Receiver, Sender},
     thread,
@@ -754,7 +754,7 @@ fn path_editor(ui: &mut egui::Ui, path: &mut PathBuf) {
     }
 }
 
-fn firewall_command(agent_path: &PathBuf) -> String {
+fn firewall_command(agent_path: &Path) -> String {
     format!(
         "New-NetFirewallRule -DisplayName \"Swagri Agent QUIC\" -Direction Inbound -Program \"{}\" -Protocol UDP -Action Allow -Profile Private",
         agent_path.display()
