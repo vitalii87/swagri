@@ -24,6 +24,10 @@ pub const MAX_SUM_VALUES: usize = 100_000;
 /// Maximum iterations accepted by the synthetic CPU benchmark.
 pub const MAX_BENCHMARK_ITERATIONS: u64 = 50_000_000;
 
+/// Minimum effective-CPU advantage required before local-first placement sends
+/// a CPU-only task over the network.
+pub const REMOTE_CPU_MINIMUM_GAIN: f64 = 1.20;
+
 /// A request identifier is unique from the perspective of the originating node.
 pub type TaskId = String;
 
@@ -58,6 +62,69 @@ pub fn effective_cpu_score(
     let policy_free =
         (cpu_limit_percent.clamp(0.0, 100.0) - agent_cpu_percent.clamp(0.0, 100.0)).max(0.0);
     calibrated_score.max(0.0) * f64::from(host_free.min(policy_free)) / 100.0
+}
+
+/// Result of comparing the local CPU headroom with observed remote agents.
+/// The index refers to the caller-provided `remote_scores` slice.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CpuPlacementDecision {
+    pub remote_candidate_index: Option<usize>,
+    pub local_score: f64,
+    pub selected_score: f64,
+    pub minimum_remote_score: f64,
+}
+
+/// Selects a remote CPU only when its current effective score clears the
+/// configured network-overhead margin. Invalid or unavailable scores never win.
+pub fn choose_cpu_placement(
+    local_score: f64,
+    remote_scores: &[f64],
+    minimum_gain: f64,
+) -> CpuPlacementDecision {
+    let local_score = finite_non_negative(local_score);
+    let minimum_gain = if minimum_gain.is_finite() {
+        minimum_gain.max(1.0)
+    } else {
+        REMOTE_CPU_MINIMUM_GAIN
+    };
+    let minimum_remote_score = local_score * minimum_gain;
+    let best_remote = remote_scores
+        .iter()
+        .enumerate()
+        .filter_map(|(index, score)| {
+            score
+                .is_finite()
+                .then_some((index, score.max(0.0)))
+                .filter(|(_, score)| *score > 0.0)
+        })
+        .max_by(|left, right| left.1.total_cmp(&right.1));
+
+    if let Some((index, score)) = best_remote
+        && score >= minimum_remote_score
+        && score > local_score
+    {
+        return CpuPlacementDecision {
+            remote_candidate_index: Some(index),
+            local_score,
+            selected_score: score,
+            minimum_remote_score,
+        };
+    }
+
+    CpuPlacementDecision {
+        remote_candidate_index: None,
+        local_score,
+        selected_score: local_score,
+        minimum_remote_score,
+    }
+}
+
+fn finite_non_negative(value: f64) -> f64 {
+    if value.is_finite() {
+        value.max(0.0)
+    } else {
+        0.0
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -340,5 +407,30 @@ mod tests {
         assert_eq!(effective_cpu_score(400.0, 72.0, 0.0, 100.0), 112.0);
         assert_eq!(effective_cpu_score(100.0, 12.0, 0.0, 100.0), 88.0);
         assert_eq!(effective_cpu_score(400.0, 10.0, 20.0, 25.0), 20.0);
+    }
+
+    #[test]
+    fn cpu_placement_stays_local_when_remote_gain_is_too_small() {
+        let decision = choose_cpu_placement(100.0, &[119.9, 80.0], REMOTE_CPU_MINIMUM_GAIN);
+
+        assert_eq!(decision.remote_candidate_index, None);
+        assert_eq!(decision.selected_score, 100.0);
+        assert_eq!(decision.minimum_remote_score, 120.0);
+    }
+
+    #[test]
+    fn cpu_placement_selects_the_strongest_remote_above_margin() {
+        let decision = choose_cpu_placement(100.0, &[125.0, 150.0, 130.0], REMOTE_CPU_MINIMUM_GAIN);
+
+        assert_eq!(decision.remote_candidate_index, Some(1));
+        assert_eq!(decision.selected_score, 150.0);
+    }
+
+    #[test]
+    fn cpu_placement_ignores_invalid_remote_scores() {
+        let decision = choose_cpu_placement(100.0, &[f64::NAN, -1.0, 0.0], f64::NAN);
+
+        assert_eq!(decision.remote_candidate_index, None);
+        assert_eq!(decision.minimum_remote_score, 120.0);
     }
 }

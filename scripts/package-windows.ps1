@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "0.5.0-alpha",
+    [string]$Version = "0.6.0-alpha",
     [string]$Configuration = "release"
 )
 
@@ -33,7 +33,8 @@ Swagri $Version experimental build
 
 Debugger package:
   Run swagri-debugger.exe. It starts the bundled agent, shows host metrics,
-  peer capacity scores, streams logs, and accepts Swagri console commands.
+  peer capacity scores, offers the local-first Smart CPU test, streams logs,
+  and accepts Swagri console commands.
 
 Agent package:
   Run swagri-agent.exe --name <device-name>

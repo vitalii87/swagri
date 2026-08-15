@@ -15,3 +15,4 @@ sysinfo.workspace = true
 rfd.workspace = true
 semver.workspace = true
 webbrowser.workspace = true
+swagri-core = { path = "../swagri-core" }

@@ -25,9 +25,10 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use swagri_core::{
-    MAX_UPDATE_BYTES, ResourceSnapshot, SignedUpdateManifest, TASK_PROTOCOL_V1, Task, TaskOutcome,
-    TaskRequest, TaskResponse, TaskResult, UPDATE_CHUNK_BYTES, UPDATE_PROTOCOL_V1, UpdateManifest,
-    UpdateRequest, UpdateResponse, effective_cpu_score,
+    MAX_UPDATE_BYTES, REMOTE_CPU_MINIMUM_GAIN, ResourceSnapshot, SignedUpdateManifest,
+    TASK_PROTOCOL_V1, Task, TaskOutcome, TaskRequest, TaskResponse, TaskResult, UPDATE_CHUNK_BYTES,
+    UPDATE_PROTOCOL_V1, UpdateManifest, UpdateRequest, UpdateResponse, choose_cpu_placement,
+    effective_cpu_score,
 };
 use swagri_executor::execute;
 use sysinfo::{Pid, ProcessesToUpdate, System};
@@ -37,6 +38,8 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
+
+const REMOTE_RESOURCE_MAX_AGE: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -161,6 +164,16 @@ impl From<ping::Event> for BehaviourEvent {
 struct CompletedResponse {
     channel: request_response::ResponseChannel<TaskResponse>,
     response: TaskResponse,
+}
+
+struct CompletedLocalTask {
+    peer: PeerId,
+    response: TaskResponse,
+}
+
+struct PeerResourceObservation {
+    snapshot: ResourceSnapshot,
+    received_at: Instant,
 }
 
 struct UpdateSource {
@@ -428,9 +441,12 @@ async fn main() -> Result<()> {
     }
 
     let (completed_tx, mut completed_rx) = mpsc::unbounded_channel::<CompletedResponse>();
+    let (local_completed_tx, mut local_completed_rx) =
+        mpsc::unbounded_channel::<CompletedLocalTask>();
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut known_peers = BTreeMap::<PeerId, BTreeSet<Multiaddr>>::new();
     let mut connected_peers = BTreeSet::<PeerId>::new();
+    let mut peer_resources = BTreeMap::<PeerId, PeerResourceObservation>::new();
     let request_counter = AtomicU64::new(1);
     let active_tasks = Arc::new(AtomicU32::new(0));
     let mut resources = ResourceMonitor::new(
@@ -468,6 +484,9 @@ async fn main() -> Result<()> {
                         &mut updates,
                         &restart_arguments,
                         &resources.snapshot,
+                        &peer_resources,
+                        &local_completed_tx,
+                        &active_tasks,
                     ) => break,
                     Some(_) => {}
                     None if args.daemon => stdin_closed = true,
@@ -481,6 +500,7 @@ async fn main() -> Result<()> {
                     &completed_tx,
                     &mut known_peers,
                     &mut connected_peers,
+                    &mut peer_resources,
                     &mut updates,
                     &restart_arguments,
                     &resources.snapshot,
@@ -498,6 +518,9 @@ async fn main() -> Result<()> {
                 {
                     warn!("requester disconnected before the response was sent");
                 }
+            }
+            Some(completed) = local_completed_rx.recv() => {
+                report_task_response(completed.peer, &completed.response);
             }
             _ = resource_tick.tick() => {
                 resources.refresh();
@@ -835,6 +858,7 @@ fn handle_swarm_event(
     completed_tx: &mpsc::UnboundedSender<CompletedResponse>,
     known_peers: &mut BTreeMap<PeerId, BTreeSet<Multiaddr>>,
     connected_peers: &mut BTreeSet<PeerId>,
+    peer_resources: &mut BTreeMap<PeerId, PeerResourceObservation>,
     updates: &mut UpdateManager,
     restart_arguments: &[String],
     resources: &ResourceSnapshot,
@@ -854,6 +878,7 @@ fn handle_swarm_event(
         }
         SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
             connected_peers.remove(&peer_id);
+            peer_resources.remove(&peer_id);
             info!(peer = %peer_id, ?cause, "peer disconnected");
             emit_event("PEER_DISCONNECTED", &[&peer_id.to_string()]);
         }
@@ -894,7 +919,7 @@ fn handle_swarm_event(
             }
         }
         SwarmEvent::Behaviour(BehaviourEvent::RequestResponse(event)) => {
-            handle_request_response(event, completed_tx, resources, active_tasks);
+            handle_request_response(event, completed_tx, resources, active_tasks, peer_resources);
         }
         SwarmEvent::Behaviour(BehaviourEvent::Update(event)) => {
             shutdown = handle_update_event(event, swarm, updates, restart_arguments);
@@ -931,6 +956,7 @@ fn handle_request_response(
     completed_tx: &mpsc::UnboundedSender<CompletedResponse>,
     resources: &ResourceSnapshot,
     active_tasks: &Arc<AtomicU32>,
+    peer_resources: &mut BTreeMap<PeerId, PeerResourceObservation>,
 ) {
     match event {
         request_response::Event::Message {
@@ -988,25 +1014,21 @@ fn handle_request_response(
                 );
                 if let Some(resources) = resources {
                     emit_resource_event("PEER_RESOURCES", &peer.to_string(), resources);
+                    peer_resources.insert(
+                        peer,
+                        PeerResourceObservation {
+                            snapshot: resources.clone(),
+                            received_at: Instant::now(),
+                        },
+                    );
                 }
                 true
             } else {
                 false
             };
             if !is_node_info {
-                emit_event(
-                    "TASK_RESULT",
-                    &[
-                        &peer.to_string(),
-                        &response.id,
-                        &response.duration_ms.to_string(),
-                    ],
-                );
+                report_task_response(peer, &response);
             }
-            println!(
-                "Result from {peer}: id={} duration={}ms outcome={:?}",
-                response.id, response.duration_ms, response.outcome
-            );
         }
         request_response::Event::OutboundFailure {
             peer,
@@ -1031,6 +1053,26 @@ fn handle_request_response(
             debug!(peer = %peer, ?request_id, "task response sent");
         }
     }
+}
+
+fn report_task_response(peer: PeerId, response: &TaskResponse) {
+    match &response.outcome {
+        TaskOutcome::Success { .. } => emit_event(
+            "TASK_RESULT",
+            &[
+                &peer.to_string(),
+                &response.id,
+                &response.duration_ms.to_string(),
+            ],
+        ),
+        TaskOutcome::Failure { message, .. } => {
+            emit_event("TASK_FAILED", &[&peer.to_string(), message]);
+        }
+    }
+    println!(
+        "Result from {peer}: id={} duration={}ms outcome={:?}",
+        response.id, response.duration_ms, response.outcome
+    );
 }
 
 fn begin_update_request(
@@ -1511,6 +1553,9 @@ fn handle_command(
     updates: &mut UpdateManager,
     restart_arguments: &[String],
     resources: &ResourceSnapshot,
+    peer_resources: &BTreeMap<PeerId, PeerResourceObservation>,
+    local_completed_tx: &mpsc::UnboundedSender<CompletedLocalTask>,
+    active_tasks: &Arc<AtomicU32>,
 ) -> bool {
     let line = line.trim();
     if line.is_empty() {
@@ -1664,6 +1709,29 @@ fn handle_command(
             });
             submit_parsed(result, swarm, local_peer_id, request_counter);
         }
+        "auto-benchmark" => {
+            let result = parts
+                .next()
+                .context("auto-benchmark requires an iteration count")
+                .and_then(|value| {
+                    value
+                        .parse::<u64>()
+                        .context("iteration count must be an integer")
+                });
+            match result {
+                Ok(iterations) => place_cpu_benchmark(
+                    iterations,
+                    swarm,
+                    local_peer_id,
+                    request_counter,
+                    resources,
+                    peer_resources,
+                    local_completed_tx,
+                    active_tasks,
+                ),
+                Err(error) => println!("Invalid command: {error:#}"),
+            }
+        }
         _ => println!("Unknown command. Type 'help'."),
     }
 
@@ -1714,6 +1782,107 @@ fn submit_task(
     debug!(%peer, %id, ?task_kind, "submitted task");
 }
 
+#[allow(clippy::too_many_arguments)]
+fn place_cpu_benchmark(
+    iterations: u64,
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    local_peer_id: PeerId,
+    request_counter: &AtomicU64,
+    resources: &ResourceSnapshot,
+    peer_resources: &BTreeMap<PeerId, PeerResourceObservation>,
+    local_completed_tx: &mpsc::UnboundedSender<CompletedLocalTask>,
+    active_tasks: &Arc<AtomicU32>,
+) {
+    let task = Task::CpuBenchmark { iterations };
+    if let Err(error) = task.validate() {
+        println!("Task rejected locally: {error}");
+        return;
+    }
+
+    let candidates = peer_resources
+        .iter()
+        .filter(|(_, observation)| observation.received_at.elapsed() <= REMOTE_RESOURCE_MAX_AGE)
+        .map(|(peer, observation)| (*peer, observation.snapshot.effective_cpu_score))
+        .collect::<Vec<_>>();
+    let scores = candidates
+        .iter()
+        .map(|(_, score)| *score)
+        .collect::<Vec<_>>();
+    let decision = choose_cpu_placement(
+        resources.effective_cpu_score,
+        &scores,
+        REMOTE_CPU_MINIMUM_GAIN,
+    );
+
+    if let Some(index) = decision.remote_candidate_index {
+        let peer = candidates[index].0;
+        emit_placement_decision("remote", peer, decision, candidates.len());
+        println!(
+            "Placement: remote {peer} (local {:.1}, remote {:.1}, required {:.1})",
+            decision.local_score, decision.selected_score, decision.minimum_remote_score
+        );
+        submit_task(swarm, peer, task, local_peer_id, request_counter);
+        return;
+    }
+
+    emit_placement_decision("local", local_peer_id, decision, candidates.len());
+    println!(
+        "Placement: local {local_peer_id} (local {:.1}, required remote {:.1})",
+        decision.local_score, decision.minimum_remote_score
+    );
+    submit_local_task(
+        task,
+        local_peer_id,
+        request_counter,
+        local_completed_tx,
+        active_tasks,
+    );
+}
+
+fn submit_local_task(
+    task: Task,
+    local_peer_id: PeerId,
+    request_counter: &AtomicU64,
+    local_completed_tx: &mpsc::UnboundedSender<CompletedLocalTask>,
+    active_tasks: &Arc<AtomicU32>,
+) {
+    let sequence = request_counter.fetch_add(1, Ordering::Relaxed);
+    let request = TaskRequest {
+        id: format!("{local_peer_id}-local-{sequence}"),
+        task,
+    };
+    let local_completed_tx = local_completed_tx.clone();
+    let active_tasks = active_tasks.clone();
+    active_tasks.fetch_add(1, Ordering::Relaxed);
+    tokio::task::spawn_blocking(move || {
+        let response = execute(request);
+        active_tasks.fetch_sub(1, Ordering::Relaxed);
+        let _ = local_completed_tx.send(CompletedLocalTask {
+            peer: local_peer_id,
+            response,
+        });
+    });
+}
+
+fn emit_placement_decision(
+    target_kind: &str,
+    target_peer: PeerId,
+    decision: swagri_core::CpuPlacementDecision,
+    candidate_count: usize,
+) {
+    emit_event(
+        "PLACEMENT_DECISION",
+        &[
+            target_kind,
+            &target_peer.to_string(),
+            &format!("{:.3}", decision.local_score),
+            &format!("{:.3}", decision.selected_score),
+            &format!("{:.3}", decision.minimum_remote_score),
+            &candidate_count.to_string(),
+        ],
+    );
+}
+
 fn print_peers(peers: &BTreeMap<PeerId, BTreeSet<Multiaddr>>) {
     if peers.is_empty() {
         println!("No peers discovered yet.");
@@ -1748,6 +1917,7 @@ fn print_help() {
          sum <peer-id> <numbers...>         Sum finite numbers remotely\n\
          sha256 <peer-id> <text>            Hash text remotely\n\
          benchmark <peer-id> <iterations>   Run bounded synthetic CPU work\n\
+         auto-benchmark <iterations>        Place CPU work locally or on a stronger peer\n\
          quit                              Stop the node"
     );
 }

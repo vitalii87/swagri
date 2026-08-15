@@ -52,7 +52,7 @@ The Agent stores its identity in `%LOCALAPPDATA%\Swagri\identity.key`. Debugger
 uses `%LOCALAPPDATA%\Swagri\debugger.key`. Keep these files if the devices
 should retain their peer identities.
 
-## Resource collection in 0.4
+## Resource collection and placement
 
 The Agent samples aggregate CPU and memory data every five seconds and exposes
 it to connected peers through `resources <peer-id>` (the `info` command is an
@@ -71,6 +71,21 @@ swagri-agent.exe --name second-computer --max-cpu-percent 60 --max-memory-percen
 These percentages currently control what the Agent advertises as available to
 future scheduling. They are not yet hard operating-system quotas. Swagri sends
 no process list, filenames, or user-activity details in the snapshot.
+
+Version 0.6 adds **Smart CPU test** to Debugger. The equivalent console command
+is:
+
+```text
+auto-benchmark 1000000
+```
+
+The Agent compares its current effective CPU score with resource observations
+received from connected peers. It executes locally unless the strongest fresh
+peer is at least 20% better, which provides a simple allowance for network and
+coordination overhead. Debugger shows the chosen device, both scores, the
+required threshold, and completion time. Only the allowlisted built-in CPU
+benchmark uses this policy in 0.6; ordinary tasks are not yet automatically
+queued, divided, migrated, retried, or cancelled.
 
 ## Updating Agent and Debugger through the swarm
 
@@ -121,6 +136,9 @@ Debugger 0.4 does not contain the new GUI-update command, so install Debugger
 Debugger, or use the installer fallback on both. Beginning with 0.5, later
 Debugger versions can update each other entirely through P2P. Agent 0.4 can
 still update itself to 0.5 through the existing P2P mechanism.
+
+Once Debugger 0.5 is installed, version 0.6 can be used as the first complete
+Debugger-to-Debugger P2P upgrade test.
 
 ## Build packages locally
 

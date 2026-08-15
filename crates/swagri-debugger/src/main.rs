@@ -15,6 +15,7 @@ use anyhow::{Context, Result, bail};
 use eframe::egui::{self, Color32, RichText};
 use egui_plot::{Line, Plot, PlotPoints};
 use semver::Version;
+use swagri_core::{REMOTE_CPU_MINIMUM_GAIN, choose_cpu_placement};
 use sysinfo::System;
 
 const MAX_LOG_LINES: usize = 2_000;
@@ -152,6 +153,7 @@ struct DebuggerApp {
     updater_child: Option<Child>,
     completed_tasks: u64,
     local_resources: Option<ResourceView>,
+    last_placement: Option<String>,
     max_cpu_percent: f32,
     max_memory_percent: f32,
     show_raw_console: bool,
@@ -198,6 +200,7 @@ impl DebuggerApp {
             updater_child: None,
             completed_tasks: 0,
             local_resources: None,
+            last_placement: None,
             max_cpu_percent: 75.0,
             max_memory_percent: 50.0,
             show_raw_console: false,
@@ -216,6 +219,7 @@ impl DebuggerApp {
         }
         self.local_peer_id = None;
         self.local_resources = None;
+        self.last_placement = None;
         self.listen_addresses.clear();
         self.peers.clear();
         self.selected_peer = None;
@@ -294,6 +298,11 @@ impl DebuggerApp {
             _ => format!("echo {peer} hello-from-swagri-debugger"),
         };
         self.send(command);
+    }
+
+    fn run_smart_benchmark(&mut self) {
+        self.notice("Scheduler 0.6 порівнює актуальну локальну силу з підключеними агентами…");
+        self.send("auto-benchmark 1000000");
     }
 
     fn check_versions(&mut self) {
@@ -633,21 +642,69 @@ impl DebuggerApp {
                     short_peer(peer_id)
                 ));
             }
+            [
+                "PLACEMENT_DECISION",
+                target_kind,
+                target_peer,
+                local_score,
+                selected_score,
+                minimum_remote_score,
+                candidates,
+                ..,
+            ] => {
+                if let (Ok(local), Ok(selected), Ok(required), Ok(candidate_count)) = (
+                    local_score.parse::<f64>(),
+                    selected_score.parse::<f64>(),
+                    minimum_remote_score.parse::<f64>(),
+                    candidates.parse::<usize>(),
+                ) {
+                    let message = if *target_kind == "remote" {
+                        format!(
+                            "Scheduler 0.6: обрано агент {} — сила {:.1} проти {:.1} локально (потрібно ≥ {:.1}; кандидатів {}).",
+                            short_peer(target_peer),
+                            selected,
+                            local,
+                            required,
+                            candidate_count
+                        )
+                    } else {
+                        format!(
+                            "Scheduler 0.6: обрано цей комп'ютер — локальна сила {:.1}; жоден із {} агентів не перевищив поріг {:.1}.",
+                            local, candidate_count, required
+                        )
+                    };
+                    self.last_placement = Some(message.clone());
+                    self.notice(message);
+                }
+            }
             ["TASK_RESULT", peer_id, _, duration, ..] => {
                 self.completed_tasks += 1;
-                let peer = self.peers.entry((*peer_id).into()).or_default();
-                peer.state = PeerState::Connected;
-                peer.last_message = format!("Тест успішний ({duration} ms)");
-                self.notice(format!("Тест зв'язку з {} успішний.", short_peer(peer_id)));
+                if self.local_peer_id.as_deref() == Some(*peer_id) {
+                    self.notice(format!(
+                        "Локальна задача успішно завершена за {duration} ms."
+                    ));
+                } else {
+                    let peer = self.peers.entry((*peer_id).into()).or_default();
+                    peer.state = PeerState::Connected;
+                    peer.last_message = format!("Задача успішна ({duration} ms)");
+                    self.notice(format!(
+                        "Задача на агенті {} успішно завершена за {duration} ms.",
+                        short_peer(peer_id)
+                    ));
+                }
             }
             ["TASK_FAILED", peer_id, error, ..] => {
-                let peer = self.peers.entry((*peer_id).into()).or_default();
-                peer.state = PeerState::Failed;
-                peer.last_message = (*error).into();
-                self.notice(format!(
-                    "Не вдалося підключитися до {}: {error}",
-                    short_peer(peer_id)
-                ));
+                if self.local_peer_id.as_deref() == Some(*peer_id) {
+                    self.notice(format!("Локальна задача завершилась помилкою: {error}"));
+                } else {
+                    let peer = self.peers.entry((*peer_id).into()).or_default();
+                    peer.state = PeerState::Failed;
+                    peer.last_message = (*error).into();
+                    self.notice(format!(
+                        "Задача на агенті {} завершилась помилкою: {error}",
+                        short_peer(peer_id)
+                    ));
+                }
             }
             _ => {}
         }
@@ -723,6 +780,18 @@ impl DebuggerApp {
                 }
                 if ui
                     .add_enabled(
+                        self.agent.is_some(),
+                        egui::Button::new("⚙ Розумний CPU-тест"),
+                    )
+                    .on_hover_text(
+                        "Виконати локально або автоматично обрати значно сильніший вільний агент",
+                    )
+                    .clicked()
+                {
+                    self.run_smart_benchmark();
+                }
+                if ui
+                    .add_enabled(
                         !self.peers.is_empty(),
                         egui::Button::new("↻ Оновити ресурси й версії"),
                     )
@@ -780,7 +849,7 @@ impl DebuggerApp {
 
         ui.add_space(4.0);
         ui.label(RichText::new("Ресурси рою").strong());
-        let recommended = self
+        let remote_candidates = self
             .peers
             .iter()
             .filter(|(_, peer)| peer.state == PeerState::Connected)
@@ -789,8 +858,25 @@ impl DebuggerApp {
                     .as_ref()
                     .map(|resources| (peer_id, resources.effective_cpu_score))
             })
+            .collect::<Vec<_>>();
+        let remote_scores = remote_candidates
+            .iter()
+            .map(|(_, score)| *score)
+            .collect::<Vec<_>>();
+        let placement = self.local_resources.as_ref().map(|local| {
+            choose_cpu_placement(
+                local.effective_cpu_score,
+                &remote_scores,
+                REMOTE_CPU_MINIMUM_GAIN,
+            )
+        });
+        let recommended = placement
+            .and_then(|decision| decision.remote_candidate_index)
+            .map(|index| remote_candidates[index].0.as_str());
+        let strongest_remote = remote_candidates
+            .iter()
             .max_by(|left, right| left.1.total_cmp(&right.1))
-            .map(|(peer_id, _)| peer_id.clone());
+            .map(|(peer_id, _)| peer_id.as_str());
 
         egui::ScrollArea::horizontal().show(ui, |ui| {
             egui::Grid::new("resource_table")
@@ -842,7 +928,7 @@ impl DebuggerApp {
                                 resources.observed_at_unix_ms
                             ));
                             ui.label(format!("{:.1}", resources.effective_cpu_score));
-                            if recommended.as_deref() == Some(peer_id.as_str()) {
+                            if recommended == Some(peer_id.as_str()) {
                                 ui.label(
                                     RichText::new("рекомендовано")
                                         .color(Color32::from_rgb(70, 210, 130))
@@ -865,16 +951,30 @@ impl DebuggerApp {
         if let Some(peer_id) = recommended
             && let Some(resources) = self
                 .peers
-                .get(&peer_id)
+                .get(peer_id)
                 .and_then(|peer| peer.resources.as_ref())
         {
             ui.small(format!(
                 "Зараз найкращий кандидат: {} — ефективна сила {:.1} із каліброваних {:.1}; CPU пристрою зайнятий на {:.1}%, доступно {} RAM.",
-                short_peer(&peer_id),
+                short_peer(peer_id),
                 resources.effective_cpu_score,
                 resources.calibrated_cpu_score,
                 resources.host_cpu_percent,
                 format_gib(resources.allocatable_memory_bytes)
+            ));
+        } else if let Some(peer_id) = strongest_remote
+            && let Some(remote) = self
+                .peers
+                .get(peer_id)
+                .and_then(|peer| peer.resources.as_ref())
+            && let Some(local) = &self.local_resources
+        {
+            ui.small(format!(
+                "Локально-перший вибір: цей комп'ютер має силу {:.1}; найсильніший peer {} має {:.1}, але для мережевого виконання потрібно щонайменше {:.1}.",
+                local.effective_cpu_score,
+                short_peer(&peer_id),
+                remote.effective_cpu_score,
+                local.effective_cpu_score * REMOTE_CPU_MINIMUM_GAIN
             ));
         }
     }
@@ -893,6 +993,13 @@ impl DebuggerApp {
                 format_gib(resources.agent_memory_bytes),
                 resources.effective_cpu_score
             ));
+        }
+        if let Some(placement) = &self.last_placement {
+            ui.label(
+                RichText::new(placement)
+                    .color(Color32::from_rgb(70, 210, 130))
+                    .strong(),
+            );
         }
         Plot::new("host_metrics")
             .height(130.0)

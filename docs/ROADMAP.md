@@ -38,7 +38,7 @@ data.
 - trust allowlists for the user's devices;
 - task queue, cancellation, deadlines, and retry policy;
 - resource budgets and contribution limits;
-- local-first placement decision;
+- [x] first local-first placement decision for the bounded CPU benchmark;
 - thermal/load-aware chunk assignment;
 - SQLite event and measurement store;
 - benchmark suite for scheduler decisions.

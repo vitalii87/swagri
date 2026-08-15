@@ -41,11 +41,14 @@ Every node has the same role and can initiate or execute requests. The MVP uses:
 - small, allowlisted task kinds;
 - aggregate resource snapshots in `NodeInfo` responses;
 - cached one-time CPU calibration and five-second dynamic sampling;
+- local-first placement for the bounded built-in CPU benchmark;
 - request limits, execution limits, deadlines, and structured failures.
 
 The prototype has no global discovery, relay, reputation, payment, arbitrary
-code execution, or automatic distributed scheduler. Resource scores currently
-inform the operator; they do not place tasks automatically.
+code execution, or general distributed scheduler. Version 0.6 uses resource
+scores for one constrained decision only: `auto-benchmark` remains local unless
+a connected peer with a resource observation no older than 20 seconds exceeds
+the local effective CPU score by at least 20%.
 
 ## Workspace boundaries
 
@@ -69,7 +72,7 @@ the interactive CLI.
 ```text
 user command
   -> validate local request
-  -> select explicit peer (MVP)
+  -> select explicit peer, or local-first CPU placement for auto-benchmark
   -> open request substream
   -> validate request on receiver
   -> execute with limits
@@ -107,7 +110,7 @@ an explicit GUI action because it closes and restarts the control application.
 
 ## Resource snapshots and scoring
 
-Version 0.4 advertises a deliberately small aggregate snapshot:
+Version 0.4 and later advertise a deliberately small aggregate snapshot:
 
 ```text
 static:  OS, architecture, CPU model, physical/logical cores, total memory
@@ -133,6 +136,13 @@ not OS-enforced hard quotas yet. Temperature, accelerators, network quality,
 energy state, and workload-specific benchmarks remain planned inputs.
 
 ## Adaptive scheduling direction
+
+Version 0.6 implements the first measurable scheduler slice for a CPU-only,
+zero-input built-in task. It compares the local score with fresh connected-peer
+scores, applies a 20% remote-gain margin as a coarse allowance for coordination
+cost, emits the decision for Debugger, and executes outside the network event
+loop. This is not yet a general scheduler: it has no measured latency model,
+queue, cancellation, retry, task splitting, or data-locality input.
 
 The scheduler should expand its candidate area in stages:
 
