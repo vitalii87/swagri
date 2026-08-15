@@ -13,7 +13,7 @@ use clap::Parser;
 #[command(
     name = "swagri-updater",
     version,
-    about = "Apply a verified Swagri agent update"
+    about = "Apply a verified Swagri component update"
 )]
 struct Args {
     #[arg(long)]
@@ -26,6 +26,12 @@ struct Args {
     restart_args: PathBuf,
     #[arg(long)]
     no_restart: bool,
+    /// Optional version marker written after a successful component restart.
+    #[arg(long, requires = "replacement_version")]
+    version_marker: Option<PathBuf>,
+    /// Version stored in --version-marker after successful activation.
+    #[arg(long, requires = "version_marker")]
+    replacement_version: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -36,6 +42,8 @@ fn main() -> Result<()> {
         &args.backup,
         &args.restart_args,
         args.no_restart,
+        args.version_marker.as_deref(),
+        args.replacement_version.as_deref(),
     )
 }
 
@@ -45,6 +53,8 @@ fn apply_update(
     backup: &Path,
     restart_args: &Path,
     no_restart: bool,
+    version_marker: Option<&Path>,
+    replacement_version: Option<&str>,
 ) -> Result<()> {
     if !target.is_file() {
         bail!("target does not exist: {}", target.display());
@@ -91,6 +101,18 @@ fn apply_update(
         return Err(error).context("could not activate replacement; previous version restored");
     }
 
+    let previous_marker = version_marker.map(|marker| fs::read(marker).ok());
+    if let (Some(marker), Some(version)) = (version_marker, replacement_version)
+        && let Err(error) = fs::write(marker, format!("{version}\n"))
+    {
+        rollback(target, backup);
+        restore_marker(
+            marker,
+            previous_marker.as_ref().and_then(|value| value.as_deref()),
+        );
+        return Err(error).context("could not update component version marker; rollback completed");
+    }
+
     if no_restart {
         let health = Command::new(target)
             .arg("--version")
@@ -100,6 +122,12 @@ fn apply_update(
             .status();
         if !matches!(health, Ok(status) if status.success()) {
             rollback(target, backup);
+            if let Some(marker) = version_marker {
+                restore_marker(
+                    marker,
+                    previous_marker.as_ref().and_then(|value| value.as_deref()),
+                );
+            }
             bail!("updated agent failed its version health check; previous version restored");
         }
         let _ = fs::remove_file(replacement);
@@ -117,6 +145,12 @@ fn apply_update(
         Ok(child) => child,
         Err(error) => {
             rollback(target, backup);
+            if let Some(marker) = version_marker {
+                restore_marker(
+                    marker,
+                    previous_marker.as_ref().and_then(|value| value.as_deref()),
+                );
+            }
             return Err(error).context("new agent could not start; previous version restored");
         }
     };
@@ -124,6 +158,12 @@ fn apply_update(
     thread::sleep(Duration::from_secs(2));
     if let Some(status) = child.try_wait().context("could not check updated agent")? {
         rollback(target, backup);
+        if let Some(marker) = version_marker {
+            restore_marker(
+                marker,
+                previous_marker.as_ref().and_then(|value| value.as_deref()),
+            );
+        }
         bail!("updated agent exited during health check ({status}); previous version restored");
     }
 
@@ -135,6 +175,14 @@ fn apply_update(
 fn rollback(target: &Path, backup: &Path) {
     let _ = fs::remove_file(target);
     let _ = fs::rename(backup, target);
+}
+
+fn restore_marker(marker: &Path, previous: Option<&[u8]>) {
+    if let Some(previous) = previous {
+        let _ = fs::write(marker, previous);
+    } else {
+        let _ = fs::remove_file(marker);
+    }
 }
 
 #[cfg(test)]
@@ -150,6 +198,8 @@ mod tests {
             &root.join("backup"),
             &root.join("args"),
             false,
+            None,
+            None,
         );
         assert!(result.is_err());
     }

@@ -78,6 +78,16 @@ impl UpdateManifest {
         )
         .into_bytes()
     }
+
+    /// Stable bytes used for a Debugger binary. A distinct domain prevents a
+    /// signed Agent manifest from being replayed as a Debugger update.
+    pub fn debugger_signing_payload(&self) -> Vec<u8> {
+        format!(
+            "swagri-debugger-update-v1\n{}\n{}\n{}\n{}\n{}\n",
+            self.version, self.target_os, self.target_arch, self.size, self.sha256_hex
+        )
+        .into_bytes()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -93,7 +103,13 @@ pub struct SignedUpdateManifest {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum UpdateRequest {
     Manifest,
+    DebuggerManifest,
     Chunk {
+        version: String,
+        offset: u64,
+        length: u32,
+    },
+    DebuggerChunk {
         version: String,
         offset: u64,
         length: u32,
@@ -312,6 +328,10 @@ mod tests {
         assert_eq!(
             manifest.signing_payload(),
             b"swagri-update-v1\n1.2.3\nwindows\nx86_64\n42\nabc\n"
+        );
+        assert_eq!(
+            manifest.debugger_signing_payload(),
+            b"swagri-debugger-update-v1\n1.2.3\nwindows\nx86_64\n42\nabc\n"
         );
     }
 

@@ -37,7 +37,7 @@ Every node has the same role and can initiate or execute requests. The MVP uses:
 - explicit multiaddresses as a fallback;
 - libp2p PeerId values derived from persistent Ed25519 identities;
 - CBOR messages on versioned protocol `/swagri/task/1`;
-- signed Agent manifests and chunks on `/swagri/update/1`;
+- separately signed Agent and Debugger manifests and chunks on `/swagri/update/1`;
 - small, allowlisted task kinds;
 - aggregate resource snapshots in `NodeInfo` responses;
 - cached one-time CPU calibration and five-second dynamic sampling;
@@ -99,6 +99,11 @@ enrolls a specific Peer ID, and manifests must verify against the public key
 that derives that ID. A dedicated updater performs replacement only after the
 complete executable matches its signed manifest, retains the previous binary,
 and rolls back after an activation or health-check failure.
+
+Agent and Debugger use different signature domains. This prevents a valid
+Agent manifest from being replayed as a GUI update. Agent updates may run
+automatically for an already trusted peer; Debugger replacement always requires
+an explicit GUI action because it closes and restarts the control application.
 
 ## Resource snapshots and scoring
 

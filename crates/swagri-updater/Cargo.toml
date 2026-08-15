@@ -1,6 +1,6 @@
 [package]
 name = "swagri-updater"
-description = "Atomic Swagri agent replacement and rollback helper"
+description = "Atomic Swagri component replacement and rollback helper"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

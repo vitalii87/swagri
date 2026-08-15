@@ -72,7 +72,7 @@ These percentages currently control what the Agent advertises as available to
 future scheduling. They are not yet hard operating-system quotas. Swagri sends
 no process list, filenames, or user-activity details in the snapshot.
 
-## Updating test agents through the swarm
+## Updating Agent and Debugger through the swarm
 
 Version 0.3 introduced signed, chunked peer-to-peer Agent updates. Install 0.3
 manually once on every device; earlier agents do not yet understand the update
@@ -99,8 +99,28 @@ For unattended headless operation, start the Agent with
 `--update-policy automatic`; only peers already present in the trust file are
 eligible. `--update-policy disabled` turns receiving updates off.
 
-P2P updates replace the lightweight Agent only. Debugger itself is updated with
-`Swagri-Debugger-Setup-x64.exe` because it owns and supervises the bundled Agent.
+Before version 0.5, P2P updates replaced only the lightweight Agent and the
+Debugger required `Swagri-Debugger-Setup-x64.exe`.
+
+Version 0.5 adds full Debugger P2P updates. On both test computers, first use
+the **Update Agent through P2P** button. After the local Agent is current,
+select the same trusted newer peer and click **Update Debugger through P2P**.
+The Agent downloads the peer's sibling Debugger binary in chunks using a
+Debugger-specific signature domain. The GUI then stops its local Agent,
+launches the updater, closes, retains `swagri-debugger.previous.exe`, and starts
+the new GUI. A failed activation restores the previous executable.
+
+The source must be a Debugger installation or Debugger portable directory that
+contains `swagri-debugger.exe` and its `swagri-debugger.version` marker. A
+headless Agent package intentionally cannot distribute a GUI it does not have.
+
+### One-time 0.4 → 0.5 transition
+
+Debugger 0.4 does not contain the new GUI-update command, so install Debugger
+0.5 manually on at least the source computer and then once on the other test
+Debugger, or use the installer fallback on both. Beginning with 0.5, later
+Debugger versions can update each other entirely through P2P. Agent 0.4 can
+still update itself to 0.5 through the existing P2P mechanism.
 
 ## Build packages locally
 

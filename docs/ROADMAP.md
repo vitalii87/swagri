@@ -34,6 +34,7 @@ data.
 
 - [x] Baseline CPU/memory capability and dynamic resource advertisement;
 - [x] Cached CPU calibration and an operator-visible effective-capacity score;
+- [x] Trusted P2P updates for both headless Agent and desktop Debugger;
 - trust allowlists for the user's devices;
 - task queue, cancellation, deadlines, and retry policy;
 - resource budgets and contribution limits;

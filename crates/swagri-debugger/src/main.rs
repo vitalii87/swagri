@@ -93,6 +93,7 @@ struct PeerView {
     last_message: String,
     trusted_for_updates: bool,
     update_progress: Option<(u64, u64)>,
+    debugger_update_progress: Option<(u64, u64)>,
     resources: Option<ResourceView>,
 }
 
@@ -131,13 +132,16 @@ struct DebuggerApp {
     output_tx: Sender<String>,
     output_rx: Receiver<String>,
     local_peer_id: Option<String>,
-    local_version: String,
+    agent_version: String,
+    debugger_version: String,
     listen_addresses: Vec<String>,
     peers: BTreeMap<String, PeerView>,
     selected_peer: Option<String>,
     automatic_peer_updates: bool,
     requested_updates: BTreeSet<String>,
     ready_update: Option<(String, String, PathBuf)>,
+    requested_debugger_updates: BTreeSet<String>,
+    ready_debugger_update: Option<(String, String, PathBuf)>,
     updater_child: Option<Child>,
     completed_tasks: u64,
     local_resources: Option<ResourceView>,
@@ -174,13 +178,16 @@ impl DebuggerApp {
             output_tx,
             output_rx,
             local_peer_id: None,
-            local_version: env!("CARGO_PKG_VERSION").into(),
+            agent_version: "очікуємо запуск".into(),
+            debugger_version: env!("CARGO_PKG_VERSION").into(),
             listen_addresses: Vec::new(),
             peers: BTreeMap::new(),
             selected_peer: None,
             automatic_peer_updates: false,
             requested_updates: BTreeSet::new(),
             ready_update: None,
+            requested_debugger_updates: BTreeSet::new(),
+            ready_debugger_update: None,
             updater_child: None,
             completed_tasks: 0,
             local_resources: None,
@@ -341,6 +348,16 @@ impl DebuggerApp {
         ));
     }
 
+    fn request_debugger_update(&mut self, peer: String) {
+        self.send(format!("trust {peer}"));
+        self.send(format!("download-debugger-update {peer}"));
+        self.requested_debugger_updates.insert(peer.clone());
+        self.notice(format!(
+            "Запитуємо підписаний Debugger у {}…",
+            short_peer(&peer)
+        ));
+    }
+
     fn apply_ready_update(&mut self, peer: String, version: String, replacement: PathBuf) {
         if !self.updater_path.is_file() {
             self.notice(format!(
@@ -380,6 +397,71 @@ impl DebuggerApp {
         }
     }
 
+    fn apply_ready_debugger_update(&mut self, peer: String, version: String, replacement: PathBuf) {
+        if !is_newer(&version, &self.debugger_version) {
+            let _ = fs::remove_file(&replacement);
+            self.notice(format!(
+                "Debugger {version} від {} не новіший за встановлений {}.",
+                short_peer(&peer),
+                self.debugger_version
+            ));
+            return;
+        }
+        if !self.updater_path.is_file() {
+            self.notice(format!(
+                "Не знайдено updater: {}",
+                self.updater_path.display()
+            ));
+            return;
+        }
+        let target = match std::env::current_exe() {
+            Ok(path) => path,
+            Err(error) => {
+                self.notice(format!("Не вдалося визначити файл Debugger: {error}"));
+                return;
+            }
+        };
+        let args_path = replacement.with_extension("debugger-restart.json");
+        if let Err(error) = fs::write(&args_path, b"[]") {
+            self.notice(format!(
+                "Не вдалося підготувати перезапуск Debugger: {error}"
+            ));
+            return;
+        }
+
+        self.stop_agent();
+        let mut command = Command::new(&self.updater_path);
+        command
+            .arg("--target")
+            .arg(&target)
+            .arg("--replacement")
+            .arg(&replacement)
+            .arg("--backup")
+            .arg(target.with_extension("previous.exe"))
+            .arg("--restart-args")
+            .arg(args_path)
+            .arg("--version-marker")
+            .arg(target.with_extension("version"))
+            .arg("--replacement-version")
+            .arg(&version);
+        configure_child_process(&mut command);
+        match command.spawn() {
+            Ok(_) => {
+                self.notice(format!(
+                    "Debugger {version} від {} перевірено. Перезапускаємо GUI…",
+                    short_peer(&peer)
+                ));
+                self.close_requested = true;
+            }
+            Err(error) => {
+                self.notice(format!(
+                    "Не вдалося запустити updater для Debugger: {error}"
+                ));
+                self.start_agent();
+            }
+        }
+    }
+
     fn poll_agent(&mut self) {
         while let Ok(line) = self.output_rx.try_recv() {
             self.handle_output(&line);
@@ -397,6 +479,10 @@ impl DebuggerApp {
 
         if let Some((peer, version, path)) = self.ready_update.take() {
             self.apply_ready_update(peer, version, path);
+        }
+
+        if let Some((peer, version, path)) = self.ready_debugger_update.take() {
+            self.apply_ready_debugger_update(peer, version, path);
         }
 
         let updater_exit = self
@@ -424,7 +510,7 @@ impl DebuggerApp {
         match fields.as_slice() {
             ["STARTED", peer_id, version, ..] => {
                 self.local_peer_id = Some((*peer_id).into());
-                self.local_version = (*version).into();
+                self.agent_version = (*version).into();
             }
             ["LISTENING", address, ..] => {
                 if !self.listen_addresses.iter().any(|item| item == address) {
@@ -467,7 +553,7 @@ impl DebuggerApp {
                 peer.version = Some((*version).into());
                 let should_update = self.automatic_peer_updates
                     && peer.trusted_for_updates
-                    && is_newer(version, &self.local_version)
+                    && is_newer(version, &self.agent_version)
                     && !self.requested_updates.contains(*peer_id);
                 self.notice(format!(
                     "Агент {} має версію {version}.",
@@ -484,7 +570,10 @@ impl DebuggerApp {
             }
             ["PEER_RESOURCES", peer_id, values @ ..] => {
                 if let Some(resources) = parse_resource_view(values) {
-                    self.peers.entry((*peer_id).into()).or_default().resources = Some(resources);
+                    let peer = self.peers.entry((*peer_id).into()).or_default();
+                    peer.state = PeerState::Connected;
+                    peer.last_message = "Ресурси оновлено".into();
+                    peer.resources = Some(resources);
                 }
             }
             ["UPDATE_TRUSTED", peer_id, ..] => {
@@ -515,6 +604,25 @@ impl DebuggerApp {
                 self.requested_updates.remove(*peer_id);
                 self.notice(format!(
                     "P2P-оновлення від {} не виконано: {error}",
+                    short_peer(peer_id)
+                ));
+            }
+            ["DEBUGGER_UPDATE_PROGRESS", peer_id, received, total, ..] => {
+                if let (Ok(received), Ok(total)) = (received.parse(), total.parse()) {
+                    self.peers
+                        .entry((*peer_id).into())
+                        .or_default()
+                        .debugger_update_progress = Some((received, total));
+                }
+            }
+            ["DEBUGGER_UPDATE_READY", peer_id, version, path, ..] => {
+                self.ready_debugger_update =
+                    Some(((*peer_id).into(), (*version).into(), PathBuf::from(path)));
+            }
+            ["DEBUGGER_UPDATE_FAILED", peer_id, error, ..] => {
+                self.requested_debugger_updates.remove(*peer_id);
+                self.notice(format!(
+                    "P2P-оновлення Debugger від {} не виконано: {error}",
                     short_peer(peer_id)
                 ));
             }
@@ -567,7 +675,9 @@ impl DebuggerApp {
             };
             ui.label(RichText::new(status).color(color).strong());
             ui.separator();
-            ui.label(format!("Версія {}", self.local_version));
+            ui.label(format!("Agent {}", self.agent_version));
+            ui.separator();
+            ui.label(format!("Debugger {}", self.debugger_version));
             ui.separator();
             ui.label(format!("Успішних відповідей: {}", self.completed_tasks));
         });
@@ -802,7 +912,8 @@ impl DebuggerApp {
     }
 
     fn draw_updates(&mut self, ui: &mut egui::Ui) {
-        ui.label(format!("Встановлена версія: {}", self.local_version));
+        ui.label(format!("Версія Agent: {}", self.agent_version));
+        ui.label(format!("Версія Debugger: {}", self.debugger_version));
         let selected = self.selected_peer_id();
         let selected_info = selected.as_ref().and_then(|peer_id| {
             self.peers.get(peer_id).map(|peer| {
@@ -810,11 +921,12 @@ impl DebuggerApp {
                     peer.version.clone(),
                     peer.trusted_for_updates,
                     peer.update_progress,
+                    peer.debugger_update_progress,
                 )
             })
         });
-        if let Some((Some(version), trusted, progress)) = &selected_info {
-            let newer = is_newer(version, &self.local_version);
+        if let Some((Some(version), trusted, progress, debugger_progress)) = &selected_info {
+            let newer = is_newer(version, &self.agent_version);
             let text = if newer {
                 format!("На вибраному агенті новіша версія {version} — її можна передати через рій")
             } else {
@@ -831,6 +943,12 @@ impl DebuggerApp {
                 "Peer ще не довірений. Перше оновлення потребує явного підтвердження."
             });
             if let Some((received, total)) = progress {
+                ui.label("Завантаження Agent:");
+                let fraction = *received as f32 / (*total).max(1) as f32;
+                ui.add(egui::ProgressBar::new(fraction).show_percentage());
+            }
+            if let Some((received, total)) = debugger_progress {
+                ui.label("Завантаження Debugger:");
                 let fraction = *received as f32 / (*total).max(1) as f32;
                 ui.add(egui::ProgressBar::new(fraction).show_percentage());
             }
@@ -853,6 +971,23 @@ impl DebuggerApp {
             {
                 self.request_peer_update(peer);
             }
+            let debugger_update_available = selected_info
+                .as_ref()
+                .and_then(|(version, _, _, _)| version.as_deref())
+                .is_some_and(|version| is_newer(version, &self.debugger_version));
+            if ui
+                .add_enabled(
+                    selected.is_some() && self.agent.is_some() && debugger_update_available,
+                    egui::Button::new("Оновити Debugger через P2P"),
+                )
+                .on_hover_text(
+                    "Завантажує підписаний GUI з вибраного довіреного peer, створює резервну копію та перезапускає Debugger.",
+                )
+                .clicked()
+                && let Some(peer) = selected.clone()
+            {
+                self.request_debugger_update(peer);
+            }
             if ui
                 .add_enabled(
                     selected.is_some() && self.agent.is_some(),
@@ -873,7 +1008,7 @@ impl DebuggerApp {
             }
         });
         ui.small(
-            "P2P-оновлення замінює лише Agent. Пакет підписується сталою Ed25519-ідентичністю джерела, приймається тільки від довіреного Peer ID і додатково перевіряється SHA-256. Debugger оновлюється окремо інсталятором.",
+            "Agent і Debugger завантажуються як окремі підписані компоненти від довіреного Peer ID, перевіряються за платформою, версією та SHA-256 і замінюються з резервною копією. Автоматичний режим стосується лише легкого Agent; перезапуск GUI завжди запускається окремою кнопкою.",
         );
     }
 

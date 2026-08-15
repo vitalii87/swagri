@@ -56,7 +56,7 @@ binaries, or arbitrary remote code.
 - mDNS discovery on local networks
 - CBOR request/response messages
 - persistent Ed25519 node identities
-- trusted-peer, signed and chunked P2P Agent updates with rollback
+- trusted-peer, signed and chunked P2P Agent and Debugger updates with rollback
 - cached CPU calibration plus low-frequency CPU/RAM resource snapshots
 - native Rust desktop Debugger with live logs, resource comparison, and controls
 
@@ -101,8 +101,8 @@ explicit `--dial <multiaddr>` copied from the other node's listen output.
 
 The desktop Debugger provides buttons for discovery, connection testing,
 allowlisted sample tasks, device-resource comparison, version comparison,
-trusted P2P Agent updates, firewall help, and manual Debugger update
-installation. Agents automatically attempt a QUIC connection after mDNS
+trusted P2P Agent and Debugger updates, firewall help, and manual installer
+fallback. Agents automatically attempt a QUIC connection after mDNS
 discovery; advanced users can also use `connect`, `dial`, and `info` commands.
 
 ## Workspace

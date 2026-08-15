@@ -168,8 +168,15 @@ struct UpdateSource {
     signed: SignedUpdateManifest,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UpdateComponent {
+    Agent,
+    Debugger,
+}
+
 struct PendingDownload {
     peer: PeerId,
+    component: UpdateComponent,
     signed: SignedUpdateManifest,
     path: PathBuf,
     file: File,
@@ -184,7 +191,8 @@ struct UpdateManager {
     updater: PathBuf,
     trusted: BTreeSet<PeerId>,
     source: UpdateSource,
-    requested: Option<(PeerId, bool)>,
+    debugger_source: Option<UpdateSource>,
+    requested: Option<(PeerId, UpdateComponent, bool)>,
     pending: Option<PendingDownload>,
 }
 
@@ -396,7 +404,15 @@ async fn main() -> Result<()> {
         &calibration_path,
     );
     let source = build_update_source(&keypair)?;
-    let mut updates = UpdateManager::new(args.update_policy, trust_path, staging, updater, source)?;
+    let debugger_source = build_debugger_update_source(&keypair)?;
+    let mut updates = UpdateManager::new(
+        args.update_policy,
+        trust_path,
+        staging,
+        updater,
+        source,
+        debugger_source,
+    )?;
 
     let mut swarm = build_swarm(keypair, &args.name, request_timeout)?;
 
@@ -559,8 +575,49 @@ fn updater_filename() -> &'static str {
     }
 }
 
+fn debugger_filename() -> &'static str {
+    if cfg!(windows) {
+        "swagri-debugger.exe"
+    } else {
+        "swagri-debugger"
+    }
+}
+
 fn build_update_source(keypair: &identity::Keypair) -> Result<UpdateSource> {
     let path = std::env::current_exe().context("could not locate running agent executable")?;
+    build_signed_update_source(
+        path,
+        env!("CARGO_PKG_VERSION"),
+        keypair,
+        UpdateComponent::Agent,
+    )
+}
+
+fn build_debugger_update_source(keypair: &identity::Keypair) -> Result<Option<UpdateSource>> {
+    let path = std::env::current_exe()
+        .context("could not locate running agent executable")?
+        .with_file_name(debugger_filename());
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let marker = path.with_extension("version");
+    if !marker.is_file() {
+        warn!(path = %marker.display(), "Debugger version marker is missing; GUI sharing disabled");
+        return Ok(None);
+    }
+    let version = fs::read_to_string(&marker)
+        .with_context(|| format!("could not read {}", marker.display()))?;
+    let version = version.trim();
+    Version::parse(version).context("Debugger version marker is invalid")?;
+    build_signed_update_source(path, version, keypair, UpdateComponent::Debugger).map(Some)
+}
+
+fn build_signed_update_source(
+    path: PathBuf,
+    version: &str,
+    keypair: &identity::Keypair,
+    component: UpdateComponent,
+) -> Result<UpdateSource> {
     let mut file = File::open(&path)
         .with_context(|| format!("could not open update source {}", path.display()))?;
     let size = file.metadata()?.len();
@@ -574,14 +631,18 @@ fn build_update_source(keypair: &identity::Keypair) -> Result<UpdateSource> {
         hasher.update(&buffer[..read]);
     }
     let manifest = UpdateManifest {
-        version: env!("CARGO_PKG_VERSION").into(),
+        version: version.into(),
         target_os: std::env::consts::OS.into(),
         target_arch: std::env::consts::ARCH.into(),
         size,
         sha256_hex: hex::encode(hasher.finalize()),
     };
+    let signing_payload = match component {
+        UpdateComponent::Agent => manifest.signing_payload(),
+        UpdateComponent::Debugger => manifest.debugger_signing_payload(),
+    };
     let signature = keypair
-        .sign(&manifest.signing_payload())
+        .sign(&signing_payload)
         .context("node identity could not sign its update manifest")?;
     Ok(UpdateSource {
         path,
@@ -600,6 +661,7 @@ impl UpdateManager {
         staging: PathBuf,
         updater: PathBuf,
         source: UpdateSource,
+        debugger_source: Option<UpdateSource>,
     ) -> Result<Self> {
         fs::create_dir_all(&staging)
             .with_context(|| format!("could not create update staging at {}", staging.display()))?;
@@ -611,6 +673,7 @@ impl UpdateManager {
             updater,
             trusted,
             source,
+            debugger_source,
             requested: None,
             pending: None,
         })
@@ -976,33 +1039,73 @@ fn begin_update_request(
     peer: PeerId,
     apply_when_ready: bool,
 ) {
+    begin_component_update_request(
+        swarm,
+        updates,
+        peer,
+        UpdateComponent::Agent,
+        apply_when_ready,
+    );
+}
+
+fn begin_debugger_update_request(
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    updates: &mut UpdateManager,
+    peer: PeerId,
+) {
+    begin_component_update_request(swarm, updates, peer, UpdateComponent::Debugger, false);
+}
+
+fn begin_component_update_request(
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    updates: &mut UpdateManager,
+    peer: PeerId,
+    component: UpdateComponent,
+    apply_when_ready: bool,
+) {
+    let failed_event = component_event(component, "FAILED");
     if updates.policy == UpdatePolicy::Disabled {
-        emit_event(
-            "UPDATE_FAILED",
-            &[&peer.to_string(), "updates are disabled"],
-        );
+        emit_event(failed_event, &[&peer.to_string(), "updates are disabled"]);
         return;
     }
     if !updates.trusted.contains(&peer) {
         emit_event(
-            "UPDATE_FAILED",
+            failed_event,
             &[&peer.to_string(), "peer is not trusted for updates"],
         );
         return;
     }
     if updates.pending.is_some() || updates.requested.is_some() {
         emit_event(
-            "UPDATE_FAILED",
+            failed_event,
             &[&peer.to_string(), "another update is already active"],
         );
         return;
     }
-    updates.requested = Some((peer, apply_when_ready));
-    swarm
-        .behaviour_mut()
-        .updates
-        .send_request(&peer, UpdateRequest::Manifest);
-    emit_event("UPDATE_REQUESTED", &[&peer.to_string()]);
+    updates.requested = Some((peer, component, apply_when_ready));
+    let request = match component {
+        UpdateComponent::Agent => UpdateRequest::Manifest,
+        UpdateComponent::Debugger => UpdateRequest::DebuggerManifest,
+    };
+    swarm.behaviour_mut().updates.send_request(&peer, request);
+    emit_event(
+        component_event(component, "REQUESTED"),
+        &[&peer.to_string()],
+    );
+}
+
+fn component_event(component: UpdateComponent, suffix: &str) -> &'static str {
+    match (component, suffix) {
+        (UpdateComponent::Agent, "REQUESTED") => "UPDATE_REQUESTED",
+        (UpdateComponent::Agent, "PROGRESS") => "UPDATE_PROGRESS",
+        (UpdateComponent::Agent, "READY") => "UPDATE_READY",
+        (UpdateComponent::Agent, "FAILED") => "UPDATE_FAILED",
+        (UpdateComponent::Debugger, "REQUESTED") => "DEBUGGER_UPDATE_REQUESTED",
+        (UpdateComponent::Debugger, "PROGRESS") => "DEBUGGER_UPDATE_PROGRESS",
+        (UpdateComponent::Debugger, "READY") => "DEBUGGER_UPDATE_READY",
+        (UpdateComponent::Debugger, "FAILED") => "DEBUGGER_UPDATE_FAILED",
+        _ => "UPDATE_FAILED",
+    }
 }
 
 fn handle_update_event(
@@ -1020,7 +1123,7 @@ fn handle_update_event(
                 },
             ..
         } => {
-            let response = serve_update_request(&request, &updates.source);
+            let response = serve_update_request(&request, updates);
             if swarm
                 .behaviour_mut()
                 .updates
@@ -1036,33 +1139,47 @@ fn handle_update_event(
             ..
         } => match response {
             UpdateResponse::Manifest { signed } => {
-                let Some((requested_peer, apply_when_ready)) = updates.requested.take() else {
+                let Some((requested_peer, component, apply_when_ready)) = updates.requested.take()
+                else {
                     warn!(%peer, "ignored unsolicited update manifest");
                     return false;
                 };
                 if requested_peer != peer {
                     emit_event(
-                        "UPDATE_FAILED",
+                        component_event(component, "FAILED"),
                         &[&peer.to_string(), "unexpected update source"],
                     );
                     return false;
                 }
-                if let Err(error) = verify_update_manifest(peer, &signed) {
-                    emit_event("UPDATE_FAILED", &[&peer.to_string(), &error.to_string()]);
+                if let Err(error) = verify_update_manifest(peer, &signed, component) {
+                    emit_event(
+                        component_event(component, "FAILED"),
+                        &[&peer.to_string(), &error.to_string()],
+                    );
                     return false;
                 }
-                let filename =
-                    format!("swagri-agent-{}-{}.download", signed.manifest.version, peer);
+                let component_name = match component {
+                    UpdateComponent::Agent => "agent",
+                    UpdateComponent::Debugger => "debugger",
+                };
+                let filename = format!(
+                    "swagri-{component_name}-{}-{}.download",
+                    signed.manifest.version, peer
+                );
                 let path = updates.staging.join(filename);
                 let file = match File::create(&path) {
                     Ok(file) => file,
                     Err(error) => {
-                        emit_event("UPDATE_FAILED", &[&peer.to_string(), &error.to_string()]);
+                        emit_event(
+                            component_event(component, "FAILED"),
+                            &[&peer.to_string(), &error.to_string()],
+                        );
                         return false;
                     }
                 };
                 updates.pending = Some(PendingDownload {
                     peer,
+                    component,
                     signed,
                     path,
                     file,
@@ -1078,7 +1195,7 @@ fn handle_update_event(
                 };
                 if pending.peer != peer || offset != pending.received {
                     emit_event(
-                        "UPDATE_FAILED",
+                        component_event(pending.component, "FAILED"),
                         &[&peer.to_string(), "invalid update chunk order"],
                     );
                     let _ = fs::remove_file(&pending.path);
@@ -1089,20 +1206,23 @@ fn handle_update_event(
                         > pending.signed.manifest.size
                 {
                     emit_event(
-                        "UPDATE_FAILED",
+                        component_event(pending.component, "FAILED"),
                         &[&peer.to_string(), "invalid update chunk size"],
                     );
                     let _ = fs::remove_file(&pending.path);
                     return false;
                 }
                 if let Err(error) = pending.file.write_all(&data) {
-                    emit_event("UPDATE_FAILED", &[&peer.to_string(), &error.to_string()]);
+                    emit_event(
+                        component_event(pending.component, "FAILED"),
+                        &[&peer.to_string(), &error.to_string()],
+                    );
                     let _ = fs::remove_file(&pending.path);
                     return false;
                 }
                 pending.received += data.len() as u64;
                 emit_event(
-                    "UPDATE_PROGRESS",
+                    component_event(pending.component, "PROGRESS"),
                     &[
                         &peer.to_string(),
                         &pending.received.to_string(),
@@ -1111,24 +1231,30 @@ fn handle_update_event(
                 );
                 if pending.received == pending.signed.manifest.size {
                     if let Err(error) = pending.file.flush().and_then(|_| pending.file.sync_all()) {
-                        emit_event("UPDATE_FAILED", &[&peer.to_string(), &error.to_string()]);
+                        emit_event(
+                            component_event(pending.component, "FAILED"),
+                            &[&peer.to_string(), &error.to_string()],
+                        );
                         let _ = fs::remove_file(&pending.path);
                         return false;
                     }
                     if let Err(error) = verify_download(&pending.path, &pending.signed.manifest) {
-                        emit_event("UPDATE_FAILED", &[&peer.to_string(), &error.to_string()]);
+                        emit_event(
+                            component_event(pending.component, "FAILED"),
+                            &[&peer.to_string(), &error.to_string()],
+                        );
                         let _ = fs::remove_file(&pending.path);
                         return false;
                     }
                     emit_event(
-                        "UPDATE_READY",
+                        component_event(pending.component, "READY"),
                         &[
                             &peer.to_string(),
                             &pending.signed.manifest.version,
                             &pending.path.to_string_lossy(),
                         ],
                     );
-                    if pending.apply_when_ready {
+                    if pending.component == UpdateComponent::Agent && pending.apply_when_ready {
                         return schedule_self_update(
                             updates,
                             &pending.path,
@@ -1142,17 +1268,33 @@ fn handle_update_event(
                 }
             }
             UpdateResponse::Error { message } => {
+                let component = updates
+                    .requested
+                    .as_ref()
+                    .map_or(UpdateComponent::Agent, |(_, component, _)| *component);
                 updates.requested = None;
                 updates.pending = None;
-                emit_event("UPDATE_FAILED", &[&peer.to_string(), &message]);
+                emit_event(
+                    component_event(component, "FAILED"),
+                    &[&peer.to_string(), &message],
+                );
             }
         },
         request_response::Event::OutboundFailure { peer, error, .. } => {
+            let component = updates
+                .requested
+                .as_ref()
+                .map(|(_, component, _)| *component)
+                .or_else(|| updates.pending.as_ref().map(|pending| pending.component))
+                .unwrap_or(UpdateComponent::Agent);
             updates.requested = None;
             if let Some(pending) = updates.pending.take() {
                 let _ = fs::remove_file(pending.path);
             }
-            emit_event("UPDATE_FAILED", &[&peer.to_string(), &error.to_string()]);
+            emit_event(
+                component_event(component, "FAILED"),
+                &[&peer.to_string(), &error.to_string()],
+            );
         }
         request_response::Event::InboundFailure { peer, error, .. } => {
             warn!(%peer, %error, "inbound update request failed");
@@ -1162,62 +1304,96 @@ fn handle_update_event(
     false
 }
 
-fn serve_update_request(request: &UpdateRequest, source: &UpdateSource) -> UpdateResponse {
+fn serve_update_request(request: &UpdateRequest, updates: &UpdateManager) -> UpdateResponse {
     match request {
         UpdateRequest::Manifest => UpdateResponse::Manifest {
-            signed: source.signed.clone(),
+            signed: updates.source.signed.clone(),
         },
+        UpdateRequest::DebuggerManifest => updates.debugger_source.as_ref().map_or_else(
+            || UpdateResponse::Error {
+                message: "this peer does not have a Debugger binary to share".into(),
+            },
+            |source| UpdateResponse::Manifest {
+                signed: source.signed.clone(),
+            },
+        ),
         UpdateRequest::Chunk {
             version,
             offset,
             length,
-        } => {
-            if version != &source.signed.manifest.version {
-                return UpdateResponse::Error {
-                    message: "requested update version is unavailable".into(),
-                };
-            }
-            if *offset >= source.signed.manifest.size {
-                return UpdateResponse::Error {
-                    message: "update offset is outside the package".into(),
-                };
-            }
-            let remaining = source.signed.manifest.size - offset;
-            let length = u64::from((*length).min(UPDATE_CHUNK_BYTES)).min(remaining) as usize;
-            let result = (|| -> Result<Vec<u8>> {
-                let mut file = File::open(&source.path)?;
-                file.seek(SeekFrom::Start(*offset))?;
-                let mut data = vec![0; length];
-                file.read_exact(&mut data)?;
-                Ok(data)
-            })();
-            match result {
-                Ok(data) => UpdateResponse::Chunk {
-                    offset: *offset,
-                    data,
-                },
-                Err(error) => UpdateResponse::Error {
-                    message: error.to_string(),
-                },
-            }
-        }
+        } => serve_update_chunk(&updates.source, version, *offset, *length),
+        UpdateRequest::DebuggerChunk {
+            version,
+            offset,
+            length,
+        } => updates.debugger_source.as_ref().map_or_else(
+            || UpdateResponse::Error {
+                message: "this peer does not have a Debugger binary to share".into(),
+            },
+            |source| serve_update_chunk(source, version, *offset, *length),
+        ),
+    }
+}
+
+fn serve_update_chunk(
+    source: &UpdateSource,
+    version: &str,
+    offset: u64,
+    length: u32,
+) -> UpdateResponse {
+    if version != source.signed.manifest.version {
+        return UpdateResponse::Error {
+            message: "requested update version is unavailable".into(),
+        };
+    }
+    if offset >= source.signed.manifest.size {
+        return UpdateResponse::Error {
+            message: "update offset is outside the package".into(),
+        };
+    }
+    let remaining = source.signed.manifest.size - offset;
+    let length = u64::from(length.min(UPDATE_CHUNK_BYTES)).min(remaining) as usize;
+    let result = (|| -> Result<Vec<u8>> {
+        let mut file = File::open(&source.path)?;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut data = vec![0; length];
+        file.read_exact(&mut data)?;
+        Ok(data)
+    })();
+    match result {
+        Ok(data) => UpdateResponse::Chunk { offset, data },
+        Err(error) => UpdateResponse::Error {
+            message: error.to_string(),
+        },
     }
 }
 
 fn request_next_update_chunk(swarm: &mut libp2p::Swarm<Behaviour>, updates: &UpdateManager) {
     if let Some(pending) = &updates.pending {
-        swarm.behaviour_mut().updates.send_request(
-            &pending.peer,
-            UpdateRequest::Chunk {
+        let request = match pending.component {
+            UpdateComponent::Agent => UpdateRequest::Chunk {
                 version: pending.signed.manifest.version.clone(),
                 offset: pending.received,
                 length: UPDATE_CHUNK_BYTES,
             },
-        );
+            UpdateComponent::Debugger => UpdateRequest::DebuggerChunk {
+                version: pending.signed.manifest.version.clone(),
+                offset: pending.received,
+                length: UPDATE_CHUNK_BYTES,
+            },
+        };
+        swarm
+            .behaviour_mut()
+            .updates
+            .send_request(&pending.peer, request);
     }
 }
 
-fn verify_update_manifest(peer: PeerId, signed: &SignedUpdateManifest) -> Result<()> {
+fn verify_update_manifest(
+    peer: PeerId,
+    signed: &SignedUpdateManifest,
+    component: UpdateComponent,
+) -> Result<()> {
     let manifest = &signed.manifest;
     if manifest.target_os != std::env::consts::OS || manifest.target_arch != std::env::consts::ARCH
     {
@@ -1226,7 +1402,10 @@ fn verify_update_manifest(peer: PeerId, signed: &SignedUpdateManifest) -> Result
     if manifest.size == 0 || manifest.size > MAX_UPDATE_BYTES {
         bail!("update package size is outside the allowed range");
     }
-    if !is_newer_version(&manifest.version) {
+    if Version::parse(&manifest.version).is_err() {
+        bail!("offered update version is invalid");
+    }
+    if component == UpdateComponent::Agent && !is_newer_version(&manifest.version) {
         bail!("offered version is not newer than the running agent");
     }
     let public = identity::PublicKey::try_decode_protobuf(&signed.signer_public_key)
@@ -1234,7 +1413,11 @@ fn verify_update_manifest(peer: PeerId, signed: &SignedUpdateManifest) -> Result
     if PeerId::from_public_key(&public) != peer {
         bail!("update signature key does not match the connected peer");
     }
-    if !public.verify(&manifest.signing_payload(), &signed.signature) {
+    let signing_payload = match component {
+        UpdateComponent::Agent => manifest.signing_payload(),
+        UpdateComponent::Debugger => manifest.debugger_signing_payload(),
+    };
+    if !public.verify(&signing_payload, &signed.signature) {
         bail!("update manifest signature is invalid");
     }
     Ok(())
@@ -1383,6 +1566,10 @@ fn handle_command(
         "download-update" => match parse_peer(&mut parts) {
             Ok(peer) => begin_update_request(swarm, updates, peer, false),
             Err(error) => println!("Invalid update command: {error:#}"),
+        },
+        "download-debugger-update" => match parse_peer(&mut parts) {
+            Ok(peer) => begin_debugger_update_request(swarm, updates, peer),
+            Err(error) => println!("Invalid Debugger update command: {error:#}"),
         },
         "apply-update" => {
             let peer = parse_peer(&mut parts);
@@ -1552,6 +1739,7 @@ fn print_help() {
          untrust <peer-id>                 Remove update trust\n\
          update <peer-id>                  Download, verify, apply, and restart\n\
          download-update <peer-id>         Download and verify without applying\n\
+         download-debugger-update <peer>   Download and verify the peer Debugger\n\
          connect <peer-id>                 Connect using a discovered address\n\
          dial <multiaddr>                  Connect using an explicit address\n\
          local-resources                   Show this device resource snapshot\n\
@@ -1625,11 +1813,11 @@ mod tests {
         let signer = identity::Keypair::generate_ed25519();
         let peer = PeerId::from(signer.public());
         let signed = signed_manifest(&signer, "999.0.0");
-        assert!(verify_update_manifest(peer, &signed).is_ok());
+        assert!(verify_update_manifest(peer, &signed, UpdateComponent::Agent).is_ok());
 
         let attacker = identity::Keypair::generate_ed25519();
         let attacker_peer = PeerId::from(attacker.public());
-        assert!(verify_update_manifest(attacker_peer, &signed).is_err());
+        assert!(verify_update_manifest(attacker_peer, &signed, UpdateComponent::Agent).is_err());
     }
 
     #[test]
@@ -1638,7 +1826,16 @@ mod tests {
         let peer = PeerId::from(signer.public());
         let mut signed = signed_manifest(&signer, "999.0.0");
         signed.manifest.size += 1;
-        assert!(verify_update_manifest(peer, &signed).is_err());
+        assert!(verify_update_manifest(peer, &signed, UpdateComponent::Agent).is_err());
+    }
+
+    #[test]
+    fn agent_signature_cannot_be_replayed_as_debugger_update() {
+        let signer = identity::Keypair::generate_ed25519();
+        let peer = PeerId::from(signer.public());
+        let signed = signed_manifest(&signer, "999.0.0");
+
+        assert!(verify_update_manifest(peer, &signed, UpdateComponent::Debugger).is_err());
     }
 
     #[tokio::test]

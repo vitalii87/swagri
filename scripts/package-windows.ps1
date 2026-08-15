@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "0.4.0-alpha",
+    [string]$Version = "0.5.0-alpha",
     [string]$Configuration = "release"
 )
 
@@ -41,10 +41,13 @@ Agent package:
   Resource sampling defaults to 5 seconds; CPU calibration is cached after one run.
 
 Updates: both packages include swagri-updater.exe. Trust a specific Peer ID
-before receiving signed P2P Agent updates. Use only on trusted test networks.
+before receiving signed P2P updates. Debugger packages can share both Agent and
+GUI updates; headless packages share Agent only. Use trusted test networks.
 Documentation: https://github.com/vitalii87/swagri
 "@
 Set-Content -LiteralPath (Join-Path $packageDirectory "README.txt") -Value $readme -Encoding utf8
+$binaryVersion = $Version.Split('-')[0]
+Set-Content -LiteralPath (Join-Path $packageDirectory "swagri-debugger.version") -Value $binaryVersion -Encoding ascii
 
 $agentPortable = Join-Path $outputDirectory "agent-portable"
 $debuggerPortable = Join-Path $outputDirectory "debugger-portable"
@@ -56,6 +59,7 @@ Copy-Item -LiteralPath (Join-Path $buildDirectory "swagri-debugger.exe") -Destin
 Copy-Item -LiteralPath (Join-Path $buildDirectory "swagri-updater.exe") -Destination $debuggerPortable
 Copy-Item -LiteralPath (Join-Path $packageDirectory "README.txt") -Destination $agentPortable
 Copy-Item -LiteralPath (Join-Path $packageDirectory "README.txt") -Destination $debuggerPortable
+Copy-Item -LiteralPath (Join-Path $packageDirectory "swagri-debugger.version") -Destination $debuggerPortable
 
 Compress-Archive -Path (Join-Path $agentPortable "*") -DestinationPath (Join-Path $outputDirectory "Swagri-Agent-Portable-x64.zip")
 Compress-Archive -Path (Join-Path $debuggerPortable "*") -DestinationPath (Join-Path $outputDirectory "Swagri-Debugger-Portable-x64.zip")
