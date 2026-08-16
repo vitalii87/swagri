@@ -873,7 +873,7 @@ fn handle_swarm_event(
     peer_resources: &mut BTreeMap<PeerId, PeerResourceObservation>,
     updates: &mut UpdateManager,
     restart_arguments: &[String],
-    resources: &mut ResourceMonitor,
+    resources: &ResourceSnapshot,
     active_tasks: &Arc<AtomicU32>,
 ) -> bool {
     let mut shutdown = false;
@@ -1623,7 +1623,7 @@ fn handle_command(
     known_peers: &BTreeMap<PeerId, BTreeSet<Multiaddr>>,
     updates: &mut UpdateManager,
     restart_arguments: &[String],
-    resources: &ResourceSnapshot,
+    resources: &mut ResourceMonitor,
     peer_resources: &BTreeMap<PeerId, PeerResourceObservation>,
     local_completed_tx: &mpsc::UnboundedSender<CompletedLocalTask>,
     active_tasks: &Arc<AtomicU32>,
