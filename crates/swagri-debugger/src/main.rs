@@ -8,12 +8,13 @@ use std::{
     process::{Child, ChildStdin, Command, Stdio},
     sync::mpsc::{self, Receiver, Sender},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
 use eframe::egui::{self, Color32, RichText};
 use egui_plot::{Line, Plot, PlotPoints};
+use rusqlite::{Connection, params};
 use semver::Version;
 use swagri_core::{REMOTE_CPU_MINIMUM_GAIN, choose_cpu_placement};
 use sysinfo::System;
@@ -21,6 +22,7 @@ use sysinfo::System;
 const MAX_LOG_LINES: usize = 2_000;
 const MAX_METRIC_SAMPLES: usize = 240;
 const MAX_TASK_HISTORY: usize = 100;
+const MAX_PERSISTED_TASKS: usize = 1_000;
 const DOWNLOADS_URL: &str = "https://github.com/vitalii87/swagri/actions/workflows/packages.yml";
 
 fn main() -> eframe::Result {
@@ -135,6 +137,7 @@ enum TaskState {
     Failed,
 }
 
+#[derive(Clone)]
 struct TaskView {
     id: String,
     description: String,
@@ -142,8 +145,149 @@ struct TaskView {
     direction: String,
     state: TaskState,
     started_at: Instant,
+    started_unix_ms: i64,
     duration_ms: Option<u64>,
     result: Option<String>,
+}
+
+struct TaskStore {
+    connection: Connection,
+}
+
+impl TaskStore {
+    fn open(path: &Path) -> Result<(Self, VecDeque<TaskView>, usize)> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create task history directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+        let connection = Connection::open(path)
+            .with_context(|| format!("failed to open task history {}", path.display()))?;
+        connection.busy_timeout(Duration::from_secs(2))?;
+        connection.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             CREATE TABLE IF NOT EXISTS tasks (
+                 id              TEXT PRIMARY KEY,
+                 description     TEXT NOT NULL,
+                 executor_peer   TEXT NOT NULL,
+                 direction       TEXT NOT NULL,
+                 state           TEXT NOT NULL,
+                 started_unix_ms INTEGER NOT NULL,
+                 duration_ms     INTEGER,
+                 result          TEXT,
+                 updated_unix_ms INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS tasks_updated_idx
+                 ON tasks(updated_unix_ms DESC);",
+        )?;
+        let store = Self { connection };
+        let interrupted = store.mark_interrupted()?;
+        let tasks = store.load_recent(MAX_TASK_HISTORY)?;
+        Ok((store, tasks, interrupted))
+    }
+
+    fn mark_interrupted(&self) -> Result<usize> {
+        let now = unix_time_ms();
+        Ok(self.connection.execute(
+            "UPDATE tasks
+             SET state = 'failed',
+                 duration_ms = COALESCE(duration_ms, MAX(0, ?1 - started_unix_ms)),
+                 result = COALESCE(result, 'Debugger було закрито до завершення задачі'),
+                 updated_unix_ms = ?1
+             WHERE state = 'running'",
+            [now],
+        )?)
+    }
+
+    fn load_recent(&self, limit: usize) -> Result<VecDeque<TaskView>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, description, executor_peer, direction, state,
+                    started_unix_ms, duration_ms, result
+             FROM tasks
+             ORDER BY updated_unix_ms DESC
+             LIMIT ?1",
+        )?;
+        let now = unix_time_ms();
+        let rows = statement.query_map([limit as i64], |row| {
+            let state_text: String = row.get(4)?;
+            let started_unix_ms: i64 = row.get(5)?;
+            let age_ms = now.saturating_sub(started_unix_ms).max(0) as u64;
+            Ok(TaskView {
+                id: row.get(0)?,
+                description: row.get(1)?,
+                executor_peer: row.get(2)?,
+                direction: row.get(3)?,
+                state: task_state_from_db(&state_text),
+                started_at: Instant::now()
+                    .checked_sub(Duration::from_millis(age_ms))
+                    .unwrap_or_else(Instant::now),
+                started_unix_ms,
+                duration_ms: row
+                    .get::<_, Option<i64>>(6)?
+                    .map(|value| value.max(0) as u64),
+                result: row.get(7)?,
+            })
+        })?;
+        let mut tasks = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        tasks.reverse();
+        Ok(tasks.into())
+    }
+
+    fn save(&self, task: &TaskView) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO tasks (
+                 id, description, executor_peer, direction, state,
+                 started_unix_ms, duration_ms, result, updated_unix_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(id) DO UPDATE SET
+                 description = excluded.description,
+                 executor_peer = excluded.executor_peer,
+                 direction = excluded.direction,
+                 state = excluded.state,
+                 started_unix_ms = excluded.started_unix_ms,
+                 duration_ms = excluded.duration_ms,
+                 result = excluded.result,
+                 updated_unix_ms = excluded.updated_unix_ms",
+            params![
+                task.id,
+                task.description,
+                task.executor_peer,
+                task.direction,
+                task_state_for_db(task.state),
+                task.started_unix_ms,
+                task.duration_ms
+                    .map(|value| value.min(i64::MAX as u64) as i64),
+                task.result,
+                unix_time_ms(),
+            ],
+        )?;
+        self.trim()?;
+        Ok(())
+    }
+
+    fn clear_finished(&self) -> Result<usize> {
+        Ok(self
+            .connection
+            .execute("DELETE FROM tasks WHERE state != 'running'", [])?)
+    }
+
+    fn trim(&self) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM tasks
+             WHERE id IN (
+                 SELECT id FROM tasks
+                 WHERE state != 'running'
+                 ORDER BY updated_unix_ms DESC
+                 LIMIT -1 OFFSET ?1
+             )",
+            [MAX_PERSISTED_TASKS as i64],
+        )?;
+        Ok(())
+    }
 }
 
 struct DebuggerApp {
@@ -173,6 +317,8 @@ struct DebuggerApp {
     updater_child: Option<Child>,
     completed_tasks: u64,
     tasks: VecDeque<TaskView>,
+    task_store: Option<TaskStore>,
+    task_store_path: PathBuf,
     local_resources: Option<ResourceView>,
     last_placement: Option<String>,
     max_cpu_percent: f32,
@@ -190,6 +336,31 @@ impl DebuggerApp {
     fn new(context: &eframe::CreationContext<'_>) -> Self {
         context.egui_ctx.set_visuals(egui::Visuals::dark());
         let (output_tx, output_rx) = mpsc::channel();
+        let task_store_path = default_task_store_path();
+        let (task_store, tasks, history_notice) = match TaskStore::open(&task_store_path) {
+            Ok((store, tasks, interrupted)) => {
+                let message = if interrupted == 0 {
+                    format!("Історію задач завантажено з {}.", task_store_path.display())
+                } else {
+                    format!(
+                        "Відновлено історію; {interrupted} незавершених задач позначено перерваними."
+                    )
+                };
+                (Some(store), tasks, message)
+            }
+            Err(error) => (
+                None,
+                VecDeque::new(),
+                format!(
+                    "SQLite-історія недоступна ({error:#}); задачі зберігатимуться лише до закриття Debugger."
+                ),
+            ),
+        };
+        let mut notices = VecDeque::from([
+            "1. Запустіть агент. 2. Натисніть «Знайти агентів». 3. Оберіть peer і перевірте зв'язок."
+                .into(),
+        ]);
+        notices.push_back(history_notice);
 
         Self {
             agent: None,
@@ -201,10 +372,7 @@ impl DebuggerApp {
             dial_address: String::new(),
             command: String::new(),
             logs: VecDeque::new(),
-            notices: VecDeque::from([
-                "1. Запустіть агент. 2. Натисніть «Знайти агентів». 3. Оберіть peer і перевірте зв'язок."
-                    .into(),
-            ]),
+            notices,
             output_tx,
             output_rx,
             local_peer_id: None,
@@ -220,7 +388,9 @@ impl DebuggerApp {
             ready_debugger_update: None,
             updater_child: None,
             completed_tasks: 0,
-            tasks: VecDeque::new(),
+            tasks,
+            task_store,
+            task_store_path,
             local_resources: None,
             last_placement: None,
             max_cpu_percent: 75.0,
@@ -703,7 +873,7 @@ impl DebuggerApp {
                     let task = details.first().copied().unwrap_or("CPU task");
                     let message = if *target_kind == "remote" {
                         format!(
-                            "Scheduler 0.8 ({task}): обрано агент {} — сила {:.1} проти {:.1} локально (потрібно ≥ {:.1}; кандидатів {}).",
+                            "Scheduler 0.9 ({task}): обрано агент {} — сила {:.1} проти {:.1} локально (потрібно ≥ {:.1}; кандидатів {}).",
                             short_peer(target_peer),
                             selected,
                             local,
@@ -712,7 +882,7 @@ impl DebuggerApp {
                         )
                     } else {
                         format!(
-                            "Scheduler 0.8 ({task}): обрано цей комп'ютер — локальна сила {:.1}; жоден із {} агентів не перевищив поріг {:.1}.",
+                            "Scheduler 0.9 ({task}): обрано цей комп'ютер — локальна сила {:.1}; жоден із {} агентів не перевищив поріг {:.1}.",
                             local, candidate_count, required
                         )
                     };
@@ -750,20 +920,25 @@ impl DebuggerApp {
                 direction,
                 ..,
             ] => {
-                record_task_started(&mut self.tasks, id, description, executor_peer, direction);
+                let task =
+                    record_task_started(&mut self.tasks, id, description, executor_peer, direction)
+                        .clone();
+                self.persist_task(&task);
             }
             ["TASK_RESULT", peer_id, id, duration, details @ ..] => {
                 self.completed_tasks += 1;
                 let duration_ms = duration.parse::<u64>().unwrap_or_default();
                 let result = details.first().copied().unwrap_or("completed");
-                record_task_finished(
+                let task = record_task_finished(
                     &mut self.tasks,
                     id,
                     peer_id,
                     duration_ms,
                     result,
                     TaskState::Completed,
-                );
+                )
+                .clone();
+                self.persist_task(&task);
                 let detail = details
                     .first()
                     .map(|value| format!(" Результат: {value}."))
@@ -784,14 +959,16 @@ impl DebuggerApp {
             }
             ["TASK_FAILED", peer_id, id, duration, error, ..] => {
                 let duration_ms = duration.parse::<u64>().unwrap_or_default();
-                record_task_finished(
+                let task = record_task_finished(
                     &mut self.tasks,
                     id,
                     peer_id,
                     duration_ms,
                     error,
                     TaskState::Failed,
-                );
+                )
+                .clone();
+                self.persist_task(&task);
                 if self.local_peer_id.as_deref() == Some(*peer_id) {
                     self.notice(format!("Локальна задача завершилась помилкою: {error}"));
                 } else {
@@ -804,7 +981,10 @@ impl DebuggerApp {
                 }
             }
             ["TASK_FAILED", peer_id, error, ..] => {
-                record_task_finished(&mut self.tasks, "", peer_id, 0, error, TaskState::Failed);
+                let task =
+                    record_task_finished(&mut self.tasks, "", peer_id, 0, error, TaskState::Failed)
+                        .clone();
+                self.persist_task(&task);
                 if self.local_peer_id.as_deref() == Some(*peer_id) {
                     self.notice(format!("Локальна задача завершилась помилкою: {error}"));
                 } else {
@@ -822,6 +1002,33 @@ impl DebuggerApp {
 
     fn notice(&mut self, message: impl Into<String>) {
         push_bounded(&mut self.notices, message.into(), 100);
+    }
+
+    fn persist_task(&mut self, task: &TaskView) {
+        let error = self
+            .task_store
+            .as_ref()
+            .and_then(|store| store.save(task).err());
+        if let Some(error) = error {
+            self.task_store = None;
+            self.notice(format!(
+                "SQLite-історію вимкнено після помилки запису: {error:#}"
+            ));
+        }
+    }
+
+    fn clear_finished_tasks(&mut self) {
+        self.tasks.retain(|task| task.state == TaskState::Running);
+        let error = self
+            .task_store
+            .as_ref()
+            .and_then(|store| store.clear_finished().err());
+        if let Some(error) = error {
+            self.task_store = None;
+            self.notice(format!(
+                "Не вдалося очистити SQLite-історію; подальший запис вимкнено: {error:#}"
+            ));
+        }
     }
 
     fn refresh_metrics(&mut self) {
@@ -1165,13 +1372,25 @@ impl DebuggerApp {
                     )
                     .clicked()
                 {
-                    self.tasks.retain(|task| task.state == TaskState::Running);
+                    self.clear_finished_tasks();
                 }
             });
 
+            if self.task_store.is_some() {
+                ui.small(format!(
+                    "Історія зберігається локально: {}",
+                    self.task_store_path.display()
+                ));
+            } else {
+                ui.small(
+                    RichText::new("SQLite недоступний: історія зберігається лише в цьому сеансі")
+                        .color(Color32::from_rgb(255, 190, 70)),
+                );
+            }
+
             if self.tasks.is_empty() {
                 ui.label(
-                    "Тут з’являться локальні, відправлені та отримані задачі. Історія зберігається до закриття Debugger.",
+                    "Тут з’являться локальні, відправлені та отримані задачі. Завершені записи відновлюються після перезапуску Debugger.",
                 );
                 return;
             }
@@ -1610,6 +1829,14 @@ fn default_identity_path() -> PathBuf {
         .join("debugger.key")
 }
 
+fn default_task_store_path() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("Swagri")
+        .join("debugger-tasks.sqlite3")
+}
+
 fn default_node_name() -> String {
     std::env::var("COMPUTERNAME")
         .map(|name| format!("debugger-{name}"))
@@ -1666,24 +1893,49 @@ fn task_direction_label(direction: &str) -> &'static str {
     }
 }
 
-fn record_task_started(
-    tasks: &mut VecDeque<TaskView>,
+fn task_state_for_db(state: TaskState) -> &'static str {
+    match state {
+        TaskState::Running => "running",
+        TaskState::Completed => "completed",
+        TaskState::Failed => "failed",
+    }
+}
+
+fn task_state_from_db(state: &str) -> TaskState {
+    match state {
+        "running" => TaskState::Running,
+        "completed" => TaskState::Completed,
+        _ => TaskState::Failed,
+    }
+}
+
+fn unix_time_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
+}
+
+fn record_task_started<'a>(
+    tasks: &'a mut VecDeque<TaskView>,
     id: &str,
     description: &str,
     executor_peer: &str,
     direction: &str,
-) {
-    if let Some(task) = tasks
-        .iter_mut()
-        .rev()
-        .find(|task| task.id == id && task.state == TaskState::Running)
+) -> &'a TaskView {
+    if let Some(position) = tasks
+        .iter()
+        .rposition(|task| task.id == id && task.state == TaskState::Running)
     {
+        let task = &mut tasks[position];
         task.description = description.into();
         task.executor_peer = executor_peer.into();
         task.direction = direction.into();
-        return;
+        return &tasks[position];
     }
 
+    let started_unix_ms = unix_time_ms();
     push_bounded(
         tasks,
         TaskView {
@@ -1693,40 +1945,43 @@ fn record_task_started(
             direction: direction.into(),
             state: TaskState::Running,
             started_at: Instant::now(),
+            started_unix_ms,
             duration_ms: None,
             result: None,
         },
         MAX_TASK_HISTORY,
     );
+    tasks.back().expect("task was just appended")
 }
 
-fn record_task_finished(
-    tasks: &mut VecDeque<TaskView>,
+fn record_task_finished<'a>(
+    tasks: &'a mut VecDeque<TaskView>,
     id: &str,
     executor_peer: &str,
     duration_ms: u64,
     result: &str,
     state: TaskState,
-) {
-    let task = if id.is_empty() {
-        tasks
-            .iter_mut()
-            .rev()
-            .find(|task| task.state == TaskState::Running && task.executor_peer == executor_peer)
+) -> &'a TaskView {
+    let position = if id.is_empty() {
+        tasks.iter().rposition(|task| {
+            task.state == TaskState::Running && task.executor_peer == executor_peer
+        })
     } else {
-        tasks.iter_mut().rev().find(|task| task.id == id)
+        tasks.iter().rposition(|task| task.id == id)
     };
 
-    if let Some(task) = task {
+    if let Some(position) = position {
+        let task = &mut tasks[position];
         task.state = state;
         task.duration_ms = Some(duration_ms);
         task.result = Some(result.into());
         if !executor_peer.is_empty() {
             task.executor_peer = executor_peer.into();
         }
-        return;
+        return &tasks[position];
     }
 
+    let started_unix_ms = unix_time_ms().saturating_sub(duration_ms.min(i64::MAX as u64) as i64);
     let started_at = Instant::now()
         .checked_sub(Duration::from_millis(duration_ms))
         .unwrap_or_else(Instant::now);
@@ -1744,11 +1999,13 @@ fn record_task_finished(
             direction: "unknown".into(),
             state,
             started_at,
+            started_unix_ms,
             duration_ms: Some(duration_ms),
             result: Some(result.into()),
         },
         MAX_TASK_HISTORY,
     );
+    tasks.back().expect("task was just appended")
 }
 
 fn format_gib(bytes: u64) -> String {
@@ -1917,5 +2174,71 @@ mod tests {
 
         assert_eq!(tasks[0].state, TaskState::Failed);
         assert_eq!(tasks[0].result.as_deref(), Some("connection lost"));
+    }
+
+    #[test]
+    fn sqlite_history_restores_completed_task() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("tasks.sqlite3");
+        {
+            let (store, mut tasks, interrupted) = TaskStore::open(&path)?;
+            assert_eq!(interrupted, 0);
+            let started = record_task_started(
+                &mut tasks,
+                "task-persisted",
+                "Matrix 320x320",
+                "peer-beta",
+                "outbound",
+            )
+            .clone();
+            store.save(&started)?;
+            let completed = record_task_finished(
+                &mut tasks,
+                "task-persisted",
+                "peer-beta",
+                418,
+                "matrix checksum 42",
+                TaskState::Completed,
+            )
+            .clone();
+            store.save(&completed)?;
+        }
+
+        let (_store, tasks, interrupted) = TaskStore::open(&path)?;
+        assert_eq!(interrupted, 0);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].state, TaskState::Completed);
+        assert_eq!(tasks[0].duration_ms, Some(418));
+        assert_eq!(tasks[0].result.as_deref(), Some("matrix checksum 42"));
+        Ok(())
+    }
+
+    #[test]
+    fn sqlite_history_marks_abandoned_task_as_failed() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("tasks.sqlite3");
+        {
+            let (store, mut tasks, _) = TaskStore::open(&path)?;
+            let started = record_task_started(
+                &mut tasks,
+                "task-interrupted",
+                "CPU benchmark",
+                "peer-beta",
+                "outbound",
+            )
+            .clone();
+            store.save(&started)?;
+        }
+
+        let (_store, tasks, interrupted) = TaskStore::open(&path)?;
+        assert_eq!(interrupted, 1);
+        assert_eq!(tasks[0].state, TaskState::Failed);
+        assert!(
+            tasks[0]
+                .result
+                .as_deref()
+                .is_some_and(|result| result.contains("закрито"))
+        );
+        Ok(())
     }
 }

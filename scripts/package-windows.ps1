@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "0.8.0-alpha",
+    [string]$Version = "0.9.0-alpha",
     [string]$Configuration = "release"
 )
 
@@ -34,7 +34,7 @@ Swagri $Version experimental build
 Debugger package:
   Run swagri-debugger.exe. It starts the bundled agent, shows host metrics,
   peer capacity scores, offers smart CPU and matrix tests, can pause this
-  computer's Swagri contribution, and keeps a live task activity/history panel.
+  computer's Swagri contribution, and keeps a persistent SQLite task history.
 
 Agent package:
   Run swagri-agent.exe --name <device-name>

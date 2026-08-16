@@ -41,8 +41,9 @@ data.
 - hard OS-enforced resource quotas;
 - [x] local-first placement for bounded CPU benchmark and matrix tasks;
 - [x] operator-visible in-memory task lifecycle and result history;
+- [x] persistent local SQLite history for task lifecycle and results;
 - thermal/load-aware chunk assignment;
-- SQLite event and measurement store;
+- broader SQLite event and resource-measurement store;
 - benchmark suite for scheduler decisions.
 
 Exit criterion: a group of 3–5 heterogeneous trusted devices demonstrates that

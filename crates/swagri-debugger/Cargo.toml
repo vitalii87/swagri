@@ -15,4 +15,8 @@ sysinfo.workspace = true
 rfd.workspace = true
 semver.workspace = true
 webbrowser.workspace = true
+rusqlite.workspace = true
 swagri-core = { path = "../swagri-core" }
+
+[dev-dependencies]
+tempfile = "3"

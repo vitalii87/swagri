@@ -89,11 +89,16 @@ not stop peer discovery, heartbeats, or other responses.
 
 Version 0.8 emits a lightweight local control event when tracked work starts
 and when it completes or fails. Debugger correlates those events by the typed
-request ID and keeps the latest 100 records in memory. Running tasks show
+request ID. Version 0.9 persists the latest 1,000 completed records in a local
+SQLite database and restores the newest 100 into the task panel on startup.
+Tasks left running when Debugger closes are marked as interrupted on the next
+start. Running tasks show
 elapsed wall time rather than an invented percentage: truthful percentage
 progress requires a later streaming progress protocol and workload-specific
 units. Both requester and executor can therefore observe the same remote task
 from their own perspective without adding coordination traffic to the wire.
+The database is Debugger-local and stores task metadata/results only; resource
+measurement persistence remains a later telemetry step.
 
 ## Identity and trust
 

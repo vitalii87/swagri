@@ -43,11 +43,11 @@ goal is intentionally small:
 The first prototype includes a lightweight headless Agent and a desktop
 Debugger for test networks. It exchanges lightweight resource snapshots and
 ranks connected devices by calibrated CPU strength adjusted for current load
-and the owner's contribution limits. Version 0.8 adds an operator-visible task
+and the owner's contribution limits. Version 0.9 adds an operator-visible task
 lifecycle: Debugger retains active, completed, and failed local, outbound, and
-inbound work with its executor, elapsed time, duration, and typed result. The
-history is currently in-memory for the Debugger session; durable event storage
-and true percentage progress remain planned. Swagri does **not** yet queue,
+inbound work with its executor, elapsed time, duration, and typed result in a
+bounded local SQLite history that survives Debugger restarts. True percentage
+progress and a broader resource-measurement store remain planned. Swagri does **not** yet queue,
 split, migrate, or retry general workloads, and it does not execute shell
 commands, downloaded binaries, or arbitrary remote code.
 
@@ -64,7 +64,7 @@ commands, downloaded binaries, or arbitrary remote code.
 - cached CPU calibration plus low-frequency CPU/RAM resource snapshots
 - local-first placement for bounded CPU benchmark and matrix workloads
 - runtime pause/resume of a device's Swagri contribution
-- live in-memory lifecycle and result history for swarm tasks
+- durable local SQLite lifecycle and result history for swarm tasks
 - native Rust desktop Debugger with live logs, resource comparison, and controls
 
 See [Architecture](docs/ARCHITECTURE.md) for the design boundaries and
