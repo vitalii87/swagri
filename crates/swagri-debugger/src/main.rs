@@ -20,6 +20,7 @@ use sysinfo::System;
 
 const MAX_LOG_LINES: usize = 2_000;
 const MAX_METRIC_SAMPLES: usize = 240;
+const MAX_TASK_HISTORY: usize = 100;
 const DOWNLOADS_URL: &str = "https://github.com/vitalii87/swagri/actions/workflows/packages.yml";
 
 fn main() -> eframe::Result {
@@ -127,6 +128,24 @@ struct ResourceView {
     contribution_paused: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TaskState {
+    Running,
+    Completed,
+    Failed,
+}
+
+struct TaskView {
+    id: String,
+    description: String,
+    executor_peer: String,
+    direction: String,
+    state: TaskState,
+    started_at: Instant,
+    duration_ms: Option<u64>,
+    result: Option<String>,
+}
+
 struct DebuggerApp {
     agent: Option<ManagedAgent>,
     agent_path: PathBuf,
@@ -153,6 +172,7 @@ struct DebuggerApp {
     ready_debugger_update: Option<(String, String, PathBuf)>,
     updater_child: Option<Child>,
     completed_tasks: u64,
+    tasks: VecDeque<TaskView>,
     local_resources: Option<ResourceView>,
     last_placement: Option<String>,
     max_cpu_percent: f32,
@@ -200,6 +220,7 @@ impl DebuggerApp {
             ready_debugger_update: None,
             updater_child: None,
             completed_tasks: 0,
+            tasks: VecDeque::new(),
             local_resources: None,
             last_placement: None,
             max_cpu_percent: 75.0,
@@ -682,7 +703,7 @@ impl DebuggerApp {
                     let task = details.first().copied().unwrap_or("CPU task");
                     let message = if *target_kind == "remote" {
                         format!(
-                            "Scheduler 0.7 ({task}): обрано агент {} — сила {:.1} проти {:.1} локально (потрібно ≥ {:.1}; кандидатів {}).",
+                            "Scheduler 0.8 ({task}): обрано агент {} — сила {:.1} проти {:.1} локально (потрібно ≥ {:.1}; кандидатів {}).",
                             short_peer(target_peer),
                             selected,
                             local,
@@ -691,7 +712,7 @@ impl DebuggerApp {
                         )
                     } else {
                         format!(
-                            "Scheduler 0.7 ({task}): обрано цей комп'ютер — локальна сила {:.1}; жоден із {} агентів не перевищив поріг {:.1}.",
+                            "Scheduler 0.8 ({task}): обрано цей комп'ютер — локальна сила {:.1}; жоден із {} агентів не перевищив поріг {:.1}.",
                             local, candidate_count, required
                         )
                     };
@@ -721,8 +742,28 @@ impl DebuggerApp {
                     short_peer(peer_id)
                 ));
             }
-            ["TASK_RESULT", peer_id, _, duration, details @ ..] => {
+            [
+                "TASK_STARTED",
+                id,
+                description,
+                executor_peer,
+                direction,
+                ..,
+            ] => {
+                record_task_started(&mut self.tasks, id, description, executor_peer, direction);
+            }
+            ["TASK_RESULT", peer_id, id, duration, details @ ..] => {
                 self.completed_tasks += 1;
+                let duration_ms = duration.parse::<u64>().unwrap_or_default();
+                let result = details.first().copied().unwrap_or("completed");
+                record_task_finished(
+                    &mut self.tasks,
+                    id,
+                    peer_id,
+                    duration_ms,
+                    result,
+                    TaskState::Completed,
+                );
                 let detail = details
                     .first()
                     .map(|value| format!(" Результат: {value}."))
@@ -741,13 +782,34 @@ impl DebuggerApp {
                     ));
                 }
             }
-            ["TASK_FAILED", peer_id, error, ..] => {
+            ["TASK_FAILED", peer_id, id, duration, error, ..] => {
+                let duration_ms = duration.parse::<u64>().unwrap_or_default();
+                record_task_finished(
+                    &mut self.tasks,
+                    id,
+                    peer_id,
+                    duration_ms,
+                    error,
+                    TaskState::Failed,
+                );
                 if self.local_peer_id.as_deref() == Some(*peer_id) {
                     self.notice(format!("Локальна задача завершилась помилкою: {error}"));
                 } else {
                     let peer = self.peers.entry((*peer_id).into()).or_default();
-                    peer.state = PeerState::Failed;
-                    peer.last_message = (*error).into();
+                    peer.last_message = format!("Помилка задачі: {error}");
+                    self.notice(format!(
+                        "Задача на агенті {} завершилась помилкою: {error}",
+                        short_peer(peer_id)
+                    ));
+                }
+            }
+            ["TASK_FAILED", peer_id, error, ..] => {
+                record_task_finished(&mut self.tasks, "", peer_id, 0, error, TaskState::Failed);
+                if self.local_peer_id.as_deref() == Some(*peer_id) {
+                    self.notice(format!("Локальна задача завершилась помилкою: {error}"));
+                } else {
+                    let peer = self.peers.entry((*peer_id).into()).or_default();
+                    peer.last_message = format!("Помилка задачі: {error}");
                     self.notice(format!(
                         "Задача на агенті {} завершилась помилкою: {error}",
                         short_peer(peer_id)
@@ -1073,6 +1135,104 @@ impl DebuggerApp {
         }
     }
 
+    fn draw_tasks(&mut self, ui: &mut egui::Ui) {
+        let running = self
+            .tasks
+            .iter()
+            .filter(|task| task.state == TaskState::Running)
+            .count();
+        let completed = self
+            .tasks
+            .iter()
+            .filter(|task| task.state == TaskState::Completed)
+            .count();
+        let failed = self
+            .tasks
+            .iter()
+            .filter(|task| task.state == TaskState::Failed)
+            .count();
+
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Задачі рою").strong().size(18.0));
+                ui.label(format!(
+                    "виконується: {running} · завершено: {completed} · помилки: {failed}"
+                ));
+                if ui
+                    .add_enabled(
+                        completed + failed > 0,
+                        egui::Button::new("Очистити завершені"),
+                    )
+                    .clicked()
+                {
+                    self.tasks.retain(|task| task.state == TaskState::Running);
+                }
+            });
+
+            if self.tasks.is_empty() {
+                ui.label(
+                    "Тут з’являться локальні, відправлені та отримані задачі. Історія зберігається до закриття Debugger.",
+                );
+                return;
+            }
+
+            egui::ScrollArea::vertical()
+                .id_salt("task_history")
+                .max_height(210.0)
+                .show(ui, |ui| {
+                    egui::Grid::new("task_history_grid")
+                        .striped(true)
+                        .num_columns(6)
+                        .show(ui, |ui| {
+                            ui.strong("Стан");
+                            ui.strong("Задача");
+                            ui.strong("Де виконується");
+                            ui.strong("Напрямок");
+                            ui.strong("Час");
+                            ui.strong("Результат");
+                            ui.end_row();
+
+                            for task in self.tasks.iter().rev() {
+                                let (state, color) = match task.state {
+                                    TaskState::Running => {
+                                        ("● виконується", Color32::from_rgb(90, 190, 255))
+                                    }
+                                    TaskState::Completed => {
+                                        ("✓ завершено", Color32::from_rgb(70, 210, 130))
+                                    }
+                                    TaskState::Failed => {
+                                        ("✕ помилка", Color32::from_rgb(240, 90, 80))
+                                    }
+                                };
+                                ui.label(RichText::new(state).color(color).strong())
+                                    .on_hover_text(&task.id);
+                                ui.label(&task.description).on_hover_text(&task.id);
+                                let executor = if task.direction == "scheduler" {
+                                    "не призначено".into()
+                                } else if self.local_peer_id.as_deref()
+                                    == Some(task.executor_peer.as_str())
+                                {
+                                    "цей ПК".into()
+                                } else {
+                                    short_peer(&task.executor_peer)
+                                };
+                                ui.label(executor).on_hover_text(&task.executor_peer);
+                                ui.label(task_direction_label(&task.direction));
+                                let elapsed = if task.state == TaskState::Running {
+                                    format!("{:.1} s", task.started_at.elapsed().as_secs_f32())
+                                } else {
+                                    format!("{} ms", task.duration_ms.unwrap_or_default())
+                                };
+                                ui.label(elapsed);
+                                let result = task.result.as_deref().unwrap_or("очікуємо…");
+                                ui.label(short_text(result, 72)).on_hover_text(result);
+                                ui.end_row();
+                            }
+                        });
+                });
+        });
+    }
+
     fn draw_metrics(&self, ui: &mut egui::Ui) {
         let used_gib = self.system.used_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
         let total_gib = self.system.total_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
@@ -1325,6 +1485,8 @@ impl eframe::App for DebuggerApp {
                 ui.separator();
                 self.draw_main_actions(ui);
                 ui.separator();
+                self.draw_tasks(ui);
+                ui.separator();
                 self.draw_peers(ui);
                 ui.separator();
                 self.draw_metrics(ui);
@@ -1485,6 +1647,110 @@ fn short_cpu(cpu: &str) -> String {
     }
 }
 
+fn short_text(text: &str, limit: usize) -> String {
+    let shortened = text.chars().take(limit).collect::<String>();
+    if shortened.chars().count() < text.chars().count() {
+        format!("{shortened}…")
+    } else {
+        shortened
+    }
+}
+
+fn task_direction_label(direction: &str) -> &'static str {
+    match direction {
+        "local" => "локальна",
+        "inbound" => "отримана з рою",
+        "outbound" => "відправлена в рій",
+        "scheduler" => "scheduler",
+        _ => "невідомо",
+    }
+}
+
+fn record_task_started(
+    tasks: &mut VecDeque<TaskView>,
+    id: &str,
+    description: &str,
+    executor_peer: &str,
+    direction: &str,
+) {
+    if let Some(task) = tasks
+        .iter_mut()
+        .rev()
+        .find(|task| task.id == id && task.state == TaskState::Running)
+    {
+        task.description = description.into();
+        task.executor_peer = executor_peer.into();
+        task.direction = direction.into();
+        return;
+    }
+
+    push_bounded(
+        tasks,
+        TaskView {
+            id: id.into(),
+            description: description.into(),
+            executor_peer: executor_peer.into(),
+            direction: direction.into(),
+            state: TaskState::Running,
+            started_at: Instant::now(),
+            duration_ms: None,
+            result: None,
+        },
+        MAX_TASK_HISTORY,
+    );
+}
+
+fn record_task_finished(
+    tasks: &mut VecDeque<TaskView>,
+    id: &str,
+    executor_peer: &str,
+    duration_ms: u64,
+    result: &str,
+    state: TaskState,
+) {
+    let task = if id.is_empty() {
+        tasks
+            .iter_mut()
+            .rev()
+            .find(|task| task.state == TaskState::Running && task.executor_peer == executor_peer)
+    } else {
+        tasks.iter_mut().rev().find(|task| task.id == id)
+    };
+
+    if let Some(task) = task {
+        task.state = state;
+        task.duration_ms = Some(duration_ms);
+        task.result = Some(result.into());
+        if !executor_peer.is_empty() {
+            task.executor_peer = executor_peer.into();
+        }
+        return;
+    }
+
+    let started_at = Instant::now()
+        .checked_sub(Duration::from_millis(duration_ms))
+        .unwrap_or_else(Instant::now);
+    let fallback_id = if id.is_empty() {
+        format!("unmatched-{}", tasks.len() + 1)
+    } else {
+        id.into()
+    };
+    push_bounded(
+        tasks,
+        TaskView {
+            id: fallback_id,
+            description: "Задача".into(),
+            executor_peer: executor_peer.into(),
+            direction: "unknown".into(),
+            state,
+            started_at,
+            duration_ms: Some(duration_ms),
+            result: Some(result.into()),
+        },
+        MAX_TASK_HISTORY,
+    );
+}
+
 fn format_gib(bytes: u64) -> String {
     format!("{:.2} GiB", bytes as f64 / 1024.0 / 1024.0 / 1024.0)
 }
@@ -1597,5 +1863,59 @@ mod tests {
             .collect::<Vec<_>>();
         let paused = parse_resource_view(&paused_fields).expect("valid 0.7 resource event");
         assert!(paused.contribution_paused);
+    }
+
+    #[test]
+    fn task_history_keeps_completed_result() {
+        let mut tasks = VecDeque::new();
+        record_task_started(
+            &mut tasks,
+            "task-1",
+            "Matrix 320x320",
+            "peer-beta",
+            "outbound",
+        );
+
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].state, TaskState::Running);
+        record_task_finished(
+            &mut tasks,
+            "task-1",
+            "peer-beta",
+            245,
+            "matrix 320x320, checksum 42",
+            TaskState::Completed,
+        );
+
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].state, TaskState::Completed);
+        assert_eq!(tasks[0].duration_ms, Some(245));
+        assert_eq!(
+            tasks[0].result.as_deref(),
+            Some("matrix 320x320, checksum 42")
+        );
+    }
+
+    #[test]
+    fn unmatched_network_failure_closes_latest_task_for_peer() {
+        let mut tasks = VecDeque::new();
+        record_task_started(
+            &mut tasks,
+            "task-1",
+            "CPU benchmark",
+            "peer-beta",
+            "outbound",
+        );
+        record_task_finished(
+            &mut tasks,
+            "",
+            "peer-beta",
+            0,
+            "connection lost",
+            TaskState::Failed,
+        );
+
+        assert_eq!(tasks[0].state, TaskState::Failed);
+        assert_eq!(tasks[0].result.as_deref(), Some("connection lost"));
     }
 }

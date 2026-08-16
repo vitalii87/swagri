@@ -72,7 +72,7 @@ These percentages currently control what the Agent advertises as available to
 future scheduling. They are not yet hard operating-system quotas. Swagri sends
 no process list, filenames, or user-activity details in the snapshot.
 
-Version 0.7 provides **Smart CPU test** and **Smart Matrix task** in Debugger.
+Version 0.8 provides **Smart CPU test** and **Smart Matrix task** in Debugger.
 The equivalent console commands are:
 
 ```text
@@ -90,9 +90,9 @@ or cancelled.
 
 ### Force a smart task onto the other computer
 
-This is the recommended two-Debugger test for version 0.7:
+This is the recommended two-Debugger test for version 0.8:
 
-1. Start version 0.7 on both computers and wait until each lists the other as
+1. Start version 0.8 on both computers and wait until each lists the other as
    connected with resource data.
 2. On computer A, click **Block resources of this PC**. Its local effective
    strength becomes zero and the status says that contribution is paused.
@@ -106,6 +106,20 @@ The pause is intentionally safe and lightweight: it blocks only *new Swagri
 compute tasks*. It does not reserve CPU in Windows, stop other applications, or
 interrupt a task already running. If no compatible remote Agent is available,
 the smart task fails visibly instead of silently running on the paused PC.
+
+## Task activity and history
+
+Version 0.8 adds a persistent-on-screen **Swarm tasks** panel. It lists work
+initiated on this Debugger, work executed locally, and work received from
+another Agent. Each row shows the lifecycle state, task description, executor,
+direction, live elapsed time or final duration, and the typed result/error.
+Matrix results therefore remain visible with their checksum after transient
+status messages change.
+
+This first history is intentionally lightweight and remains in memory until
+Debugger closes. It does not claim a percentage for workloads that expose no
+progress units. Durable history across restarts, filtering, cancellation, and
+streamed percentage progress are later scheduler/telemetry steps.
 
 ## Updating Agent and Debugger through the swarm
 
@@ -157,7 +171,7 @@ Debugger, or use the installer fallback on both. Beginning with 0.5, later
 Debugger versions can update each other entirely through P2P. Agent 0.4 can
 still update itself to 0.5 through the existing P2P mechanism.
 
-Once Debugger 0.5 or newer is installed, version 0.7 can be distributed as a
+Once Debugger 0.5 or newer is installed, version 0.8 can be distributed as a
 complete Debugger-to-Debugger P2P upgrade test.
 
 ## Build packages locally

@@ -43,6 +43,7 @@ Every node has the same role and can initiate or execute requests. The MVP uses:
 - cached one-time CPU calibration and five-second dynamic sampling;
 - local-first placement for bounded built-in CPU benchmark and matrix work;
 - runtime contribution pause/resume with zero advertised capacity;
+- Debugger-visible lifecycle events for local, outbound, and inbound tasks;
 - request limits, execution limits, deadlines, and structured failures.
 
 The prototype has no global discovery, relay, reputation, payment, arbitrary
@@ -85,6 +86,14 @@ user command
 
 Inbound work runs outside the networking event loop. A slow computation must
 not stop peer discovery, heartbeats, or other responses.
+
+Version 0.8 emits a lightweight local control event when tracked work starts
+and when it completes or fails. Debugger correlates those events by the typed
+request ID and keeps the latest 100 records in memory. Running tasks show
+elapsed wall time rather than an invented percentage: truthful percentage
+progress requires a later streaming progress protocol and workload-specific
+units. Both requester and executor can therefore observe the same remote task
+from their own perspective without adding coordination traffic to the wire.
 
 ## Identity and trust
 

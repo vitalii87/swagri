@@ -164,6 +164,7 @@ impl From<ping::Event> for BehaviourEvent {
 struct CompletedResponse {
     channel: request_response::ResponseChannel<TaskResponse>,
     response: TaskResponse,
+    track_task: bool,
 }
 
 struct CompletedLocalTask {
@@ -522,6 +523,9 @@ async fn main() -> Result<()> {
                 }
             }
             Some(completed) = completed_rx.recv() => {
+                if completed.track_task {
+                    report_task_response(local_peer_id, &completed.response);
+                }
                 if swarm
                     .behaviour_mut()
                     .request_response
@@ -931,7 +935,14 @@ fn handle_swarm_event(
             }
         }
         SwarmEvent::Behaviour(BehaviourEvent::RequestResponse(event)) => {
-            handle_request_response(event, completed_tx, resources, active_tasks, peer_resources);
+            handle_request_response(
+                event,
+                completed_tx,
+                *swarm.local_peer_id(),
+                resources,
+                active_tasks,
+                peer_resources,
+            );
         }
         SwarmEvent::Behaviour(BehaviourEvent::Update(event)) => {
             shutdown = handle_update_event(event, swarm, updates, restart_arguments);
@@ -973,6 +984,7 @@ fn handle_swarm_event(
 fn handle_request_response(
     event: request_response::Event<TaskRequest, TaskResponse>,
     completed_tx: &mpsc::UnboundedSender<CompletedResponse>,
+    local_peer_id: PeerId,
     resources: &ResourceSnapshot,
     active_tasks: &Arc<AtomicU32>,
     peer_resources: &mut BTreeMap<PeerId, PeerResourceObservation>,
@@ -997,7 +1009,11 @@ fn handle_request_response(
                         resources: Some(resources.clone()),
                     },
                 );
-                let _ = completed_tx.send(CompletedResponse { channel, response });
+                let _ = completed_tx.send(CompletedResponse {
+                    channel,
+                    response,
+                    track_task: false,
+                });
                 return;
             }
             if resources.contribution_paused
@@ -1013,16 +1029,30 @@ fn handle_request_response(
                     "resources_paused",
                     "the selected Agent has paused its compute contribution",
                 );
-                let _ = completed_tx.send(CompletedResponse { channel, response });
+                let _ = completed_tx.send(CompletedResponse {
+                    channel,
+                    response,
+                    track_task: false,
+                });
                 return;
             }
+            emit_task_started(
+                &request.id,
+                &task_description(&request.task),
+                local_peer_id,
+                "inbound",
+            );
             let completed_tx = completed_tx.clone();
             let active_tasks = active_tasks.clone();
             active_tasks.fetch_add(1, Ordering::Relaxed);
             tokio::task::spawn_blocking(move || {
                 let response = execute(request);
                 active_tasks.fetch_sub(1, Ordering::Relaxed);
-                let _ = completed_tx.send(CompletedResponse { channel, response });
+                let _ = completed_tx.send(CompletedResponse {
+                    channel,
+                    response,
+                    track_task: true,
+                });
             });
         }
         request_response::Event::Message {
@@ -1073,7 +1103,10 @@ fn handle_request_response(
             ..
         } => {
             warn!(peer = %peer, ?request_id, %error, "outbound task failed");
-            emit_event("TASK_FAILED", &[&peer.to_string(), &error.to_string()]);
+            emit_event(
+                "TASK_FAILED",
+                &[&peer.to_string(), "", "0", &error.to_string()],
+            );
         }
         request_response::Event::InboundFailure {
             peer,
@@ -1110,7 +1143,15 @@ fn report_task_response(peer: PeerId, response: &TaskResponse) {
             );
         }
         TaskOutcome::Failure { message, .. } => {
-            emit_event("TASK_FAILED", &[&peer.to_string(), message]);
+            emit_event(
+                "TASK_FAILED",
+                &[
+                    &peer.to_string(),
+                    &response.id,
+                    &response.duration_ms.to_string(),
+                    message,
+                ],
+            );
         }
     }
     println!(
@@ -1903,6 +1944,8 @@ fn submit_task(
     let sequence = request_counter.fetch_add(1, Ordering::Relaxed);
     let id = format!("{local_peer_id}-{sequence}");
     let task_kind = task.kind();
+    let description = task_description(&task);
+    let tracked = task != Task::NodeInfo;
     swarm.behaviour_mut().request_response.send_request(
         &peer,
         TaskRequest {
@@ -1910,6 +1953,9 @@ fn submit_task(
             task,
         },
     );
+    if tracked {
+        emit_task_started(&id, &description, peer, "outbound");
+    }
     debug!(%peer, %id, ?task_kind, "submitted task");
 }
 
@@ -1930,6 +1976,7 @@ fn place_cpu_task(
         return;
     }
     let task_kind = format!("{:?}", task.kind());
+    let description = task_description(&task);
 
     let candidates = peer_resources
         .iter()
@@ -1964,8 +2011,10 @@ fn place_cpu_task(
 
     if resources.contribution_paused {
         let sequence = request_counter.fetch_add(1, Ordering::Relaxed);
+        let id = format!("{local_peer_id}-blocked-{sequence}");
+        emit_task_started(&id, &description, local_peer_id, "scheduler");
         let response = TaskResponse::failure(
-            format!("{local_peer_id}-blocked-{sequence}"),
+            id,
             0,
             "no_eligible_resources",
             "local contribution is paused and no compatible remote Agent is available",
@@ -2012,10 +2061,13 @@ fn submit_local_task(
     active_tasks: &Arc<AtomicU32>,
 ) {
     let sequence = request_counter.fetch_add(1, Ordering::Relaxed);
+    let id = format!("{local_peer_id}-local-{sequence}");
+    let description = task_description(&task);
     let request = TaskRequest {
-        id: format!("{local_peer_id}-local-{sequence}"),
+        id: id.clone(),
         task,
     };
+    emit_task_started(&id, &description, local_peer_id, "local");
     let local_completed_tx = local_completed_tx.clone();
     let active_tasks = active_tasks.clone();
     active_tasks.fetch_add(1, Ordering::Relaxed);
@@ -2027,6 +2079,24 @@ fn submit_local_task(
             response,
         });
     });
+}
+
+fn emit_task_started(id: &str, description: &str, executor: PeerId, direction: &str) {
+    emit_event(
+        "TASK_STARTED",
+        &[id, description, &executor.to_string(), direction],
+    );
+}
+
+fn task_description(task: &Task) -> String {
+    match task {
+        Task::NodeInfo => "Node info".into(),
+        Task::Echo { .. } => "Echo".into(),
+        Task::Sum { values } => format!("Sum ({} values)", values.len()),
+        Task::Sha256 { .. } => "SHA-256".into(),
+        Task::CpuBenchmark { iterations } => format!("CPU benchmark ({iterations} iterations)"),
+        Task::MatrixMultiply { size } => format!("Matrix {size}x{size}"),
+    }
 }
 
 fn emit_placement_decision(
@@ -2199,6 +2269,20 @@ mod tests {
         assert!(!task_allowed_while_contribution_paused(
             &Task::MatrixMultiply { size: 16 }
         ));
+    }
+
+    #[test]
+    fn task_descriptions_include_workload_size() {
+        assert_eq!(
+            task_description(&Task::MatrixMultiply { size: 320 }),
+            "Matrix 320x320"
+        );
+        assert_eq!(
+            task_description(&Task::CpuBenchmark {
+                iterations: 1_000_000,
+            }),
+            "CPU benchmark (1000000 iterations)"
+        );
     }
 
     #[tokio::test]

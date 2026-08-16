@@ -40,6 +40,7 @@ data.
 - [x] runtime contribution pause and advertised resource budgets;
 - hard OS-enforced resource quotas;
 - [x] local-first placement for bounded CPU benchmark and matrix tasks;
+- [x] operator-visible in-memory task lifecycle and result history;
 - thermal/load-aware chunk assignment;
 - SQLite event and measurement store;
 - benchmark suite for scheduler decisions.
