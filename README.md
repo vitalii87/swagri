@@ -43,11 +43,13 @@ goal is intentionally small:
 The first prototype includes a lightweight headless Agent and a desktop
 Debugger for test networks. It exchanges lightweight resource snapshots and
 ranks connected devices by calibrated CPU strength adjusted for current load
-and the owner's contribution limits. Version 0.6 adds the first deliberately
-narrow automatic placement path: a bounded built-in CPU benchmark stays local
-unless a peer with fresh resource data is at least 20% stronger. Swagri does
-**not** yet queue, split, migrate, or retry general workloads, and it does not
-execute shell commands, downloaded binaries, or arbitrary remote code.
+and the owner's contribution limits. Version 0.7 adds a deterministic bounded
+matrix workload and a safe runtime switch that pauses this device's Swagri
+contribution. While paused, its advertised capacity is zero, new compute work
+is rejected, and smart tasks are routed to a compatible peer when one is
+available. Swagri does **not** yet queue, split, migrate, or retry general
+workloads, and it does not execute shell commands, downloaded binaries, or
+arbitrary remote code.
 
 ## Technology
 
@@ -60,7 +62,8 @@ execute shell commands, downloaded binaries, or arbitrary remote code.
 - persistent Ed25519 node identities
 - trusted-peer, signed and chunked P2P Agent and Debugger updates with rollback
 - cached CPU calibration plus low-frequency CPU/RAM resource snapshots
-- local-first placement for the bounded built-in CPU benchmark
+- local-first placement for bounded CPU benchmark and matrix workloads
+- runtime pause/resume of a device's Swagri contribution
 - native Rust desktop Debugger with live logs, resource comparison, and controls
 
 See [Architecture](docs/ARCHITECTURE.md) for the design boundaries and
@@ -97,6 +100,10 @@ sum <peer-id> 1 2 3.5
 sha256 <peer-id> Swagri
 benchmark <peer-id> 1000000
 auto-benchmark 1000000
+matrix <peer-id> 192
+auto-matrix 320
+pause-resources
+resume-resources
 resources <peer-id>
 ```
 
@@ -104,9 +111,10 @@ Use `help` for all commands. If mDNS is unavailable, start a node with an
 explicit `--dial <multiaddr>` copied from the other node's listen output.
 
 The desktop Debugger provides buttons for discovery, connection testing,
-allowlisted sample tasks, a smart CPU test with an operator-visible placement
-decision, device-resource comparison, version comparison, trusted P2P Agent
-and Debugger updates, firewall help, and manual installer fallback. Agents
+allowlisted sample tasks, smart CPU and matrix tests with operator-visible
+placement decisions, a local contribution pause, device-resource comparison,
+version comparison, trusted P2P Agent and Debugger updates, firewall help, and
+manual installer fallback. Agents
 automatically attempt a QUIC connection after mDNS discovery; advanced users
 can also use `connect`, `dial`, and `info` commands.
 

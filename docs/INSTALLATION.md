@@ -72,20 +72,40 @@ These percentages currently control what the Agent advertises as available to
 future scheduling. They are not yet hard operating-system quotas. Swagri sends
 no process list, filenames, or user-activity details in the snapshot.
 
-Version 0.6 adds **Smart CPU test** to Debugger. The equivalent console command
-is:
+Version 0.7 provides **Smart CPU test** and **Smart Matrix task** in Debugger.
+The equivalent console commands are:
 
 ```text
 auto-benchmark 1000000
+auto-matrix 320
 ```
 
 The Agent compares its current effective CPU score with resource observations
-received from connected peers. It executes locally unless the strongest fresh
-peer is at least 20% better, which provides a simple allowance for network and
-coordination overhead. Debugger shows the chosen device, both scores, the
-required threshold, and completion time. Only the allowlisted built-in CPU
-benchmark uses this policy in 0.6; ordinary tasks are not yet automatically
-queued, divided, migrated, retried, or cancelled.
+received from connected peers. It executes locally unless the strongest fresh,
+compatible peer is at least 20% better, which provides a simple allowance for
+network and coordination overhead. Debugger shows the chosen device, both
+scores, the required threshold, completion time, and the matrix checksum.
+Ordinary tasks are not yet automatically queued, divided, migrated, retried,
+or cancelled.
+
+### Force a smart task onto the other computer
+
+This is the recommended two-Debugger test for version 0.7:
+
+1. Start version 0.7 on both computers and wait until each lists the other as
+   connected with resource data.
+2. On computer A, click **Block resources of this PC**. Its local effective
+   strength becomes zero and the status says that contribution is paused.
+3. On computer A, click **Smart Matrix task**. The scheduler must select
+   computer B and show a remote placement decision.
+4. Wait for a successful result containing `matrix 320x320`, a checksum, and
+   the execution time.
+5. Click **Allow resources of this PC** to resume normal placement.
+
+The pause is intentionally safe and lightweight: it blocks only *new Swagri
+compute tasks*. It does not reserve CPU in Windows, stop other applications, or
+interrupt a task already running. If no compatible remote Agent is available,
+the smart task fails visibly instead of silently running on the paused PC.
 
 ## Updating Agent and Debugger through the swarm
 
@@ -137,8 +157,8 @@ Debugger, or use the installer fallback on both. Beginning with 0.5, later
 Debugger versions can update each other entirely through P2P. Agent 0.4 can
 still update itself to 0.5 through the existing P2P mechanism.
 
-Once Debugger 0.5 is installed, version 0.6 can be used as the first complete
-Debugger-to-Debugger P2P upgrade test.
+Once Debugger 0.5 or newer is installed, version 0.7 can be distributed as a
+complete Debugger-to-Debugger P2P upgrade test.
 
 ## Build packages locally
 

@@ -3,7 +3,7 @@
 use std::{hint::black_box, time::Instant};
 
 use sha2::{Digest, Sha256};
-use swagri_core::{Task, TaskRequest, TaskResponse, TaskResult};
+use swagri_core::{NODE_PROTOCOL_VERSION, Task, TaskRequest, TaskResponse, TaskResult};
 
 pub fn execute(request: TaskRequest) -> TaskResponse {
     let started = Instant::now();
@@ -20,7 +20,7 @@ pub fn execute(request: TaskRequest) -> TaskResponse {
     let result = match request.task {
         Task::NodeInfo => TaskResult::NodeInfo {
             agent_version: env!("CARGO_PKG_VERSION").into(),
-            protocol_version: 2,
+            protocol_version: NODE_PROTOCOL_VERSION,
             resources: None,
         },
         Task::Echo { message } => TaskResult::Echo { message },
@@ -36,6 +36,10 @@ pub fn execute(request: TaskRequest) -> TaskResponse {
         Task::CpuBenchmark { iterations } => TaskResult::CpuBenchmark {
             checksum: cpu_benchmark(iterations),
             iterations,
+        },
+        Task::MatrixMultiply { size } => TaskResult::MatrixMultiply {
+            checksum: matrix_multiply(size),
+            size,
         },
     };
 
@@ -57,6 +61,42 @@ fn cpu_benchmark(iterations: u64) -> u64 {
     }
 
     black_box(value)
+}
+
+fn matrix_multiply(size: u16) -> u64 {
+    let side = usize::from(size);
+    let cells = side * side;
+    let mut left = vec![0_u64; cells];
+    let mut right = vec![0_u64; cells];
+    let mut output = vec![0_u64; cells];
+
+    for row in 0..side {
+        for column in 0..side {
+            let index = row * side + column;
+            left[index] = ((row * 31 + column * 17 + 1) % 251 + 1) as u64;
+            right[index] = ((row * 13 + column * 29 + 7) % 241 + 1) as u64;
+        }
+    }
+
+    for row in 0..side {
+        for inner in 0..side {
+            let left_value = left[row * side + inner];
+            for column in 0..side {
+                let index = row * side + column;
+                output[index] = output[index]
+                    .wrapping_add(left_value.wrapping_mul(right[inner * side + column]));
+            }
+        }
+    }
+
+    black_box(
+        output
+            .into_iter()
+            .enumerate()
+            .fold(0x6a09_e667_f3bc_c909_u64, |checksum, (index, value)| {
+                checksum.wrapping_add(value ^ index as u64).rotate_left(11)
+            }),
+    )
 }
 
 #[cfg(test)]
@@ -110,10 +150,25 @@ mod tests {
             TaskOutcome::Success {
                 result: TaskResult::NodeInfo {
                     ref agent_version,
-                    protocol_version: 2,
+                    protocol_version: NODE_PROTOCOL_VERSION,
                     resources: None,
                 }
             } if agent_version == env!("CARGO_PKG_VERSION")
+        ));
+    }
+
+    #[test]
+    fn executes_bounded_matrix_workload() {
+        let response = execute(TaskRequest {
+            id: "matrix-1".into(),
+            task: Task::MatrixMultiply { size: 16 },
+        });
+
+        assert!(matches!(
+            response.outcome,
+            TaskOutcome::Success {
+                result: TaskResult::MatrixMultiply { size: 16, checksum }
+            } if checksum != 0
         ));
     }
 }

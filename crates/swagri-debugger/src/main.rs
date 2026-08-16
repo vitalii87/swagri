@@ -124,6 +124,7 @@ struct ResourceView {
     allocatable_memory_bytes: u64,
     calibrated_cpu_score: f64,
     effective_cpu_score: f64,
+    contribution_paused: bool,
 }
 
 struct DebuggerApp {
@@ -294,6 +295,7 @@ impl DebuggerApp {
             "sum" => format!("sum {peer} 1 2 3 4 5"),
             "sha256" => format!("sha256 {peer} Swagri"),
             "benchmark" => format!("benchmark {peer} 1000000"),
+            "matrix" => format!("matrix {peer} 192"),
             "info" => format!("info {peer}"),
             _ => format!("echo {peer} hello-from-swagri-debugger"),
         };
@@ -301,8 +303,27 @@ impl DebuggerApp {
     }
 
     fn run_smart_benchmark(&mut self) {
-        self.notice("Scheduler 0.6 порівнює актуальну локальну силу з підключеними агентами…");
+        self.notice("Scheduler порівнює актуальну локальну силу з підключеними агентами…");
         self.send("auto-benchmark 1000000");
+    }
+
+    fn run_smart_matrix(&mut self) {
+        self.notice("Готуємо складнішу matrix-задачу та автоматично обираємо місце виконання…");
+        self.send("auto-matrix 320");
+    }
+
+    fn toggle_local_contribution(&mut self) {
+        let paused = self
+            .local_resources
+            .as_ref()
+            .is_some_and(|resources| resources.contribution_paused);
+        if paused {
+            self.send("resume-resources");
+            self.notice("Дозволяємо нові обчислення на цьому Agent…");
+        } else {
+            self.send("pause-resources");
+            self.notice("Блокуємо нові обчислення на цьому Agent…");
+        }
     }
 
     fn check_versions(&mut self) {
@@ -650,7 +671,7 @@ impl DebuggerApp {
                 selected_score,
                 minimum_remote_score,
                 candidates,
-                ..,
+                details @ ..,
             ] => {
                 if let (Ok(local), Ok(selected), Ok(required), Ok(candidate_count)) = (
                     local_score.parse::<f64>(),
@@ -658,9 +679,10 @@ impl DebuggerApp {
                     minimum_remote_score.parse::<f64>(),
                     candidates.parse::<usize>(),
                 ) {
+                    let task = details.first().copied().unwrap_or("CPU task");
                     let message = if *target_kind == "remote" {
                         format!(
-                            "Scheduler 0.6: обрано агент {} — сила {:.1} проти {:.1} локально (потрібно ≥ {:.1}; кандидатів {}).",
+                            "Scheduler 0.7 ({task}): обрано агент {} — сила {:.1} проти {:.1} локально (потрібно ≥ {:.1}; кандидатів {}).",
                             short_peer(target_peer),
                             selected,
                             local,
@@ -669,7 +691,7 @@ impl DebuggerApp {
                         )
                     } else {
                         format!(
-                            "Scheduler 0.6: обрано цей комп'ютер — локальна сила {:.1}; жоден із {} агентів не перевищив поріг {:.1}.",
+                            "Scheduler 0.7 ({task}): обрано цей комп'ютер — локальна сила {:.1}; жоден із {} агентів не перевищив поріг {:.1}.",
                             local, candidate_count, required
                         )
                     };
@@ -677,19 +699,45 @@ impl DebuggerApp {
                     self.notice(message);
                 }
             }
-            ["TASK_RESULT", peer_id, _, duration, ..] => {
+            ["PLACEMENT_UNAVAILABLE", task, candidates, ..] => {
+                let message = format!(
+                    "Немає місця для {task}: локальні ресурси заблоковані, сумісних віддалених агентів — {candidates}."
+                );
+                self.last_placement = Some(message.clone());
+                self.notice(message);
+            }
+            ["CONTRIBUTION_STATE", state, ..] => {
+                if *state == "paused" {
+                    self.notice(
+                        "Локальний внесок призупинено: нові задачі Swagri підуть на інші агенти.",
+                    );
+                } else {
+                    self.notice("Локальний Agent знову приймає нові обчислення.");
+                }
+            }
+            ["INBOUND_TASK_REJECTED", peer_id, ..] => {
+                self.notice(format!(
+                    "Відхилено нову задачу від {}: локальний внесок призупинено.",
+                    short_peer(peer_id)
+                ));
+            }
+            ["TASK_RESULT", peer_id, _, duration, details @ ..] => {
                 self.completed_tasks += 1;
+                let detail = details
+                    .first()
+                    .map(|value| format!(" Результат: {value}."))
+                    .unwrap_or_default();
                 if self.local_peer_id.as_deref() == Some(*peer_id) {
                     self.notice(format!(
-                        "Локальна задача успішно завершена за {duration} ms."
+                        "Локальна задача успішно завершена за {duration} ms.{detail}"
                     ));
                 } else {
                     let peer = self.peers.entry((*peer_id).into()).or_default();
                     peer.state = PeerState::Connected;
                     peer.last_message = format!("Задача успішна ({duration} ms)");
                     self.notice(format!(
-                        "Задача на агенті {} успішно завершена за {duration} ms.",
-                        short_peer(peer_id)
+                        "Задача на агенті {} успішно завершена за {duration} ms.{detail}",
+                        short_peer(peer_id),
                     ));
                 }
             }
@@ -748,6 +796,10 @@ impl DebuggerApp {
     }
 
     fn draw_main_actions(&mut self, ui: &mut egui::Ui) {
+        let contribution_paused = self
+            .local_resources
+            .as_ref()
+            .is_some_and(|resources| resources.contribution_paused);
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.label(RichText::new("Швидкий старт").strong().size(18.0));
             ui.horizontal_wrapped(|ui| {
@@ -789,6 +841,35 @@ impl DebuggerApp {
                     .clicked()
                 {
                     self.run_smart_benchmark();
+                }
+                if ui
+                    .add_enabled(
+                        self.agent.is_some(),
+                        egui::Button::new("🧮 Розумна Matrix-задача"),
+                    )
+                    .on_hover_text(
+                        "Помножити матриці 320×320 локально або на автоматично обраному агенті",
+                    )
+                    .clicked()
+                {
+                    self.run_smart_matrix();
+                }
+                let contribution_label = if contribution_paused {
+                    "▶ Дозволити ресурси цього ПК"
+                } else {
+                    "⏸ Заблокувати ресурси цього ПК"
+                };
+                if ui
+                    .add_enabled(
+                        self.agent.is_some(),
+                        egui::Button::new(contribution_label),
+                    )
+                    .on_hover_text(
+                        "Забороняє нові задачі Swagri на цьому ПК; Windows та вже запущені задачі не зупиняються",
+                    )
+                    .clicked()
+                {
+                    self.toggle_local_contribution();
                 }
                 if ui
                     .add_enabled(
@@ -839,6 +920,7 @@ impl DebuggerApp {
                 ("Sum", "sum"),
                 ("SHA-256", "sha256"),
                 ("CPU benchmark", "benchmark"),
+                ("Matrix 192×192", "matrix"),
                 ("Версія агента", "info"),
             ] {
                 if ui.button(label).clicked() {
@@ -854,9 +936,12 @@ impl DebuggerApp {
             .iter()
             .filter(|(_, peer)| peer.state == PeerState::Connected)
             .filter_map(|(peer_id, peer)| {
-                peer.resources
-                    .as_ref()
-                    .map(|resources| (peer_id, resources.effective_cpu_score))
+                peer.resources.as_ref().and_then(|resources| {
+                    (!resources.contribution_paused
+                        && resources.effective_cpu_score.is_finite()
+                        && resources.effective_cpu_score > 0.0)
+                        .then_some((peer_id, resources.effective_cpu_score))
+                })
             })
             .collect::<Vec<_>>();
         let remote_scores = remote_candidates
@@ -915,18 +1000,27 @@ impl DebuggerApp {
                                     format_gib(resources.allocatable_memory_bytes),
                                     format_gib(resources.total_memory_bytes)
                                 ));
-                            ui.label(format!(
-                                "CPU {:.1}% · RAM {} · задач {}",
-                                resources.agent_cpu_percent,
-                                format_gib(resources.agent_memory_bytes),
-                                resources.active_tasks
-                            ))
-                            .on_hover_text(format!(
-                                "Ліміти: CPU {:.0}%, RAM {:.0}% · знімок {}",
-                                resources.cpu_limit_percent,
-                                resources.memory_limit_percent,
-                                resources.observed_at_unix_ms
-                            ));
+                            if resources.contribution_paused {
+                                ui.label(
+                                    RichText::new("внесок призупинено")
+                                        .color(Color32::from_rgb(255, 190, 70))
+                                        .strong(),
+                                )
+                                .on_hover_text("Agent відхиляє нові обчислювальні задачі");
+                            } else {
+                                ui.label(format!(
+                                    "CPU {:.1}% · RAM {} · задач {}",
+                                    resources.agent_cpu_percent,
+                                    format_gib(resources.agent_memory_bytes),
+                                    resources.active_tasks
+                                ))
+                                .on_hover_text(format!(
+                                    "Ліміти: CPU {:.0}%, RAM {:.0}% · знімок {}",
+                                    resources.cpu_limit_percent,
+                                    resources.memory_limit_percent,
+                                    resources.observed_at_unix_ms
+                                ));
+                            }
                             ui.label(format!("{:.1}", resources.effective_cpu_score));
                             if recommended == Some(peer_id.as_str()) {
                                 ui.label(
@@ -987,12 +1081,22 @@ impl DebuggerApp {
             "CPU {cpu:.1}%    Пам'ять {used_gib:.2}/{total_gib:.2} GiB"
         ));
         if let Some(resources) = &self.local_resources {
-            ui.small(format!(
-                "Локальний Agent: CPU {:.1}% · RAM {} · доступна рою ефективна сила {:.1}",
-                resources.agent_cpu_percent,
-                format_gib(resources.agent_memory_bytes),
-                resources.effective_cpu_score
-            ));
+            if resources.contribution_paused {
+                ui.label(
+                    RichText::new(
+                        "Локальні ресурси заблоковано для нових задач Swagri · ефективна сила 0",
+                    )
+                    .color(Color32::from_rgb(255, 190, 70))
+                    .strong(),
+                );
+            } else {
+                ui.small(format!(
+                    "Локальний Agent: CPU {:.1}% · RAM {} · доступна рою ефективна сила {:.1}",
+                    resources.agent_cpu_percent,
+                    format_gib(resources.agent_memory_bytes),
+                    resources.effective_cpu_score
+                ));
+            }
         }
         if let Some(placement) = &self.last_placement {
             ui.label(
@@ -1407,6 +1511,10 @@ fn parse_resource_view(values: &[&str]) -> Option<ResourceView> {
         allocatable_memory_bytes: values[14].parse().ok()?,
         calibrated_cpu_score: values[15].parse().ok()?,
         effective_cpu_score: values[16].parse().ok()?,
+        contribution_paused: values
+            .get(17)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(false),
     })
 }
 
@@ -1480,5 +1588,14 @@ mod tests {
         assert_eq!(resources.logical_cores, 16);
         assert_eq!(resources.allocatable_memory_bytes, 8_589_934_592);
         assert_eq!(resources.effective_cpu_score, 110.0);
+        assert!(!resources.contribution_paused);
+
+        let paused_fields = fields
+            .iter()
+            .copied()
+            .chain(std::iter::once("true"))
+            .collect::<Vec<_>>();
+        let paused = parse_resource_view(&paused_fields).expect("valid 0.7 resource event");
+        assert!(paused.contribution_paused);
     }
 }

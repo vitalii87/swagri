@@ -25,10 +25,10 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use swagri_core::{
-    MAX_UPDATE_BYTES, REMOTE_CPU_MINIMUM_GAIN, ResourceSnapshot, SignedUpdateManifest,
-    TASK_PROTOCOL_V1, Task, TaskOutcome, TaskRequest, TaskResponse, TaskResult, UPDATE_CHUNK_BYTES,
-    UPDATE_PROTOCOL_V1, UpdateManifest, UpdateRequest, UpdateResponse, choose_cpu_placement,
-    effective_cpu_score,
+    MAX_UPDATE_BYTES, NODE_PROTOCOL_VERSION, REMOTE_CPU_MINIMUM_GAIN, ResourceSnapshot,
+    SignedUpdateManifest, TASK_PROTOCOL_V1, Task, TaskOutcome, TaskRequest, TaskResponse,
+    TaskResult, UPDATE_CHUNK_BYTES, UPDATE_PROTOCOL_V1, UpdateManifest, UpdateRequest,
+    UpdateResponse, choose_cpu_placement, effective_cpu_score,
 };
 use swagri_executor::execute;
 use sysinfo::{Pid, ProcessesToUpdate, System};
@@ -174,6 +174,7 @@ struct CompletedLocalTask {
 struct PeerResourceObservation {
     snapshot: ResourceSnapshot,
     received_at: Instant,
+    protocol_version: u16,
 }
 
 struct UpdateSource {
@@ -277,6 +278,7 @@ impl ResourceMonitor {
             allocatable_memory_bytes: 0,
             calibrated_cpu_score,
             effective_cpu_score: 0.0,
+            contribution_paused: false,
         };
         let mut monitor = Self {
             system,
@@ -319,16 +321,26 @@ impl ResourceMonitor {
         self.snapshot.agent_cpu_percent = agent_cpu;
         self.snapshot.agent_memory_bytes = agent_memory;
         self.snapshot.active_tasks = self.active_tasks.load(Ordering::Relaxed);
-        self.snapshot.allocatable_memory_bytes = self
-            .snapshot
-            .available_memory_bytes
-            .min(memory_policy_bytes.saturating_sub(agent_memory));
-        self.snapshot.effective_cpu_score = effective_cpu_score(
-            self.snapshot.calibrated_cpu_score,
-            host_cpu,
-            agent_cpu,
-            self.snapshot.cpu_limit_percent,
-        );
+        if self.snapshot.contribution_paused {
+            self.snapshot.allocatable_memory_bytes = 0;
+            self.snapshot.effective_cpu_score = 0.0;
+        } else {
+            self.snapshot.allocatable_memory_bytes = self
+                .snapshot
+                .available_memory_bytes
+                .min(memory_policy_bytes.saturating_sub(agent_memory));
+            self.snapshot.effective_cpu_score = effective_cpu_score(
+                self.snapshot.calibrated_cpu_score,
+                host_cpu,
+                agent_cpu,
+                self.snapshot.cpu_limit_percent,
+            );
+        }
+    }
+
+    fn set_contribution_paused(&mut self, paused: bool) {
+        self.snapshot.contribution_paused = paused;
+        self.refresh();
     }
 }
 
@@ -483,7 +495,7 @@ async fn main() -> Result<()> {
                         &known_peers,
                         &mut updates,
                         &restart_arguments,
-                        &resources.snapshot,
+                        &mut resources,
                         &peer_resources,
                         &local_completed_tx,
                         &active_tasks,
@@ -861,7 +873,7 @@ fn handle_swarm_event(
     peer_resources: &mut BTreeMap<PeerId, PeerResourceObservation>,
     updates: &mut UpdateManager,
     restart_arguments: &[String],
-    resources: &ResourceSnapshot,
+    resources: &mut ResourceMonitor,
     active_tasks: &Arc<AtomicU32>,
 ) -> bool {
     let mut shutdown = false;
@@ -931,7 +943,14 @@ fn handle_swarm_event(
                     .strip_prefix("swagri/")
                     .and_then(|value| value.split_whitespace().next())
                     .unwrap_or(&info.agent_version);
-                emit_event("PEER_VERSION", &[&peer_id.to_string(), version, "2"]);
+                emit_event(
+                    "PEER_VERSION",
+                    &[
+                        &peer_id.to_string(),
+                        version,
+                        &protocol_hint_for_version(version).to_string(),
+                    ],
+                );
                 if updates.policy == UpdatePolicy::Automatic
                     && updates.trusted.contains(&peer_id)
                     && updates.pending.is_none()
@@ -974,9 +993,25 @@ fn handle_request_response(
                     0,
                     TaskResult::NodeInfo {
                         agent_version: env!("CARGO_PKG_VERSION").into(),
-                        protocol_version: 2,
+                        protocol_version: NODE_PROTOCOL_VERSION,
                         resources: Some(resources.clone()),
                     },
+                );
+                let _ = completed_tx.send(CompletedResponse { channel, response });
+                return;
+            }
+            if resources.contribution_paused
+                && !task_allowed_while_contribution_paused(&request.task)
+            {
+                emit_event(
+                    "INBOUND_TASK_REJECTED",
+                    &[&peer.to_string(), "local contribution is paused"],
+                );
+                let response = TaskResponse::failure(
+                    request.id,
+                    0,
+                    "resources_paused",
+                    "the selected Agent has paused its compute contribution",
                 );
                 let _ = completed_tx.send(CompletedResponse { channel, response });
                 return;
@@ -1019,6 +1054,7 @@ fn handle_request_response(
                         PeerResourceObservation {
                             snapshot: resources.clone(),
                             received_at: Instant::now(),
+                            protocol_version: *protocol_version,
                         },
                     );
                 }
@@ -1055,16 +1091,24 @@ fn handle_request_response(
     }
 }
 
+fn task_allowed_while_contribution_paused(task: &Task) -> bool {
+    matches!(task, Task::NodeInfo | Task::Echo { .. })
+}
+
 fn report_task_response(peer: PeerId, response: &TaskResponse) {
     match &response.outcome {
-        TaskOutcome::Success { .. } => emit_event(
-            "TASK_RESULT",
-            &[
-                &peer.to_string(),
-                &response.id,
-                &response.duration_ms.to_string(),
-            ],
-        ),
+        TaskOutcome::Success { result } => {
+            let summary = task_result_summary(result);
+            emit_event(
+                "TASK_RESULT",
+                &[
+                    &peer.to_string(),
+                    &response.id,
+                    &response.duration_ms.to_string(),
+                    &summary,
+                ],
+            );
+        }
         TaskOutcome::Failure { message, .. } => {
             emit_event("TASK_FAILED", &[&peer.to_string(), message]);
         }
@@ -1073,6 +1117,22 @@ fn report_task_response(peer: PeerId, response: &TaskResponse) {
         "Result from {peer}: id={} duration={}ms outcome={:?}",
         response.id, response.duration_ms, response.outcome
     );
+}
+
+fn task_result_summary(result: &TaskResult) -> String {
+    match result {
+        TaskResult::MatrixMultiply { checksum, size } => {
+            format!("matrix {size}x{size}, checksum {checksum}")
+        }
+        TaskResult::CpuBenchmark {
+            checksum,
+            iterations,
+        } => format!("CPU benchmark {iterations} iterations, checksum {checksum}"),
+        TaskResult::Sum { value } => format!("sum {value}"),
+        TaskResult::Sha256 { digest_hex } => format!("SHA-256 {digest_hex}"),
+        TaskResult::Echo { message } => format!("echo {message}"),
+        TaskResult::NodeInfo { agent_version, .. } => format!("Agent {agent_version}"),
+    }
 }
 
 fn begin_update_request(
@@ -1472,6 +1532,17 @@ fn is_newer_version(version: &str) -> bool {
         .is_some_and(|(remote, local)| remote > local)
 }
 
+fn protocol_hint_for_version(version: &str) -> u16 {
+    if Version::parse(version)
+        .ok()
+        .is_some_and(|version| version >= Version::new(0, 7, 0))
+    {
+        NODE_PROTOCOL_VERSION
+    } else {
+        2
+    }
+}
+
 fn verify_download(path: &Path, manifest: &UpdateManifest) -> Result<()> {
     let mut file = File::open(path)?;
     if file.metadata()?.len() != manifest.size {
@@ -1657,9 +1728,33 @@ fn handle_command(
             }
         }
         "quit" | "exit" => return false,
+        "pause-resources" => {
+            resources.set_contribution_paused(true);
+            println!("Local compute contribution is paused.");
+            emit_event("CONTRIBUTION_STATE", &["paused"]);
+            emit_resource_event(
+                "LOCAL_RESOURCES",
+                &local_peer_id.to_string(),
+                &resources.snapshot,
+            );
+        }
+        "resume-resources" => {
+            resources.set_contribution_paused(false);
+            println!("Local compute contribution is enabled.");
+            emit_event("CONTRIBUTION_STATE", &["enabled"]);
+            emit_resource_event(
+                "LOCAL_RESOURCES",
+                &local_peer_id.to_string(),
+                &resources.snapshot,
+            );
+        }
         "local-resources" => {
-            println!("{resources:#?}");
-            emit_resource_event("LOCAL_RESOURCES", &local_peer_id.to_string(), resources);
+            println!("{:#?}", resources.snapshot);
+            emit_resource_event(
+                "LOCAL_RESOURCES",
+                &local_peer_id.to_string(),
+                &resources.snapshot,
+            );
         }
         "info" | "resources" => {
             let result = parse_peer(&mut parts).map(|peer| (peer, Task::NodeInfo));
@@ -1709,6 +1804,17 @@ fn handle_command(
             });
             submit_parsed(result, swarm, local_peer_id, request_counter);
         }
+        "matrix" => {
+            let result = parse_peer(&mut parts).and_then(|peer| {
+                let size = parts
+                    .next()
+                    .context("matrix requires a side length")?
+                    .parse::<u16>()
+                    .context("matrix size must be an integer")?;
+                Ok((peer, Task::MatrixMultiply { size }))
+            });
+            submit_parsed(result, swarm, local_peer_id, request_counter);
+        }
         "auto-benchmark" => {
             let result = parts
                 .next()
@@ -1719,12 +1825,37 @@ fn handle_command(
                         .context("iteration count must be an integer")
                 });
             match result {
-                Ok(iterations) => place_cpu_benchmark(
-                    iterations,
+                Ok(iterations) => place_cpu_task(
+                    Task::CpuBenchmark { iterations },
+                    2,
                     swarm,
                     local_peer_id,
                     request_counter,
-                    resources,
+                    &resources.snapshot,
+                    peer_resources,
+                    local_completed_tx,
+                    active_tasks,
+                ),
+                Err(error) => println!("Invalid command: {error:#}"),
+            }
+        }
+        "auto-matrix" => {
+            let result = parts
+                .next()
+                .context("auto-matrix requires a side length")
+                .and_then(|value| {
+                    value
+                        .parse::<u16>()
+                        .context("matrix size must be an integer")
+                });
+            match result {
+                Ok(size) => place_cpu_task(
+                    Task::MatrixMultiply { size },
+                    NODE_PROTOCOL_VERSION,
+                    swarm,
+                    local_peer_id,
+                    request_counter,
+                    &resources.snapshot,
                     peer_resources,
                     local_completed_tx,
                     active_tasks,
@@ -1783,8 +1914,9 @@ fn submit_task(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn place_cpu_benchmark(
-    iterations: u64,
+fn place_cpu_task(
+    task: Task,
+    minimum_protocol_version: u16,
     swarm: &mut libp2p::Swarm<Behaviour>,
     local_peer_id: PeerId,
     request_counter: &AtomicU64,
@@ -1793,15 +1925,20 @@ fn place_cpu_benchmark(
     local_completed_tx: &mpsc::UnboundedSender<CompletedLocalTask>,
     active_tasks: &Arc<AtomicU32>,
 ) {
-    let task = Task::CpuBenchmark { iterations };
     if let Err(error) = task.validate() {
         println!("Task rejected locally: {error}");
         return;
     }
+    let task_kind = format!("{:?}", task.kind());
 
     let candidates = peer_resources
         .iter()
         .filter(|(_, observation)| observation.received_at.elapsed() <= REMOTE_RESOURCE_MAX_AGE)
+        .filter(|(_, observation)| observation.protocol_version >= minimum_protocol_version)
+        .filter(|(_, observation)| {
+            !observation.snapshot.contribution_paused
+                && observation.snapshot.effective_cpu_score > 0.0
+        })
         .map(|(peer, observation)| (*peer, observation.snapshot.effective_cpu_score))
         .collect::<Vec<_>>();
     let scores = candidates
@@ -1816,7 +1953,7 @@ fn place_cpu_benchmark(
 
     if let Some(index) = decision.remote_candidate_index {
         let peer = candidates[index].0;
-        emit_placement_decision("remote", peer, decision, candidates.len());
+        emit_placement_decision("remote", peer, decision, candidates.len(), &task_kind);
         println!(
             "Placement: remote {peer} (local {:.1}, remote {:.1}, required {:.1})",
             decision.local_score, decision.selected_score, decision.minimum_remote_score
@@ -1825,7 +1962,35 @@ fn place_cpu_benchmark(
         return;
     }
 
-    emit_placement_decision("local", local_peer_id, decision, candidates.len());
+    if resources.contribution_paused {
+        let sequence = request_counter.fetch_add(1, Ordering::Relaxed);
+        let response = TaskResponse::failure(
+            format!("{local_peer_id}-blocked-{sequence}"),
+            0,
+            "no_eligible_resources",
+            "local contribution is paused and no compatible remote Agent is available",
+        );
+        emit_event(
+            "PLACEMENT_UNAVAILABLE",
+            &[&task_kind, &candidates.len().to_string()],
+        );
+        println!(
+            "Placement unavailable: local contribution is paused and no remote candidate is eligible"
+        );
+        let _ = local_completed_tx.send(CompletedLocalTask {
+            peer: local_peer_id,
+            response,
+        });
+        return;
+    }
+
+    emit_placement_decision(
+        "local",
+        local_peer_id,
+        decision,
+        candidates.len(),
+        &task_kind,
+    );
     println!(
         "Placement: local {local_peer_id} (local {:.1}, required remote {:.1})",
         decision.local_score, decision.minimum_remote_score
@@ -1869,6 +2034,7 @@ fn emit_placement_decision(
     target_peer: PeerId,
     decision: swagri_core::CpuPlacementDecision,
     candidate_count: usize,
+    task_kind: &str,
 ) {
     emit_event(
         "PLACEMENT_DECISION",
@@ -1879,6 +2045,7 @@ fn emit_placement_decision(
             &format!("{:.3}", decision.selected_score),
             &format!("{:.3}", decision.minimum_remote_score),
             &candidate_count.to_string(),
+            task_kind,
         ],
     );
 }
@@ -1911,13 +2078,17 @@ fn print_help() {
          download-debugger-update <peer>   Download and verify the peer Debugger\n\
          connect <peer-id>                 Connect using a discovered address\n\
          dial <multiaddr>                  Connect using an explicit address\n\
+         pause-resources                   Reject new compute work on this Agent\n\
+         resume-resources                  Offer local compute resources again\n\
          local-resources                   Show this device resource snapshot\n\
          info|resources <peer-id>          Read remote version and resources\n\
          echo <peer-id> <text>             Return text from the remote node\n\
          sum <peer-id> <numbers...>         Sum finite numbers remotely\n\
          sha256 <peer-id> <text>            Hash text remotely\n\
          benchmark <peer-id> <iterations>   Run bounded synthetic CPU work\n\
+         matrix <peer-id> <size>            Multiply deterministic square matrices remotely\n\
          auto-benchmark <iterations>        Place CPU work locally or on a stronger peer\n\
+         auto-matrix <size>                 Smart-place deterministic matrix work\n\
          quit                              Stop the node"
     );
 }
@@ -1950,6 +2121,7 @@ fn emit_resource_event(kind: &str, peer: &str, resources: &ResourceSnapshot) {
         resources.allocatable_memory_bytes.to_string(),
         format!("{:.3}", resources.calibrated_cpu_score),
         format!("{:.3}", resources.effective_cpu_score),
+        resources.contribution_paused.to_string(),
     ];
     let refs = fields.iter().map(String::as_str).collect::<Vec<_>>();
     emit_event(kind, &refs);
@@ -2006,6 +2178,27 @@ mod tests {
         let signed = signed_manifest(&signer, "999.0.0");
 
         assert!(verify_update_manifest(peer, &signed, UpdateComponent::Debugger).is_err());
+    }
+
+    #[test]
+    fn protocol_hint_requires_version_0_7_for_matrix_work() {
+        assert_eq!(protocol_hint_for_version("0.6.0"), 2);
+        assert_eq!(protocol_hint_for_version("0.7.0"), NODE_PROTOCOL_VERSION);
+        assert_eq!(protocol_hint_for_version("invalid"), 2);
+    }
+
+    #[test]
+    fn paused_contribution_keeps_control_plane_available() {
+        assert!(task_allowed_while_contribution_paused(&Task::NodeInfo));
+        assert!(task_allowed_while_contribution_paused(&Task::Echo {
+            message: "ping".into(),
+        }));
+        assert!(!task_allowed_while_contribution_paused(
+            &Task::CpuBenchmark { iterations: 1 }
+        ));
+        assert!(!task_allowed_while_contribution_paused(
+            &Task::MatrixMultiply { size: 16 }
+        ));
     }
 
     #[tokio::test]

@@ -37,8 +37,9 @@ data.
 - [x] Trusted P2P updates for both headless Agent and desktop Debugger;
 - trust allowlists for the user's devices;
 - task queue, cancellation, deadlines, and retry policy;
-- resource budgets and contribution limits;
-- [x] first local-first placement decision for the bounded CPU benchmark;
+- [x] runtime contribution pause and advertised resource budgets;
+- hard OS-enforced resource quotas;
+- [x] local-first placement for bounded CPU benchmark and matrix tasks;
 - thermal/load-aware chunk assignment;
 - SQLite event and measurement store;
 - benchmark suite for scheduler decisions.

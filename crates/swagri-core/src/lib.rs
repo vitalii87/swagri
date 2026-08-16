@@ -24,6 +24,16 @@ pub const MAX_SUM_VALUES: usize = 100_000;
 /// Maximum iterations accepted by the synthetic CPU benchmark.
 pub const MAX_BENCHMARK_ITERATIONS: u64 = 50_000_000;
 
+/// Smallest accepted side length for the deterministic matrix workload.
+pub const MIN_MATRIX_SIZE: u16 = 16;
+
+/// Largest accepted side length for the deterministic matrix workload.
+pub const MAX_MATRIX_SIZE: u16 = 384;
+
+/// Capability version advertised by nodes that support matrix work and
+/// runtime contribution pause/resume.
+pub const NODE_PROTOCOL_VERSION: u16 = 3;
+
 /// Minimum effective-CPU advantage required before local-first placement sends
 /// a CPU-only task over the network.
 pub const REMOTE_CPU_MINIMUM_GAIN: f64 = 1.20;
@@ -50,6 +60,8 @@ pub struct ResourceSnapshot {
     pub allocatable_memory_bytes: u64,
     pub calibrated_cpu_score: f64,
     pub effective_cpu_score: f64,
+    #[serde(default)]
+    pub contribution_paused: bool,
 }
 
 pub fn effective_cpu_score(
@@ -213,6 +225,7 @@ pub enum Task {
     Sum { values: Vec<f64> },
     Sha256 { text: String },
     CpuBenchmark { iterations: u64 },
+    MatrixMultiply { size: u16 },
 }
 
 impl Task {
@@ -223,6 +236,7 @@ impl Task {
             Self::Sum { .. } => TaskKind::Sum,
             Self::Sha256 { .. } => TaskKind::Sha256,
             Self::CpuBenchmark { .. } => TaskKind::CpuBenchmark,
+            Self::MatrixMultiply { .. } => TaskKind::MatrixMultiply,
         }
     }
 
@@ -245,6 +259,11 @@ impl Task {
             {
                 Err(TaskValidationError::InvalidBenchmarkIterations)
             }
+            Self::MatrixMultiply { size }
+                if !(MIN_MATRIX_SIZE..=MAX_MATRIX_SIZE).contains(size) =>
+            {
+                Err(TaskValidationError::InvalidMatrixSize)
+            }
             _ => Ok(()),
         }
     }
@@ -258,6 +277,7 @@ pub enum TaskKind {
     Sum,
     Sha256,
     CpuBenchmark,
+    MatrixMultiply,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -270,13 +290,14 @@ pub struct NodeCapabilities {
 impl Default for NodeCapabilities {
     fn default() -> Self {
         Self {
-            protocol_version: 2,
+            protocol_version: NODE_PROTOCOL_VERSION,
             task_kinds: vec![
                 TaskKind::NodeInfo,
                 TaskKind::Echo,
                 TaskKind::Sum,
                 TaskKind::Sha256,
                 TaskKind::CpuBenchmark,
+                TaskKind::MatrixMultiply,
             ],
             max_text_bytes: MAX_TEXT_BYTES,
         }
@@ -345,6 +366,10 @@ pub enum TaskResult {
         checksum: u64,
         iterations: u64,
     },
+    MatrixMultiply {
+        checksum: u64,
+        size: u16,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -357,6 +382,8 @@ pub enum TaskValidationError {
     NonFiniteNumber,
     #[error("benchmark iterations must be between 1 and the configured limit")]
     InvalidBenchmarkIterations,
+    #[error("matrix size must be between 16 and 384")]
+    InvalidMatrixSize,
 }
 
 #[cfg(test)]
@@ -380,6 +407,15 @@ mod tests {
             task.validate(),
             Err(TaskValidationError::InvalidBenchmarkIterations)
         );
+    }
+
+    #[test]
+    fn rejects_matrix_outside_bounded_size() {
+        let task = Task::MatrixMultiply {
+            size: MIN_MATRIX_SIZE - 1,
+        };
+
+        assert_eq!(task.validate(), Err(TaskValidationError::InvalidMatrixSize));
     }
 
     #[test]
@@ -424,6 +460,15 @@ mod tests {
 
         assert_eq!(decision.remote_candidate_index, Some(1));
         assert_eq!(decision.selected_score, 150.0);
+    }
+
+    #[test]
+    fn cpu_placement_routes_remote_when_local_contribution_is_unavailable() {
+        let decision = choose_cpu_placement(0.0, &[50.0], REMOTE_CPU_MINIMUM_GAIN);
+
+        assert_eq!(decision.remote_candidate_index, Some(0));
+        assert_eq!(decision.selected_score, 50.0);
+        assert_eq!(decision.minimum_remote_score, 0.0);
     }
 
     #[test]

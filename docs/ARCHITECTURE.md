@@ -41,14 +41,17 @@ Every node has the same role and can initiate or execute requests. The MVP uses:
 - small, allowlisted task kinds;
 - aggregate resource snapshots in `NodeInfo` responses;
 - cached one-time CPU calibration and five-second dynamic sampling;
-- local-first placement for the bounded built-in CPU benchmark;
+- local-first placement for bounded built-in CPU benchmark and matrix work;
+- runtime contribution pause/resume with zero advertised capacity;
 - request limits, execution limits, deadlines, and structured failures.
 
 The prototype has no global discovery, relay, reputation, payment, arbitrary
-code execution, or general distributed scheduler. Version 0.6 uses resource
-scores for one constrained decision only: `auto-benchmark` remains local unless
-a connected peer with a resource observation no older than 20 seconds exceeds
-the local effective CPU score by at least 20%.
+code execution, or general distributed scheduler. Version 0.7 uses resource
+scores for two constrained decisions: `auto-benchmark` and `auto-matrix` remain
+local unless a connected compatible peer with a resource observation no older
+than 20 seconds exceeds the local effective CPU score by at least 20%. If the
+operator pauses local contribution, the local score becomes zero and a smart
+task must use an eligible remote peer or fail explicitly.
 
 ## Workspace boundaries
 
@@ -72,7 +75,7 @@ the interactive CLI.
 ```text
 user command
   -> validate local request
-  -> select explicit peer, or local-first CPU placement for auto-benchmark
+  -> select explicit peer, or local-first CPU placement for a smart task
   -> open request substream
   -> validate request on receiver
   -> execute with limits
@@ -131,18 +134,23 @@ calibrated strength × min(host free CPU, policy CPU remaining) / 100
 ```
 
 Advertised allocatable memory is the smaller of currently available RAM and the
-remaining owner-configured memory budget. These limits are scheduler signals,
-not OS-enforced hard quotas yet. Temperature, accelerators, network quality,
-energy state, and workload-specific benchmarks remain planned inputs.
+remaining owner-configured memory budget. The operator can pause contribution
+at runtime: the Agent advertises zero effective CPU and allocatable memory and
+rejects new compute requests while continuing to answer resource/version
+queries. Already-running work is allowed to finish. These limits are scheduler
+signals, not OS-enforced hard quotas yet. Temperature, accelerators, network
+quality, energy state, and workload-specific benchmarks remain planned inputs.
 
 ## Adaptive scheduling direction
 
-Version 0.6 implements the first measurable scheduler slice for a CPU-only,
-zero-input built-in task. It compares the local score with fresh connected-peer
-scores, applies a 20% remote-gain margin as a coarse allowance for coordination
-cost, emits the decision for Debugger, and executes outside the network event
-loop. This is not yet a general scheduler: it has no measured latency model,
-queue, cancellation, retry, task splitting, or data-locality input.
+Version 0.7 extends the first measurable scheduler slice to two CPU-only,
+zero-input built-in tasks: a synthetic benchmark and deterministic square
+matrix multiplication. It compares the local score with fresh connected-peer
+scores, filters by task protocol capability, applies a 20% remote-gain margin
+as a coarse allowance for coordination cost, emits the decision for Debugger,
+and executes outside the network event loop. This is not yet a general
+scheduler: it has no measured latency model, queue, cancellation, retry, task
+splitting, or data-locality input.
 
 The scheduler should expand its candidate area in stages:
 
