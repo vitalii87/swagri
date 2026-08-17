@@ -87,18 +87,30 @@ user command
 Inbound work runs outside the networking event loop. A slow computation must
 not stop peer discovery, heartbeats, or other responses.
 
-Version 0.8 emits a lightweight local control event when tracked work starts
-and when it completes or fails. Debugger correlates those events by the typed
-request ID. Version 0.9 persists the latest 1,000 completed records in a local
-SQLite database and restores the newest 100 into the task panel on startup.
-Tasks left running when Debugger closes are marked as interrupted on the next
-start. Running tasks show
-elapsed wall time rather than an invented percentage: truthful percentage
-progress requires a later streaming progress protocol and workload-specific
-units. Both requester and executor can therefore observe the same remote task
-from their own perspective without adding coordination traffic to the wire.
-The database is Debugger-local and stores task metadata/results only; resource
-measurement persistence remains a later telemetry step.
+Debugger correlates lifecycle events by typed request ID. It persists the
+latest 1,000 completed records in a local SQLite database and restores the
+newest 100 into the task panel on startup. Tasks left running when Debugger
+closes are marked as interrupted on the next start.
+
+Version 0.10 adds a bounded lifecycle for the first divisible workload:
+
+```text
+distributed matrix command
+  -> validate matrix and chunk bounds
+  -> build a bounded row-chunk queue
+  -> select fresh protocol-compatible local/remote workers
+  -> keep at most one chunk in flight per worker
+  -> report completed chunks as truthful progress
+  -> XOR the order-independent partial checksums
+  -> finish one parent swarm task
+```
+
+This remains deliberately workload-specific. It proves concurrent assignment
+and aggregation without pretending that arbitrary programs are safely
+divisible. Disconnect retry, reassignment, cancellation, and a general task
+graph remain future work. Other running tasks show elapsed wall time rather
+than an invented percentage. The database is Debugger-local and stores task
+metadata/results only; resource measurement persistence remains a later step.
 
 ## Identity and trust
 

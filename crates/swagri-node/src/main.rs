@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fs::{self, File},
     hint::black_box,
     io::{Read, Seek, SeekFrom, Write},
@@ -25,10 +25,10 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use swagri_core::{
-    MAX_UPDATE_BYTES, NODE_PROTOCOL_VERSION, REMOTE_CPU_MINIMUM_GAIN, ResourceSnapshot,
-    SignedUpdateManifest, TASK_PROTOCOL_V1, Task, TaskOutcome, TaskRequest, TaskResponse,
-    TaskResult, UPDATE_CHUNK_BYTES, UPDATE_PROTOCOL_V1, UpdateManifest, UpdateRequest,
-    UpdateResponse, choose_cpu_placement, effective_cpu_score,
+    MAX_DISTRIBUTED_MATRIX_SIZE, MAX_MATRIX_CHUNK_ROWS, MAX_UPDATE_BYTES, NODE_PROTOCOL_VERSION,
+    REMOTE_CPU_MINIMUM_GAIN, ResourceSnapshot, SignedUpdateManifest, TASK_PROTOCOL_V1, Task,
+    TaskOutcome, TaskRequest, TaskResponse, TaskResult, UPDATE_CHUNK_BYTES, UPDATE_PROTOCOL_V1,
+    UpdateManifest, UpdateRequest, UpdateResponse, choose_cpu_placement, effective_cpu_score,
 };
 use swagri_executor::execute;
 use sysinfo::{Pid, ProcessesToUpdate, System};
@@ -170,6 +170,39 @@ struct CompletedResponse {
 struct CompletedLocalTask {
     peer: PeerId,
     response: TaskResponse,
+    matrix_job: Option<String>,
+    matrix_worker: Option<MatrixWorker>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MatrixWorker {
+    Local,
+    Remote(PeerId),
+}
+
+struct OutboundTaskMeta {
+    id: String,
+    tracked: bool,
+    matrix_job: Option<String>,
+    matrix_worker: Option<MatrixWorker>,
+}
+
+struct MatrixChunkPlan {
+    index: u16,
+    row_start: u16,
+    row_end: u16,
+}
+
+struct DistributedMatrixJob {
+    id: String,
+    size: u16,
+    total_chunks: u16,
+    completed_chunks: u16,
+    checksum: u64,
+    started_at: Instant,
+    pending: VecDeque<MatrixChunkPlan>,
+    available_workers: VecDeque<MatrixWorker>,
+    in_flight: u16,
 }
 
 struct PeerResourceObservation {
@@ -460,6 +493,9 @@ async fn main() -> Result<()> {
     let mut known_peers = BTreeMap::<PeerId, BTreeSet<Multiaddr>>::new();
     let mut connected_peers = BTreeSet::<PeerId>::new();
     let mut peer_resources = BTreeMap::<PeerId, PeerResourceObservation>::new();
+    let mut outbound_tasks =
+        HashMap::<request_response::OutboundRequestId, OutboundTaskMeta>::new();
+    let mut matrix_jobs = BTreeMap::<String, DistributedMatrixJob>::new();
     let request_counter = AtomicU64::new(1);
     let active_tasks = Arc::new(AtomicU32::new(0));
     let mut resources = ResourceMonitor::new(
@@ -477,7 +513,11 @@ async fn main() -> Result<()> {
     println!("Identity: {}", identity_path.display());
     emit_event(
         "STARTED",
-        &[&local_peer_id.to_string(), env!("CARGO_PKG_VERSION")],
+        &[
+            &local_peer_id.to_string(),
+            env!("CARGO_PKG_VERSION"),
+            &args.name,
+        ],
     );
     for peer in &updates.trusted {
         emit_event("UPDATE_TRUSTED", &[&peer.to_string()]);
@@ -488,20 +528,33 @@ async fn main() -> Result<()> {
         tokio::select! {
             maybe_line = lines.next_line(), if !stdin_closed => {
                 match maybe_line.context("failed to read stdin")? {
-                    Some(line) if !handle_command(
-                        &line,
-                        &mut swarm,
-                        local_peer_id,
-                        &request_counter,
-                        &known_peers,
-                        &mut updates,
-                        &restart_arguments,
-                        &mut resources,
-                        &peer_resources,
-                        &local_completed_tx,
-                        &active_tasks,
-                    ) => break,
-                    Some(_) => {}
+                    Some(line) => {
+                        if !handle_command(
+                            &line,
+                            &mut swarm,
+                            local_peer_id,
+                            &request_counter,
+                            &known_peers,
+                            &mut updates,
+                            &restart_arguments,
+                            &mut resources,
+                            &peer_resources,
+                            &local_completed_tx,
+                            &active_tasks,
+                            &mut outbound_tasks,
+                            &mut matrix_jobs,
+                        ) {
+                            break;
+                        }
+                        dispatch_matrix_jobs(
+                            &mut matrix_jobs,
+                            &mut swarm,
+                            local_peer_id,
+                            &mut outbound_tasks,
+                            &local_completed_tx,
+                            &active_tasks,
+                        );
+                    }
                     None if args.daemon => stdin_closed = true,
                     None => break,
                 }
@@ -518,9 +571,20 @@ async fn main() -> Result<()> {
                     &restart_arguments,
                     &resources.snapshot,
                     &active_tasks,
+                    &args.name,
+                    &mut outbound_tasks,
+                    &mut matrix_jobs,
                 ) {
                     break;
                 }
+                dispatch_matrix_jobs(
+                    &mut matrix_jobs,
+                    &mut swarm,
+                    local_peer_id,
+                    &mut outbound_tasks,
+                    &local_completed_tx,
+                    &active_tasks,
+                );
             }
             Some(completed) = completed_rx.recv() => {
                 if completed.track_task {
@@ -537,6 +601,25 @@ async fn main() -> Result<()> {
             }
             Some(completed) = local_completed_rx.recv() => {
                 report_task_response(completed.peer, &completed.response);
+                if let (Some(job_id), Some(worker)) =
+                    (completed.matrix_job, completed.matrix_worker)
+                {
+                    complete_matrix_chunk(
+                        &job_id,
+                        worker,
+                        &completed.response,
+                        local_peer_id,
+                        &mut matrix_jobs,
+                    );
+                    dispatch_matrix_jobs(
+                        &mut matrix_jobs,
+                        &mut swarm,
+                        local_peer_id,
+                        &mut outbound_tasks,
+                        &local_completed_tx,
+                        &active_tasks,
+                    );
+                }
             }
             _ = resource_tick.tick() => {
                 resources.refresh();
@@ -548,6 +631,7 @@ async fn main() -> Result<()> {
                         Task::NodeInfo,
                         local_peer_id,
                         &request_counter,
+                        &mut outbound_tasks,
                     );
                 }
             }
@@ -879,6 +963,9 @@ fn handle_swarm_event(
     restart_arguments: &[String],
     resources: &ResourceSnapshot,
     active_tasks: &Arc<AtomicU32>,
+    node_name: &str,
+    outbound_tasks: &mut HashMap<request_response::OutboundRequestId, OutboundTaskMeta>,
+    matrix_jobs: &mut BTreeMap<String, DistributedMatrixJob>,
 ) -> bool {
     let mut shutdown = false;
     match event {
@@ -939,9 +1026,12 @@ fn handle_swarm_event(
                 event,
                 completed_tx,
                 *swarm.local_peer_id(),
+                node_name,
                 resources,
                 active_tasks,
                 peer_resources,
+                outbound_tasks,
+                matrix_jobs,
             );
         }
         SwarmEvent::Behaviour(BehaviourEvent::Update(event)) => {
@@ -985,9 +1075,12 @@ fn handle_request_response(
     event: request_response::Event<TaskRequest, TaskResponse>,
     completed_tx: &mpsc::UnboundedSender<CompletedResponse>,
     local_peer_id: PeerId,
+    node_name: &str,
     resources: &ResourceSnapshot,
     active_tasks: &Arc<AtomicU32>,
     peer_resources: &mut BTreeMap<PeerId, PeerResourceObservation>,
+    outbound_tasks: &mut HashMap<request_response::OutboundRequestId, OutboundTaskMeta>,
+    matrix_jobs: &mut BTreeMap<String, DistributedMatrixJob>,
 ) {
     match event {
         request_response::Event::Message {
@@ -1006,6 +1099,7 @@ fn handle_request_response(
                     TaskResult::NodeInfo {
                         agent_version: env!("CARGO_PKG_VERSION").into(),
                         protocol_version: NODE_PROTOCOL_VERSION,
+                        node_name: node_name.into(),
                         resources: Some(resources.clone()),
                     },
                 );
@@ -1057,14 +1151,20 @@ fn handle_request_response(
         }
         request_response::Event::Message {
             peer,
-            message: request_response::Message::Response { response, .. },
+            message:
+                request_response::Message::Response {
+                    request_id,
+                    response,
+                },
             ..
         } => {
+            let outbound = outbound_tasks.remove(&request_id);
             let is_node_info = if let TaskOutcome::Success {
                 result:
                     TaskResult::NodeInfo {
                         agent_version,
                         protocol_version,
+                        node_name,
                         resources,
                     },
             } = &response.outcome
@@ -1077,6 +1177,9 @@ fn handle_request_response(
                         &protocol_version.to_string(),
                     ],
                 );
+                if !node_name.is_empty() {
+                    emit_event("PEER_NAME", &[&peer.to_string(), node_name]);
+                }
                 if let Some(resources) = resources {
                     emit_resource_event("PEER_RESOURCES", &peer.to_string(), resources);
                     peer_resources.insert(
@@ -1094,6 +1197,12 @@ fn handle_request_response(
             };
             if !is_node_info {
                 report_task_response(peer, &response);
+                if let Some(outbound) = outbound
+                    && let (Some(job_id), Some(worker)) =
+                        (outbound.matrix_job, outbound.matrix_worker)
+                {
+                    complete_matrix_chunk(&job_id, worker, &response, local_peer_id, matrix_jobs);
+                }
             }
         }
         request_response::Event::OutboundFailure {
@@ -1103,10 +1212,26 @@ fn handle_request_response(
             ..
         } => {
             warn!(peer = %peer, ?request_id, %error, "outbound task failed");
-            emit_event(
-                "TASK_FAILED",
-                &[&peer.to_string(), "", "0", &error.to_string()],
-            );
+            if let Some(outbound) = outbound_tasks.remove(&request_id) {
+                if outbound.tracked {
+                    emit_event(
+                        "TASK_FAILED",
+                        &[&peer.to_string(), &outbound.id, "0", &error.to_string()],
+                    );
+                } else {
+                    emit_event("PEER_POLL_FAILED", &[&peer.to_string(), &error.to_string()]);
+                }
+                if let Some(job_id) = outbound.matrix_job {
+                    fail_matrix_job(
+                        &job_id,
+                        &format!("chunk connection failed: {error}"),
+                        local_peer_id,
+                        matrix_jobs,
+                    );
+                }
+            } else {
+                emit_event("PEER_POLL_FAILED", &[&peer.to_string(), &error.to_string()]);
+            }
         }
         request_response::Event::InboundFailure {
             peer,
@@ -1165,6 +1290,20 @@ fn task_result_summary(result: &TaskResult) -> String {
         TaskResult::MatrixMultiply { checksum, size } => {
             format!("matrix {size}x{size}, checksum {checksum}")
         }
+        TaskResult::MatrixChunk {
+            checksum,
+            size,
+            row_start,
+            row_end,
+        } => format!(
+            "matrix {size}x{size} rows {row_start}-{}, checksum {checksum}",
+            row_end.saturating_sub(1)
+        ),
+        TaskResult::DistributedMatrix {
+            checksum,
+            size,
+            chunks,
+        } => format!("distributed matrix {size}x{size}, {chunks} chunks, checksum {checksum}"),
         TaskResult::CpuBenchmark {
             checksum,
             iterations,
@@ -1574,13 +1713,10 @@ fn is_newer_version(version: &str) -> bool {
 }
 
 fn protocol_hint_for_version(version: &str) -> u16 {
-    if Version::parse(version)
-        .ok()
-        .is_some_and(|version| version >= Version::new(0, 7, 0))
-    {
-        NODE_PROTOCOL_VERSION
-    } else {
-        2
+    match Version::parse(version).ok() {
+        Some(version) if version >= Version::new(0, 10, 0) => NODE_PROTOCOL_VERSION,
+        Some(version) if version >= Version::new(0, 7, 0) => 3,
+        _ => 2,
     }
 }
 
@@ -1668,6 +1804,8 @@ fn handle_command(
     peer_resources: &BTreeMap<PeerId, PeerResourceObservation>,
     local_completed_tx: &mpsc::UnboundedSender<CompletedLocalTask>,
     active_tasks: &Arc<AtomicU32>,
+    outbound_tasks: &mut HashMap<request_response::OutboundRequestId, OutboundTaskMeta>,
+    matrix_jobs: &mut BTreeMap<String, DistributedMatrixJob>,
 ) -> bool {
     let line = line.trim();
     if line.is_empty() {
@@ -1799,7 +1937,13 @@ fn handle_command(
         }
         "info" | "resources" => {
             let result = parse_peer(&mut parts).map(|peer| (peer, Task::NodeInfo));
-            submit_parsed(result, swarm, local_peer_id, request_counter);
+            submit_parsed(
+                result,
+                swarm,
+                local_peer_id,
+                request_counter,
+                outbound_tasks,
+            );
         }
         "echo" => {
             let result = parse_peer(&mut parts).and_then(|peer| {
@@ -1809,7 +1953,13 @@ fn handle_command(
                 }
                 Ok((peer, Task::Echo { message }))
             });
-            submit_parsed(result, swarm, local_peer_id, request_counter);
+            submit_parsed(
+                result,
+                swarm,
+                local_peer_id,
+                request_counter,
+                outbound_tasks,
+            );
         }
         "sum" => {
             let result = parse_peer(&mut parts).and_then(|peer| {
@@ -1825,14 +1975,26 @@ fn handle_command(
                 }
                 Ok((peer, Task::Sum { values }))
             });
-            submit_parsed(result, swarm, local_peer_id, request_counter);
+            submit_parsed(
+                result,
+                swarm,
+                local_peer_id,
+                request_counter,
+                outbound_tasks,
+            );
         }
         "sha256" => {
             let result = parse_peer(&mut parts).map(|peer| {
                 let text = parts.collect::<Vec<_>>().join(" ");
                 (peer, Task::Sha256 { text })
             });
-            submit_parsed(result, swarm, local_peer_id, request_counter);
+            submit_parsed(
+                result,
+                swarm,
+                local_peer_id,
+                request_counter,
+                outbound_tasks,
+            );
         }
         "benchmark" => {
             let result = parse_peer(&mut parts).and_then(|peer| {
@@ -1843,7 +2005,13 @@ fn handle_command(
                     .context("iteration count must be an integer")?;
                 Ok((peer, Task::CpuBenchmark { iterations }))
             });
-            submit_parsed(result, swarm, local_peer_id, request_counter);
+            submit_parsed(
+                result,
+                swarm,
+                local_peer_id,
+                request_counter,
+                outbound_tasks,
+            );
         }
         "matrix" => {
             let result = parse_peer(&mut parts).and_then(|peer| {
@@ -1854,7 +2022,13 @@ fn handle_command(
                     .context("matrix size must be an integer")?;
                 Ok((peer, Task::MatrixMultiply { size }))
             });
-            submit_parsed(result, swarm, local_peer_id, request_counter);
+            submit_parsed(
+                result,
+                swarm,
+                local_peer_id,
+                request_counter,
+                outbound_tasks,
+            );
         }
         "auto-benchmark" => {
             let result = parts
@@ -1876,6 +2050,7 @@ fn handle_command(
                     peer_resources,
                     local_completed_tx,
                     active_tasks,
+                    outbound_tasks,
                 ),
                 Err(error) => println!("Invalid command: {error:#}"),
             }
@@ -1900,6 +2075,41 @@ fn handle_command(
                     peer_resources,
                     local_completed_tx,
                     active_tasks,
+                    outbound_tasks,
+                ),
+                Err(error) => println!("Invalid command: {error:#}"),
+            }
+        }
+        "distributed-matrix" => {
+            let result = parts
+                .next()
+                .context("distributed-matrix requires a side length")
+                .and_then(|value| {
+                    value
+                        .parse::<u16>()
+                        .context("matrix size must be an integer")
+                })
+                .and_then(|size| {
+                    let chunk_rows = parts
+                        .next()
+                        .map(|value| {
+                            value
+                                .parse::<u16>()
+                                .context("chunk row count must be an integer")
+                        })
+                        .transpose()?
+                        .unwrap_or(96);
+                    Ok((size, chunk_rows))
+                });
+            match result {
+                Ok((size, chunk_rows)) => start_distributed_matrix(
+                    size,
+                    chunk_rows,
+                    local_peer_id,
+                    request_counter,
+                    &resources.snapshot,
+                    peer_resources,
+                    matrix_jobs,
                 ),
                 Err(error) => println!("Invalid command: {error:#}"),
             }
@@ -1920,6 +2130,7 @@ fn submit_parsed(
     swarm: &mut libp2p::Swarm<Behaviour>,
     local_peer_id: PeerId,
     request_counter: &AtomicU64,
+    outbound_tasks: &mut HashMap<request_response::OutboundRequestId, OutboundTaskMeta>,
 ) {
     match parsed {
         Ok((peer, task)) => {
@@ -1928,7 +2139,14 @@ fn submit_parsed(
                 return;
             }
 
-            submit_task(swarm, peer, task, local_peer_id, request_counter);
+            submit_task(
+                swarm,
+                peer,
+                task,
+                local_peer_id,
+                request_counter,
+                outbound_tasks,
+            );
         }
         Err(error) => println!("Invalid command: {error:#}"),
     }
@@ -1940,17 +2158,27 @@ fn submit_task(
     task: Task,
     local_peer_id: PeerId,
     request_counter: &AtomicU64,
+    outbound_tasks: &mut HashMap<request_response::OutboundRequestId, OutboundTaskMeta>,
 ) {
     let sequence = request_counter.fetch_add(1, Ordering::Relaxed);
     let id = format!("{local_peer_id}-{sequence}");
     let task_kind = task.kind();
     let description = task_description(&task);
     let tracked = task != Task::NodeInfo;
-    swarm.behaviour_mut().request_response.send_request(
+    let request_id = swarm.behaviour_mut().request_response.send_request(
         &peer,
         TaskRequest {
             id: id.clone(),
             task,
+        },
+    );
+    outbound_tasks.insert(
+        request_id,
+        OutboundTaskMeta {
+            id: id.clone(),
+            tracked,
+            matrix_job: None,
+            matrix_worker: None,
         },
     );
     if tracked {
@@ -1970,6 +2198,7 @@ fn place_cpu_task(
     peer_resources: &BTreeMap<PeerId, PeerResourceObservation>,
     local_completed_tx: &mpsc::UnboundedSender<CompletedLocalTask>,
     active_tasks: &Arc<AtomicU32>,
+    outbound_tasks: &mut HashMap<request_response::OutboundRequestId, OutboundTaskMeta>,
 ) {
     if let Err(error) = task.validate() {
         println!("Task rejected locally: {error}");
@@ -2005,7 +2234,14 @@ fn place_cpu_task(
             "Placement: remote {peer} (local {:.1}, remote {:.1}, required {:.1})",
             decision.local_score, decision.selected_score, decision.minimum_remote_score
         );
-        submit_task(swarm, peer, task, local_peer_id, request_counter);
+        submit_task(
+            swarm,
+            peer,
+            task,
+            local_peer_id,
+            request_counter,
+            outbound_tasks,
+        );
         return;
     }
 
@@ -2029,6 +2265,8 @@ fn place_cpu_task(
         let _ = local_completed_tx.send(CompletedLocalTask {
             peer: local_peer_id,
             response,
+            matrix_job: None,
+            matrix_worker: None,
         });
         return;
     }
@@ -2077,6 +2315,8 @@ fn submit_local_task(
         let _ = local_completed_tx.send(CompletedLocalTask {
             peer: local_peer_id,
             response,
+            matrix_job: None,
+            matrix_worker: None,
         });
     });
 }
@@ -2096,7 +2336,306 @@ fn task_description(task: &Task) -> String {
         Task::Sha256 { .. } => "SHA-256".into(),
         Task::CpuBenchmark { iterations } => format!("CPU benchmark ({iterations} iterations)"),
         Task::MatrixMultiply { size } => format!("Matrix {size}x{size}"),
+        Task::MatrixChunk {
+            size,
+            row_start,
+            row_end,
+        } => format!("Matrix {size}x{size}, rows {row_start}..{row_end}"),
     }
+}
+
+fn start_distributed_matrix(
+    size: u16,
+    chunk_rows: u16,
+    local_peer_id: PeerId,
+    request_counter: &AtomicU64,
+    resources: &ResourceSnapshot,
+    peer_resources: &BTreeMap<PeerId, PeerResourceObservation>,
+    matrix_jobs: &mut BTreeMap<String, DistributedMatrixJob>,
+) {
+    if !(swagri_core::MIN_MATRIX_SIZE..=MAX_DISTRIBUTED_MATRIX_SIZE).contains(&size) {
+        println!(
+            "Distributed matrix size must be between {} and {MAX_DISTRIBUTED_MATRIX_SIZE}",
+            swagri_core::MIN_MATRIX_SIZE
+        );
+        return;
+    }
+    if !(1..=MAX_MATRIX_CHUNK_ROWS).contains(&chunk_rows) {
+        println!("Chunk rows must be between 1 and {MAX_MATRIX_CHUNK_ROWS}");
+        return;
+    }
+
+    let mut workers = Vec::<(MatrixWorker, f64)>::new();
+    if !resources.contribution_paused && resources.effective_cpu_score > 0.0 {
+        workers.push((MatrixWorker::Local, resources.effective_cpu_score));
+    }
+    workers.extend(
+        peer_resources
+            .iter()
+            .filter(|(_, observation)| observation.received_at.elapsed() <= REMOTE_RESOURCE_MAX_AGE)
+            .filter(|(_, observation)| observation.protocol_version >= NODE_PROTOCOL_VERSION)
+            .filter(|(_, observation)| {
+                !observation.snapshot.contribution_paused
+                    && observation.snapshot.effective_cpu_score > 0.0
+            })
+            .map(|(peer, observation)| {
+                (
+                    MatrixWorker::Remote(*peer),
+                    observation.snapshot.effective_cpu_score,
+                )
+            }),
+    );
+    workers.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let sequence = request_counter.fetch_add(1, Ordering::Relaxed);
+    let id = format!("{local_peer_id}-distributed-{sequence}");
+    let total_chunks = size.div_ceil(chunk_rows);
+    let description = format!("Distributed Matrix {size}x{size} ({total_chunks} chunks)");
+    emit_event(
+        "TASK_STARTED",
+        &[&id, &description, "swarm", "orchestrator"],
+    );
+
+    if workers.is_empty() {
+        let response = TaskResponse::failure(
+            id,
+            0,
+            "no_eligible_resources",
+            "no compatible Agent currently offers compute resources",
+        );
+        report_task_response(local_peer_id, &response);
+        return;
+    }
+
+    let pending = (0..total_chunks)
+        .map(|index| {
+            let row_start = index * chunk_rows;
+            MatrixChunkPlan {
+                index,
+                row_start,
+                row_end: (row_start + chunk_rows).min(size),
+            }
+        })
+        .collect::<VecDeque<_>>();
+    let available_workers = workers
+        .into_iter()
+        .map(|(worker, _)| worker)
+        .collect::<VecDeque<_>>();
+    emit_event(
+        "MATRIX_PLAN",
+        &[
+            &id,
+            &size.to_string(),
+            &total_chunks.to_string(),
+            &available_workers.len().to_string(),
+        ],
+    );
+    matrix_jobs.insert(
+        id.clone(),
+        DistributedMatrixJob {
+            id,
+            size,
+            total_chunks,
+            completed_chunks: 0,
+            checksum: 0,
+            started_at: Instant::now(),
+            pending,
+            available_workers,
+            in_flight: 0,
+        },
+    );
+}
+
+struct MatrixDispatch {
+    job_id: String,
+    task_id: String,
+    task: Task,
+    worker: MatrixWorker,
+}
+
+fn dispatch_matrix_jobs(
+    matrix_jobs: &mut BTreeMap<String, DistributedMatrixJob>,
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    local_peer_id: PeerId,
+    outbound_tasks: &mut HashMap<request_response::OutboundRequestId, OutboundTaskMeta>,
+    local_completed_tx: &mpsc::UnboundedSender<CompletedLocalTask>,
+    active_tasks: &Arc<AtomicU32>,
+) {
+    let mut dispatches = Vec::new();
+    for job in matrix_jobs.values_mut() {
+        while let (Some(worker), Some(chunk)) =
+            (job.available_workers.pop_front(), job.pending.pop_front())
+        {
+            job.in_flight += 1;
+            dispatches.push(MatrixDispatch {
+                job_id: job.id.clone(),
+                task_id: format!("{}-chunk-{}", job.id, chunk.index + 1),
+                task: Task::MatrixChunk {
+                    size: job.size,
+                    row_start: chunk.row_start,
+                    row_end: chunk.row_end,
+                },
+                worker,
+            });
+        }
+    }
+
+    for dispatch in dispatches {
+        let description = task_description(&dispatch.task);
+        match dispatch.worker {
+            MatrixWorker::Local => {
+                emit_task_started(&dispatch.task_id, &description, local_peer_id, "local");
+                let request = TaskRequest {
+                    id: dispatch.task_id,
+                    task: dispatch.task,
+                };
+                let local_completed_tx = local_completed_tx.clone();
+                let active_tasks = active_tasks.clone();
+                let job_id = dispatch.job_id;
+                active_tasks.fetch_add(1, Ordering::Relaxed);
+                tokio::task::spawn_blocking(move || {
+                    let response = execute(request);
+                    active_tasks.fetch_sub(1, Ordering::Relaxed);
+                    let _ = local_completed_tx.send(CompletedLocalTask {
+                        peer: local_peer_id,
+                        response,
+                        matrix_job: Some(job_id),
+                        matrix_worker: Some(MatrixWorker::Local),
+                    });
+                });
+            }
+            MatrixWorker::Remote(peer) => {
+                emit_task_started(&dispatch.task_id, &description, peer, "outbound");
+                let request_id = swarm.behaviour_mut().request_response.send_request(
+                    &peer,
+                    TaskRequest {
+                        id: dispatch.task_id.clone(),
+                        task: dispatch.task,
+                    },
+                );
+                outbound_tasks.insert(
+                    request_id,
+                    OutboundTaskMeta {
+                        id: dispatch.task_id,
+                        tracked: true,
+                        matrix_job: Some(dispatch.job_id),
+                        matrix_worker: Some(MatrixWorker::Remote(peer)),
+                    },
+                );
+            }
+        }
+    }
+}
+
+fn complete_matrix_chunk(
+    job_id: &str,
+    worker: MatrixWorker,
+    response: &TaskResponse,
+    local_peer_id: PeerId,
+    matrix_jobs: &mut BTreeMap<String, DistributedMatrixJob>,
+) {
+    let result = match &response.outcome {
+        TaskOutcome::Success {
+            result:
+                TaskResult::MatrixChunk {
+                    checksum,
+                    size,
+                    row_start: _,
+                    row_end: _,
+                },
+        } => Some((*checksum, *size)),
+        TaskOutcome::Success { .. } => None,
+        TaskOutcome::Failure { error } => {
+            fail_matrix_job(
+                job_id,
+                &format!("chunk failed: {}", error.message),
+                local_peer_id,
+                matrix_jobs,
+            );
+            return;
+        }
+    };
+    let Some((checksum, result_size)) = result else {
+        fail_matrix_job(
+            job_id,
+            "worker returned an unexpected result type",
+            local_peer_id,
+            matrix_jobs,
+        );
+        return;
+    };
+
+    let mut finished = None;
+    if let Some(job) = matrix_jobs.get_mut(job_id) {
+        if result_size != job.size {
+            fail_matrix_job(
+                job_id,
+                "worker returned a result for a different matrix size",
+                local_peer_id,
+                matrix_jobs,
+            );
+            return;
+        }
+        job.in_flight = job.in_flight.saturating_sub(1);
+        job.available_workers.push_back(worker);
+        job.completed_chunks += 1;
+        job.checksum ^= checksum;
+        emit_event(
+            "TASK_PROGRESS",
+            &[
+                &job.id,
+                &job.completed_chunks.to_string(),
+                &job.total_chunks.to_string(),
+                "matrix chunks completed",
+            ],
+        );
+        if job.completed_chunks == job.total_chunks {
+            finished = Some((
+                job.id.clone(),
+                job.size,
+                job.total_chunks,
+                job.checksum,
+                job.started_at.elapsed().as_millis() as u64,
+            ));
+        }
+    }
+
+    if let Some((id, size, chunks, checksum, duration_ms)) = finished {
+        matrix_jobs.remove(&id);
+        let response = TaskResponse::success(
+            id,
+            duration_ms,
+            TaskResult::DistributedMatrix {
+                checksum,
+                size,
+                chunks,
+            },
+        );
+        report_task_response(local_peer_id, &response);
+    }
+}
+
+fn fail_matrix_job(
+    job_id: &str,
+    message: &str,
+    local_peer_id: PeerId,
+    matrix_jobs: &mut BTreeMap<String, DistributedMatrixJob>,
+) {
+    let Some(job) = matrix_jobs.remove(job_id) else {
+        return;
+    };
+    let response = TaskResponse::failure(
+        job.id,
+        job.started_at.elapsed().as_millis() as u64,
+        "distributed_matrix_failed",
+        message,
+    );
+    report_task_response(local_peer_id, &response);
 }
 
 fn emit_placement_decision(
@@ -2159,6 +2698,7 @@ fn print_help() {
          matrix <peer-id> <size>            Multiply deterministic square matrices remotely\n\
          auto-benchmark <iterations>        Place CPU work locally or on a stronger peer\n\
          auto-matrix <size>                 Smart-place deterministic matrix work\n\
+         distributed-matrix <size> [rows]   Split matrix work across eligible Agents\n\
          quit                              Stop the node"
     );
 }
@@ -2251,9 +2791,11 @@ mod tests {
     }
 
     #[test]
-    fn protocol_hint_requires_version_0_7_for_matrix_work() {
+    fn protocol_hint_preserves_legacy_and_requires_0_10_for_chunks() {
         assert_eq!(protocol_hint_for_version("0.6.0"), 2);
-        assert_eq!(protocol_hint_for_version("0.7.0"), NODE_PROTOCOL_VERSION);
+        assert_eq!(protocol_hint_for_version("0.7.0"), 3);
+        assert_eq!(protocol_hint_for_version("0.9.0"), 3);
+        assert_eq!(protocol_hint_for_version("0.10.0"), NODE_PROTOCOL_VERSION);
         assert_eq!(protocol_hint_for_version("invalid"), 2);
     }
 
@@ -2269,6 +2811,13 @@ mod tests {
         assert!(!task_allowed_while_contribution_paused(
             &Task::MatrixMultiply { size: 16 }
         ));
+        assert!(!task_allowed_while_contribution_paused(
+            &Task::MatrixChunk {
+                size: 16,
+                row_start: 0,
+                row_end: 8,
+            }
+        ));
     }
 
     #[test]
@@ -2282,6 +2831,14 @@ mod tests {
                 iterations: 1_000_000,
             }),
             "CPU benchmark (1000000 iterations)"
+        );
+        assert_eq!(
+            task_description(&Task::MatrixChunk {
+                size: 768,
+                row_start: 96,
+                row_end: 192,
+            }),
+            "Matrix 768x768, rows 96..192"
         );
     }
 

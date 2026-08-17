@@ -53,11 +53,13 @@ well-characterized workload without regressing unsuitable workloads.
 ## Phase 3 — Divisible workloads
 
 - task graphs and independent chunks;
-- result aggregation;
+- [x] bounded independent chunks for the first matrix workload;
+- [x] deterministic matrix result aggregation;
 - content-addressed inputs and cached artifacts;
 - retry and reassignment after disconnects;
 - redundant execution for critical results;
-- streaming progress and partial results;
+- [x] local control-stream progress for matrix chunks;
+- network streaming progress and partial results for general workloads;
 - initial Wasm execution backend.
 
 ## Phase 4 — Wider swarm

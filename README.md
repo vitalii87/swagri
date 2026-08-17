@@ -43,13 +43,13 @@ goal is intentionally small:
 The first prototype includes a lightweight headless Agent and a desktop
 Debugger for test networks. It exchanges lightweight resource snapshots and
 ranks connected devices by calibrated CPU strength adjusted for current load
-and the owner's contribution limits. Version 0.9 adds an operator-visible task
-lifecycle: Debugger retains active, completed, and failed local, outbound, and
-inbound work with its executor, elapsed time, duration, and typed result in a
-bounded local SQLite history that survives Debugger restarts. True percentage
-progress and a broader resource-measurement store remain planned. Swagri does **not** yet queue,
-split, migrate, or retry general workloads, and it does not execute shell
-commands, downloaded binaries, or arbitrary remote code.
+and the owner's contribution limits. Version 0.10 adds the first genuinely
+divisible workload: a deterministic matrix can be queued as bounded row chunks,
+executed concurrently by the available local and remote Agents, and aggregated
+into one result with truthful chunk progress. Debugger retains both the parent
+job and every executor-visible chunk in its bounded SQLite task history. Swagri
+does **not** yet split, migrate, retry, or cancel general workloads, and it does
+not execute shell commands, downloaded binaries, or arbitrary remote code.
 
 ## Technology
 
@@ -63,6 +63,7 @@ commands, downloaded binaries, or arbitrary remote code.
 - trusted-peer, signed and chunked P2P Agent and Debugger updates with rollback
 - cached CPU calibration plus low-frequency CPU/RAM resource snapshots
 - local-first placement for bounded CPU benchmark and matrix workloads
+- bounded multi-Agent matrix chunk scheduling, progress, and result aggregation
 - runtime pause/resume of a device's Swagri contribution
 - durable local SQLite lifecycle and result history for swarm tasks
 - native Rust desktop Debugger with live logs, resource comparison, and controls
@@ -103,6 +104,7 @@ benchmark <peer-id> 1000000
 auto-benchmark 1000000
 matrix <peer-id> 192
 auto-matrix 320
+distributed-matrix 768 96
 pause-resources
 resume-resources
 resources <peer-id>
@@ -112,8 +114,8 @@ Use `help` for all commands. If mDNS is unavailable, start a node with an
 explicit `--dial <multiaddr>` copied from the other node's listen output.
 
 The desktop Debugger provides buttons for discovery, connection testing,
-allowlisted sample tasks, smart CPU and matrix tests with operator-visible
-placement decisions, a local contribution pause, device-resource comparison,
+allowlisted sample tasks, smart CPU tests, a divisible multi-Agent matrix test
+with visible placement and progress, a local contribution pause, device-resource comparison,
 version comparison, trusted P2P Agent and Debugger updates, firewall help, and
 manual installer fallback. Agents
 automatically attempt a QUIC connection after mDNS discovery; advanced users

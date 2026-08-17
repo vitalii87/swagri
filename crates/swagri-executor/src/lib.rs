@@ -21,6 +21,7 @@ pub fn execute(request: TaskRequest) -> TaskResponse {
         Task::NodeInfo => TaskResult::NodeInfo {
             agent_version: env!("CARGO_PKG_VERSION").into(),
             protocol_version: NODE_PROTOCOL_VERSION,
+            node_name: String::new(),
             resources: None,
         },
         Task::Echo { message } => TaskResult::Echo { message },
@@ -40,6 +41,16 @@ pub fn execute(request: TaskRequest) -> TaskResponse {
         Task::MatrixMultiply { size } => TaskResult::MatrixMultiply {
             checksum: matrix_multiply(size),
             size,
+        },
+        Task::MatrixChunk {
+            size,
+            row_start,
+            row_end,
+        } => TaskResult::MatrixChunk {
+            checksum: matrix_chunk(size, row_start, row_end),
+            size,
+            row_start,
+            row_end,
         },
     };
 
@@ -99,6 +110,36 @@ fn matrix_multiply(size: u16) -> u64 {
     )
 }
 
+fn matrix_chunk(size: u16, row_start: u16, row_end: u16) -> u64 {
+    let side = usize::from(size);
+    let mut right = vec![0_u64; side * side];
+    for row in 0..side {
+        for column in 0..side {
+            right[row * side + column] = ((row * 13 + column * 29 + 7) % 241 + 1) as u64;
+        }
+    }
+
+    let mut checksum = 0_u64;
+    for row in usize::from(row_start)..usize::from(row_end) {
+        for column in 0..side {
+            let mut value = 0_u64;
+            for inner in 0..side {
+                let left = ((row * 31 + inner * 17 + 1) % 251 + 1) as u64;
+                value = value.wrapping_add(left.wrapping_mul(right[inner * side + column]));
+            }
+            checksum ^= matrix_cell_checksum(row * side + column, value);
+        }
+    }
+    black_box(checksum)
+}
+
+fn matrix_cell_checksum(index: usize, value: u64) -> u64 {
+    value
+        .wrapping_add((index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15))
+        .rotate_left((index % 63 + 1) as u32)
+        .wrapping_mul(0xa076_1d64_78bd_642f)
+}
+
 #[cfg(test)]
 mod tests {
     use swagri_core::{Task, TaskOutcome, TaskRequest, TaskResult};
@@ -151,9 +192,10 @@ mod tests {
                 result: TaskResult::NodeInfo {
                     ref agent_version,
                     protocol_version: NODE_PROTOCOL_VERSION,
+                    ref node_name,
                     resources: None,
                 }
-            } if agent_version == env!("CARGO_PKG_VERSION")
+            } if agent_version == env!("CARGO_PKG_VERSION") && node_name.is_empty()
         ));
     }
 
@@ -170,5 +212,14 @@ mod tests {
                 result: TaskResult::MatrixMultiply { size: 16, checksum }
             } if checksum != 0
         ));
+    }
+
+    #[test]
+    fn matrix_chunks_aggregate_independently_of_partitioning() {
+        let whole = matrix_chunk(32, 0, 32);
+        let partitioned =
+            matrix_chunk(32, 0, 11) ^ matrix_chunk(32, 11, 23) ^ matrix_chunk(32, 23, 32);
+
+        assert_eq!(partitioned, whole);
     }
 }

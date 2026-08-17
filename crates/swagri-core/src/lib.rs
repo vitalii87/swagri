@@ -30,9 +30,15 @@ pub const MIN_MATRIX_SIZE: u16 = 16;
 /// Largest accepted side length for the deterministic matrix workload.
 pub const MAX_MATRIX_SIZE: u16 = 384;
 
-/// Capability version advertised by nodes that support matrix work and
-/// runtime contribution pause/resume.
-pub const NODE_PROTOCOL_VERSION: u16 = 3;
+/// Largest accepted side length for a row-chunked distributed matrix workload.
+pub const MAX_DISTRIBUTED_MATRIX_SIZE: u16 = 768;
+
+/// Maximum number of output rows computed by one distributed matrix request.
+pub const MAX_MATRIX_CHUNK_ROWS: u16 = 128;
+
+/// Capability version advertised by nodes that support bounded matrix chunks
+/// and runtime contribution pause/resume.
+pub const NODE_PROTOCOL_VERSION: u16 = 4;
 
 /// Minimum effective-CPU advantage required before local-first placement sends
 /// a CPU-only task over the network.
@@ -221,11 +227,26 @@ pub struct TaskRequest {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Task {
     NodeInfo,
-    Echo { message: String },
-    Sum { values: Vec<f64> },
-    Sha256 { text: String },
-    CpuBenchmark { iterations: u64 },
-    MatrixMultiply { size: u16 },
+    Echo {
+        message: String,
+    },
+    Sum {
+        values: Vec<f64>,
+    },
+    Sha256 {
+        text: String,
+    },
+    CpuBenchmark {
+        iterations: u64,
+    },
+    MatrixMultiply {
+        size: u16,
+    },
+    MatrixChunk {
+        size: u16,
+        row_start: u16,
+        row_end: u16,
+    },
 }
 
 impl Task {
@@ -237,6 +258,7 @@ impl Task {
             Self::Sha256 { .. } => TaskKind::Sha256,
             Self::CpuBenchmark { .. } => TaskKind::CpuBenchmark,
             Self::MatrixMultiply { .. } => TaskKind::MatrixMultiply,
+            Self::MatrixChunk { .. } => TaskKind::MatrixChunk,
         }
     }
 
@@ -264,6 +286,17 @@ impl Task {
             {
                 Err(TaskValidationError::InvalidMatrixSize)
             }
+            Self::MatrixChunk {
+                size,
+                row_start,
+                row_end,
+            } if !(MIN_MATRIX_SIZE..=MAX_DISTRIBUTED_MATRIX_SIZE).contains(size)
+                || row_start >= row_end
+                || row_end > size
+                || row_end - row_start > MAX_MATRIX_CHUNK_ROWS =>
+            {
+                Err(TaskValidationError::InvalidMatrixChunk)
+            }
             _ => Ok(()),
         }
     }
@@ -278,6 +311,7 @@ pub enum TaskKind {
     Sha256,
     CpuBenchmark,
     MatrixMultiply,
+    MatrixChunk,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -298,6 +332,7 @@ impl Default for NodeCapabilities {
                 TaskKind::Sha256,
                 TaskKind::CpuBenchmark,
                 TaskKind::MatrixMultiply,
+                TaskKind::MatrixChunk,
             ],
             max_text_bytes: MAX_TEXT_BYTES,
         }
@@ -351,6 +386,8 @@ pub enum TaskResult {
         agent_version: String,
         protocol_version: u16,
         #[serde(default)]
+        node_name: String,
+        #[serde(default)]
         resources: Option<ResourceSnapshot>,
     },
     Echo {
@@ -370,6 +407,17 @@ pub enum TaskResult {
         checksum: u64,
         size: u16,
     },
+    MatrixChunk {
+        checksum: u64,
+        size: u16,
+        row_start: u16,
+        row_end: u16,
+    },
+    DistributedMatrix {
+        checksum: u64,
+        size: u16,
+        chunks: u16,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -384,6 +432,8 @@ pub enum TaskValidationError {
     InvalidBenchmarkIterations,
     #[error("matrix size must be between 16 and 384")]
     InvalidMatrixSize,
+    #[error("matrix chunk must contain 1 to 128 rows within a matrix of size 16 to 768")]
+    InvalidMatrixChunk,
 }
 
 #[cfg(test)]
@@ -416,6 +466,28 @@ mod tests {
         };
 
         assert_eq!(task.validate(), Err(TaskValidationError::InvalidMatrixSize));
+    }
+
+    #[test]
+    fn validates_bounded_distributed_matrix_chunk() {
+        assert!(
+            Task::MatrixChunk {
+                size: 768,
+                row_start: 640,
+                row_end: 768,
+            }
+            .validate()
+            .is_ok()
+        );
+        assert_eq!(
+            Task::MatrixChunk {
+                size: 768,
+                row_start: 0,
+                row_end: 129,
+            }
+            .validate(),
+            Err(TaskValidationError::InvalidMatrixChunk)
+        );
     }
 
     #[test]

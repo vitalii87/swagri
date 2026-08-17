@@ -98,6 +98,7 @@ impl PeerState {
 
 #[derive(Default)]
 struct PeerView {
+    node_name: Option<String>,
     addresses: Vec<String>,
     state: PeerState,
     version: Option<String>,
@@ -186,6 +187,7 @@ impl TaskStore {
         )?;
         let store = Self { connection };
         let interrupted = store.mark_interrupted()?;
+        store.remove_legacy_poll_failures()?;
         let tasks = store.load_recent(MAX_TASK_HISTORY)?;
         Ok((store, tasks, interrupted))
     }
@@ -200,6 +202,19 @@ impl TaskStore {
                  updated_unix_ms = ?1
              WHERE state = 'running'",
             [now],
+        )?)
+    }
+
+    fn remove_legacy_poll_failures(&self) -> Result<usize> {
+        Ok(self.connection.execute(
+            "DELETE FROM tasks
+             WHERE direction = 'unknown'
+               AND description = 'Задача'
+               AND (
+                   result LIKE '%outbound stream%'
+                   OR result LIKE 'Timeout while waiting%'
+               )",
+            [],
         )?)
     }
 
@@ -503,6 +518,11 @@ impl DebuggerApp {
         self.send("auto-matrix 320");
     }
 
+    fn run_distributed_matrix(&mut self) {
+        self.notice("Ділимо Matrix 768×768 на 8 частин і розподіляємо між доступними Agent…");
+        self.send("distributed-matrix 768 96");
+    }
+
     fn toggle_local_contribution(&mut self) {
         let paused = self
             .local_resources
@@ -557,9 +577,9 @@ impl DebuggerApp {
         }
 
         self.stop_agent();
-        match Command::new(&path).spawn() {
+        match launch_installer_after_exit(&path) {
             Ok(_) => {
-                self.notice("Інсталятор оновлення запущено. Debugger закривається.");
+                self.notice("Debugger закривається; інсталятор запуститься одразу після виходу.");
                 self.close_requested = true;
             }
             Err(error) => self.notice(format!("Не вдалося запустити інсталятор: {error}")),
@@ -736,7 +756,14 @@ impl DebuggerApp {
         };
         let fields = payload.split('\t').collect::<Vec<_>>();
         match fields.as_slice() {
-            ["STARTED", peer_id, version, ..] => {
+            ["STARTED", peer_id, version, node_name, ..] => {
+                self.local_peer_id = Some((*peer_id).into());
+                self.agent_version = (*version).into();
+                if !node_name.is_empty() {
+                    self.node_name = (*node_name).into();
+                }
+            }
+            ["STARTED", peer_id, version] => {
                 self.local_peer_id = Some((*peer_id).into());
                 self.agent_version = (*version).into();
             }
@@ -790,6 +817,18 @@ impl DebuggerApp {
                 if should_update {
                     self.request_peer_update((*peer_id).into());
                 }
+            }
+            ["PEER_NAME", peer_id, node_name, ..] => {
+                if !node_name.is_empty() {
+                    self.peers.entry((*peer_id).into()).or_default().node_name =
+                        Some((*node_name).into());
+                }
+            }
+            ["PEER_POLL_FAILED", peer_id, error, ..] => {
+                self.peers
+                    .entry((*peer_id).into())
+                    .or_default()
+                    .last_message = format!("Фонове опитування: {error}");
             }
             ["LOCAL_RESOURCES", _, values @ ..] => {
                 if let Some(resources) = parse_resource_view(values) {
@@ -873,7 +912,7 @@ impl DebuggerApp {
                     let task = details.first().copied().unwrap_or("CPU task");
                     let message = if *target_kind == "remote" {
                         format!(
-                            "Scheduler 0.9 ({task}): обрано агент {} — сила {:.1} проти {:.1} локально (потрібно ≥ {:.1}; кандидатів {}).",
+                            "Scheduler 0.10 ({task}): обрано агент {} — сила {:.1} проти {:.1} локально (потрібно ≥ {:.1}; кандидатів {}).",
                             short_peer(target_peer),
                             selected,
                             local,
@@ -882,7 +921,7 @@ impl DebuggerApp {
                         )
                     } else {
                         format!(
-                            "Scheduler 0.9 ({task}): обрано цей комп'ютер — локальна сила {:.1}; жоден із {} агентів не перевищив поріг {:.1}.",
+                            "Scheduler 0.10 ({task}): обрано цей комп'ютер — локальна сила {:.1}; жоден із {} агентів не перевищив поріг {:.1}.",
                             local, candidate_count, required
                         )
                     };
@@ -924,6 +963,34 @@ impl DebuggerApp {
                     record_task_started(&mut self.tasks, id, description, executor_peer, direction)
                         .clone();
                 self.persist_task(&task);
+            }
+            ["MATRIX_PLAN", id, size, total, workers, ..] => {
+                if let Ok(total) = total.parse::<u16>()
+                    && let Some(task) = record_task_progress(
+                        &mut self.tasks,
+                        id,
+                        0,
+                        total,
+                        &format!("Matrix {size}×{size}; виконавців: {workers}"),
+                    )
+                    .cloned()
+                {
+                    self.persist_task(&task);
+                }
+            }
+            ["TASK_PROGRESS", id, completed, total, details @ ..] => {
+                if let (Ok(completed), Ok(total)) = (completed.parse::<u16>(), total.parse::<u16>())
+                    && let Some(task) = record_task_progress(
+                        &mut self.tasks,
+                        id,
+                        completed,
+                        total,
+                        details.first().copied().unwrap_or("chunks completed"),
+                    )
+                    .cloned()
+                {
+                    self.persist_task(&task);
+                }
             }
             ["TASK_RESULT", peer_id, id, duration, details @ ..] => {
                 self.completed_tasks += 1;
@@ -981,19 +1048,29 @@ impl DebuggerApp {
                 }
             }
             ["TASK_FAILED", peer_id, error, ..] => {
-                let task =
-                    record_task_finished(&mut self.tasks, "", peer_id, 0, error, TaskState::Failed)
-                        .clone();
-                self.persist_task(&task);
-                if self.local_peer_id.as_deref() == Some(*peer_id) {
-                    self.notice(format!("Локальна задача завершилась помилкою: {error}"));
+                let running_id = self
+                    .tasks
+                    .iter()
+                    .rfind(|task| {
+                        task.state == TaskState::Running && task.executor_peer == *peer_id
+                    })
+                    .map(|task| task.id.clone());
+                if let Some(id) = running_id {
+                    let task = record_task_finished(
+                        &mut self.tasks,
+                        &id,
+                        peer_id,
+                        0,
+                        error,
+                        TaskState::Failed,
+                    )
+                    .clone();
+                    self.persist_task(&task);
                 } else {
-                    let peer = self.peers.entry((*peer_id).into()).or_default();
-                    peer.last_message = format!("Помилка задачі: {error}");
-                    self.notice(format!(
-                        "Задача на агенті {} завершилась помилкою: {error}",
-                        short_peer(peer_id)
-                    ));
+                    self.peers
+                        .entry((*peer_id).into())
+                        .or_default()
+                        .last_message = format!("Фонове з'єднання: {error}");
                 }
             }
             _ => {}
@@ -1123,6 +1200,18 @@ impl DebuggerApp {
                 {
                     self.run_smart_matrix();
                 }
+                if ui
+                    .add_enabled(
+                        self.agent.is_some(),
+                        egui::Button::new("🧩 Розподілена Matrix 768×768"),
+                    )
+                    .on_hover_text(
+                        "Розбити задачу на 8 частин, роздати доступним Agent і зібрати спільний результат",
+                    )
+                    .clicked()
+                {
+                    self.run_distributed_matrix();
+                }
                 let contribution_label = if contribution_paused {
                     "▶ Дозволити ресурси цього ПК"
                 } else {
@@ -1166,7 +1255,7 @@ impl DebuggerApp {
             .num_columns(5)
             .show(ui, |ui| {
                 ui.strong("Вибір");
-                ui.strong("Peer ID");
+                ui.strong("Ім'я / Peer ID");
                 ui.strong("Стан");
                 ui.strong("Версія");
                 ui.strong("Остання перевірка");
@@ -1174,7 +1263,7 @@ impl DebuggerApp {
 
                 for (peer_id, peer) in &self.peers {
                     ui.radio_value(&mut self.selected_peer, Some(peer_id.clone()), "");
-                    ui.label(short_peer(peer_id)).on_hover_text(peer_id);
+                    ui.label(peer_label(peer_id, peer)).on_hover_text(peer_id);
                     ui.label(RichText::new(peer.state.label()).color(peer.state.color()));
                     ui.label(peer.version.as_deref().unwrap_or("невідомо"));
                     ui.label(&peer.last_message);
@@ -1248,7 +1337,7 @@ impl DebuggerApp {
                     ui.end_row();
 
                     for (peer_id, peer) in &self.peers {
-                        ui.label(short_peer(peer_id)).on_hover_text(peer_id);
+                        ui.label(peer_label(peer_id, peer)).on_hover_text(peer_id);
                         if let Some(resources) = &peer.resources {
                             ui.label(short_cpu(&resources.cpu_brand))
                                 .on_hover_text(format!(
@@ -1426,14 +1515,19 @@ impl DebuggerApp {
                                 ui.label(RichText::new(state).color(color).strong())
                                     .on_hover_text(&task.id);
                                 ui.label(&task.description).on_hover_text(&task.id);
-                                let executor = if task.direction == "scheduler" {
+                                let executor = if task.direction == "orchestrator" {
+                                    "рій (координатор)".into()
+                                } else if task.direction == "scheduler" {
                                     "не призначено".into()
                                 } else if self.local_peer_id.as_deref()
                                     == Some(task.executor_peer.as_str())
                                 {
-                                    "цей ПК".into()
+                                    format!("цей ПК ({})", self.node_name)
                                 } else {
-                                    short_peer(&task.executor_peer)
+                                    self.peers
+                                        .get(&task.executor_peer)
+                                        .map(|peer| peer_label(&task.executor_peer, peer))
+                                        .unwrap_or_else(|| short_peer(&task.executor_peer))
                                 };
                                 ui.label(executor).on_hover_text(&task.executor_peer);
                                 ui.label(task_direction_label(&task.direction));
@@ -1797,6 +1891,35 @@ fn configure_child_process(command: &mut Command) {
 #[cfg(not(windows))]
 fn configure_child_process(_command: &mut Command) {}
 
+#[cfg(windows)]
+fn launch_installer_after_exit(path: &Path) -> Result<()> {
+    let mut command = Command::new("powershell.exe");
+    command
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            "$targetPid = [int]$env:SWAGRI_DEBUGGER_PID; Wait-Process -Id $targetPid -ErrorAction SilentlyContinue; Start-Process -FilePath $env:SWAGRI_INSTALLER_PATH",
+        ])
+        .env("SWAGRI_DEBUGGER_PID", std::process::id().to_string())
+        .env("SWAGRI_INSTALLER_PATH", path);
+    configure_child_process(&mut command);
+    command
+        .spawn()
+        .context("could not start the delayed installer launcher")?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn launch_installer_after_exit(path: &Path) -> Result<()> {
+    Command::new(path)
+        .spawn()
+        .context("could not start the installer")?;
+    Ok(())
+}
+
 fn sibling_agent_path() -> PathBuf {
     let name = if cfg!(windows) {
         "swagri-agent.exe"
@@ -1865,6 +1988,14 @@ fn short_peer(peer: &str) -> String {
     }
 }
 
+fn peer_label(peer_id: &str, peer: &PeerView) -> String {
+    peer.node_name
+        .as_deref()
+        .filter(|name| !name.is_empty())
+        .map(|name| format!("{name} ({})", short_peer(peer_id)))
+        .unwrap_or_else(|| short_peer(peer_id))
+}
+
 fn short_cpu(cpu: &str) -> String {
     let shortened = cpu.chars().take(30).collect::<String>();
     if shortened.chars().count() < cpu.chars().count() {
@@ -1888,6 +2019,7 @@ fn task_direction_label(direction: &str) -> &'static str {
         "local" => "локальна",
         "inbound" => "отримана з рою",
         "outbound" => "відправлена в рій",
+        "orchestrator" => "розподілена роєм",
         "scheduler" => "scheduler",
         _ => "невідомо",
     }
@@ -1975,7 +2107,7 @@ fn record_task_finished<'a>(
         task.state = state;
         task.duration_ms = Some(duration_ms);
         task.result = Some(result.into());
-        if !executor_peer.is_empty() {
+        if !executor_peer.is_empty() && task.direction != "orchestrator" {
             task.executor_peer = executor_peer.into();
         }
         return &tasks[position];
@@ -2006,6 +2138,20 @@ fn record_task_finished<'a>(
         MAX_TASK_HISTORY,
     );
     tasks.back().expect("task was just appended")
+}
+
+fn record_task_progress<'a>(
+    tasks: &'a mut VecDeque<TaskView>,
+    id: &str,
+    completed: u16,
+    total: u16,
+    details: &str,
+) -> Option<&'a TaskView> {
+    let position = tasks
+        .iter()
+        .rposition(|task| task.id == id && task.state == TaskState::Running)?;
+    tasks[position].result = Some(format!("{completed}/{total} · {details}"));
+    Some(&tasks[position])
 }
 
 fn format_gib(bytes: u64) -> String {
@@ -2151,6 +2297,34 @@ mod tests {
             tasks[0].result.as_deref(),
             Some("matrix 320x320, checksum 42")
         );
+    }
+
+    #[test]
+    fn distributed_task_keeps_coordinator_and_progress() {
+        let mut tasks = VecDeque::new();
+        record_task_started(
+            &mut tasks,
+            "distributed-1",
+            "Distributed Matrix 768x768 (8 chunks)",
+            "swarm",
+            "orchestrator",
+        );
+        record_task_progress(&mut tasks, "distributed-1", 3, 8, "matrix chunks completed");
+        assert_eq!(
+            tasks[0].result.as_deref(),
+            Some("3/8 · matrix chunks completed")
+        );
+
+        record_task_finished(
+            &mut tasks,
+            "distributed-1",
+            "local-peer",
+            750,
+            "distributed matrix 768x768, 8 chunks, checksum 42",
+            TaskState::Completed,
+        );
+        assert_eq!(tasks[0].executor_peer, "swarm");
+        assert_eq!(tasks[0].direction, "orchestrator");
     }
 
     #[test]

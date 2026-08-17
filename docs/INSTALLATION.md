@@ -72,12 +72,14 @@ These percentages currently control what the Agent advertises as available to
 future scheduling. They are not yet hard operating-system quotas. Swagri sends
 no process list, filenames, or user-activity details in the snapshot.
 
-Version 0.9 provides **Smart CPU test** and **Smart Matrix task** in Debugger.
+Version 0.10 provides **Smart CPU test**, **Smart Matrix task**, and the first
+**Distributed Matrix 768×768** task in Debugger.
 The equivalent console commands are:
 
 ```text
 auto-benchmark 1000000
 auto-matrix 320
+distributed-matrix 768 96
 ```
 
 The Agent compares its current effective CPU score with resource observations
@@ -85,14 +87,16 @@ received from connected peers. It executes locally unless the strongest fresh,
 compatible peer is at least 20% better, which provides a simple allowance for
 network and coordination overhead. Debugger shows the chosen device, both
 scores, the required threshold, completion time, and the matrix checksum.
-Ordinary tasks are not yet automatically queued, divided, migrated, retried,
-or cancelled.
+The distributed command creates eight 96-row chunks, gives at most one chunk at
+a time to each eligible Agent, reuses a worker when it finishes, and XOR-folds
+the partial checksums into one deterministic result. Ordinary tasks are not yet
+automatically divided, migrated, retried, or cancelled.
 
 ### Force a smart task onto the other computer
 
-This is the recommended two-Debugger test for version 0.9:
+This is the recommended two-Debugger placement test for version 0.10:
 
-1. Start version 0.9 on both computers and wait until each lists the other as
+1. Start version 0.10 on both computers and wait until each lists the other as
    connected with resource data.
 2. On computer A, click **Block resources of this PC**. Its local effective
    strength becomes zero and the status says that contribution is paused.
@@ -107,9 +111,22 @@ compute tasks*. It does not reserve CPU in Windows, stop other applications, or
 interrupt a task already running. If no compatible remote Agent is available,
 the smart task fails visibly instead of silently running on the paused PC.
 
+### Test a task split across the swarm
+
+1. Allow Swagri resources on both computers and refresh resources/versions.
+2. On either Debugger click **Distributed Matrix 768×768**.
+3. In **Swarm tasks**, watch the parent job progress from `0/8` to `8/8` and
+   inspect the child rows to see exactly which named computer executed each
+   chunk.
+4. Block local Swagri resources and run it again. Every new child chunk should
+   show the other computer as executor; Windows and non-Swagri programs remain
+   unaffected.
+
+Both Agents must be version 0.10 because matrix chunks use protocol version 4.
+
 ## Task activity and history
 
-Version 0.9 provides a persistent-on-screen **Swarm tasks** panel. It lists work
+Version 0.10 provides a persistent-on-screen **Swarm tasks** panel. It lists work
 initiated on this Debugger, work executed locally, and work received from
 another Agent. Each row shows the lifecycle state, task description, executor,
 direction, live elapsed time or final duration, and the typed result/error.
@@ -122,7 +139,9 @@ Debugger and adds no swarm traffic. If Debugger closes while a task is running,
 that row is marked as interrupted on the next start. **Clear completed** removes
 finished rows from both the panel and SQLite. Swagri still does not claim a
 percentage for workloads that expose no progress units; filtering,
-cancellation, and streamed percentage progress are later scheduler steps.
+cancellation and general-workload progress are later scheduler steps. The
+distributed matrix is the first exception: its known chunk count provides
+truthful progress without inventing a percentage.
 
 ## Updating Agent and Debugger through the swarm
 
@@ -174,7 +193,7 @@ Debugger, or use the installer fallback on both. Beginning with 0.5, later
 Debugger versions can update each other entirely through P2P. Agent 0.4 can
 still update itself to 0.5 through the existing P2P mechanism.
 
-Once Debugger 0.5 or newer is installed, version 0.9 can be distributed as a
+Once Debugger 0.5 or newer is installed, version 0.10 can be distributed as a
 complete Debugger-to-Debugger P2P upgrade test.
 
 ## Build packages locally
