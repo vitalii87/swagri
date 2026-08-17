@@ -2459,6 +2459,28 @@ struct MatrixDispatch {
     worker: MatrixWorker,
 }
 
+fn take_matrix_dispatches(job: &mut DistributedMatrixJob) -> Vec<MatrixDispatch> {
+    let mut dispatches = Vec::new();
+    while let Some(worker) = job.available_workers.pop_front() {
+        let Some(chunk) = job.pending.pop_front() else {
+            job.available_workers.push_front(worker);
+            break;
+        };
+        job.in_flight += 1;
+        dispatches.push(MatrixDispatch {
+            job_id: job.id.clone(),
+            task_id: format!("{}-chunk-{}", job.id, chunk.index + 1),
+            task: Task::MatrixChunk {
+                size: job.size,
+                row_start: chunk.row_start,
+                row_end: chunk.row_end,
+            },
+            worker,
+        });
+    }
+    dispatches
+}
+
 fn dispatch_matrix_jobs(
     matrix_jobs: &mut BTreeMap<String, DistributedMatrixJob>,
     swarm: &mut libp2p::Swarm<Behaviour>,
@@ -2469,21 +2491,7 @@ fn dispatch_matrix_jobs(
 ) {
     let mut dispatches = Vec::new();
     for job in matrix_jobs.values_mut() {
-        while let (Some(worker), Some(chunk)) =
-            (job.available_workers.pop_front(), job.pending.pop_front())
-        {
-            job.in_flight += 1;
-            dispatches.push(MatrixDispatch {
-                job_id: job.id.clone(),
-                task_id: format!("{}-chunk-{}", job.id, chunk.index + 1),
-                task: Task::MatrixChunk {
-                    size: job.size,
-                    row_start: chunk.row_start,
-                    row_end: chunk.row_end,
-                },
-                worker,
-            });
-        }
+        dispatches.extend(take_matrix_dispatches(job));
     }
 
     for dispatch in dispatches {
@@ -2841,6 +2849,42 @@ mod tests {
             }),
             "Matrix 768x768, rows 96..192"
         );
+    }
+
+    #[test]
+    fn matrix_queue_keeps_every_chunk_while_one_worker_is_busy() {
+        let mut job = DistributedMatrixJob {
+            id: "distributed-test".into(),
+            size: 768,
+            total_chunks: 8,
+            completed_chunks: 0,
+            checksum: 0,
+            started_at: Instant::now(),
+            pending: (0..8)
+                .map(|index| MatrixChunkPlan {
+                    index,
+                    row_start: index * 96,
+                    row_end: (index + 1) * 96,
+                })
+                .collect(),
+            available_workers: VecDeque::from([MatrixWorker::Local]),
+            in_flight: 0,
+        };
+
+        for expected in 1..=8 {
+            let dispatches = take_matrix_dispatches(&mut job);
+            assert_eq!(dispatches.len(), 1);
+            assert_eq!(
+                dispatches[0].task_id,
+                format!("distributed-test-chunk-{expected}")
+            );
+            assert_eq!(job.pending.len(), 8 - expected);
+            job.in_flight -= 1;
+            job.available_workers.push_back(dispatches[0].worker);
+        }
+
+        assert!(job.pending.is_empty());
+        assert_eq!(job.available_workers, VecDeque::from([MatrixWorker::Local]));
     }
 
     #[tokio::test]

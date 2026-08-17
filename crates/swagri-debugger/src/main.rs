@@ -452,8 +452,22 @@ impl DebuggerApp {
     fn stop_agent(&mut self) {
         if let Some(mut agent) = self.agent.take() {
             let _ = agent.send("quit");
-            self.notice("Агент зупинено.");
+            let interrupted = self.interrupt_active_tasks(
+                "Agent зупинено до завершення задачі; обчислення перервано",
+            );
+            self.notice(format!(
+                "Агент зупинено. Перерваних активних задач: {interrupted}."
+            ));
         }
+    }
+
+    fn interrupt_active_tasks(&mut self, reason: &str) -> usize {
+        let interrupted = interrupt_running_tasks(&mut self.tasks, reason);
+        let count = interrupted.len();
+        for task in interrupted {
+            self.persist_task(&task);
+        }
+        count
     }
 
     fn send(&mut self, command: impl Into<String>) {
@@ -722,7 +736,12 @@ impl DebuggerApp {
             .and_then(|agent| agent.child.try_wait().ok().flatten());
         if let Some(status) = exit {
             self.agent = None;
-            self.notice(format!("Агент завершив роботу: {status}."));
+            let interrupted = self.interrupt_active_tasks(
+                "Agent завершив роботу до завершення задачі; обчислення перервано",
+            );
+            self.notice(format!(
+                "Агент завершив роботу: {status}. Перерваних активних задач: {interrupted}."
+            ));
         }
 
         if let Some((peer, version, path)) = self.ready_update.take() {
@@ -2154,6 +2173,20 @@ fn record_task_progress<'a>(
     Some(&tasks[position])
 }
 
+fn interrupt_running_tasks(tasks: &mut VecDeque<TaskView>, reason: &str) -> Vec<TaskView> {
+    let mut interrupted = Vec::new();
+    for task in tasks
+        .iter_mut()
+        .filter(|task| task.state == TaskState::Running)
+    {
+        task.state = TaskState::Failed;
+        task.duration_ms = Some(task.started_at.elapsed().as_millis().min(u64::MAX as u128) as u64);
+        task.result = Some(reason.into());
+        interrupted.push(task.clone());
+    }
+    interrupted
+}
+
 fn format_gib(bytes: u64) -> String {
     format!("{:.2} GiB", bytes as f64 / 1024.0 / 1024.0 / 1024.0)
 }
@@ -2325,6 +2358,42 @@ mod tests {
         );
         assert_eq!(tasks[0].executor_peer, "swarm");
         assert_eq!(tasks[0].direction, "orchestrator");
+    }
+
+    #[test]
+    fn stopping_agent_interrupts_running_tasks_and_preserves_finished_tasks() {
+        let mut tasks = VecDeque::new();
+        record_task_started(
+            &mut tasks,
+            "running-task",
+            "Distributed Matrix 768x768 (8 chunks)",
+            "swarm",
+            "orchestrator",
+        );
+        record_task_started(
+            &mut tasks,
+            "finished-task",
+            "Matrix 192x192",
+            "peer-beta",
+            "outbound",
+        );
+        record_task_finished(
+            &mut tasks,
+            "finished-task",
+            "peer-beta",
+            12,
+            "checksum 42",
+            TaskState::Completed,
+        );
+
+        let interrupted = interrupt_running_tasks(&mut tasks, "Agent stopped");
+
+        assert_eq!(interrupted.len(), 1);
+        assert_eq!(tasks[0].state, TaskState::Failed);
+        assert_eq!(tasks[0].result.as_deref(), Some("Agent stopped"));
+        assert!(tasks[0].duration_ms.is_some());
+        assert_eq!(tasks[1].state, TaskState::Completed);
+        assert_eq!(tasks[1].result.as_deref(), Some("checksum 42"));
     }
 
     #[test]

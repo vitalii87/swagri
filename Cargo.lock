@@ -4674,7 +4674,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "swagri-agent"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -4695,7 +4695,7 @@ dependencies = [
 
 [[package]]
 name = "swagri-core"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "serde",
  "serde_bytes",
@@ -4704,7 +4704,7 @@ dependencies = [
 
 [[package]]
 name = "swagri-debugger"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "anyhow",
  "eframe",
@@ -4720,7 +4720,7 @@ dependencies = [
 
 [[package]]
 name = "swagri-executor"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "hex",
  "sha2",
@@ -4729,7 +4729,7 @@ dependencies = [
 
 [[package]]
 name = "swagri-updater"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "anyhow",
  "clap",

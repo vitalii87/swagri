@@ -124,6 +124,12 @@ the smart task fails visibly instead of silently running on the paused PC.
 
 Both Agents must be version 0.10 because matrix chunks use protocol version 4.
 
+Version 0.10.1 fixes the initial 0.10.0 test build losing queued chunks while
+all workers were busy. It also marks every active Debugger task as interrupted
+immediately when its managed Agent stops, so elapsed timers cannot continue for
+work that is no longer running. Use 0.10.1 or newer for distributed-matrix
+testing.
+
 ## Task activity and history
 
 Version 0.10 provides a persistent-on-screen **Swarm tasks** panel. It lists work
