@@ -2550,10 +2550,10 @@ fn complete_matrix_chunk(
                 },
         } => Some((*checksum, *size)),
         TaskOutcome::Success { .. } => None,
-        TaskOutcome::Failure { error } => {
+        TaskOutcome::Failure { message, .. } => {
             fail_matrix_job(
                 job_id,
-                &format!("chunk failed: {}", error.message),
+                &format!("chunk failed: {message}"),
                 local_peer_id,
                 matrix_jobs,
             );
