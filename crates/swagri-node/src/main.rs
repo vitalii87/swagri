@@ -1071,6 +1071,7 @@ fn handle_swarm_event(
     shutdown
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_request_response(
     event: request_response::Event<TaskRequest, TaskResponse>,
     completed_tx: &mpsc::UnboundedSender<CompletedResponse>,
