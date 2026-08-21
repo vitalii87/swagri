@@ -100,15 +100,19 @@ distributed matrix command
   -> build a bounded row-chunk queue
   -> select fresh protocol-compatible local/remote workers
   -> keep at most one chunk in flight per worker
+  -> requeue a failed remote chunk onto another healthy worker, up to 3 attempts
   -> report completed chunks as truthful progress
   -> XOR the order-independent partial checksums
   -> finish one parent swarm task
 ```
 
-This remains deliberately workload-specific. It proves concurrent assignment
-and aggregation without pretending that arbitrary programs are safely
-divisible. Disconnect retry, reassignment, cancellation, and a general task
-graph remain future work. Other running tasks show elapsed wall time rather
+This remains deliberately workload-specific. It proves concurrent assignment,
+aggregation, and bounded reassignment without pretending that arbitrary programs
+are safely divisible. Version 0.11 removes a worker from the current job after
+its remote request fails, gives the exact chunk to another already-selected
+healthy worker, and fails explicitly when no replacement remains or three
+attempts are exhausted. General-workload retry, cancellation, and a task graph
+remain future work. Other running tasks show elapsed wall time rather
 than an invented percentage. The database is Debugger-local and stores task
 metadata/results only; resource measurement persistence remains a later step.
 

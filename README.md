@@ -47,9 +47,12 @@ and the owner's contribution limits. Version 0.10 adds the first genuinely
 divisible workload: a deterministic matrix can be queued as bounded row chunks,
 executed concurrently by the available local and remote Agents, and aggregated
 into one result with truthful chunk progress. Debugger retains both the parent
-job and every executor-visible chunk in its bounded SQLite task history. Swagri
-does **not** yet split, migrate, retry, or cancel general workloads, and it does
-not execute shell commands, downloaded binaries, or arbitrary remote code.
+job and every executor-visible chunk in its bounded SQLite task history. Version
+0.11 requeues a failed remote matrix chunk and reassigns it to another healthy
+worker, while bounding retries and failing explicitly if no worker remains.
+Swagri does **not** yet split, migrate, retry, or cancel general workloads, and
+it does not execute shell commands, downloaded binaries, or arbitrary remote
+code.
 
 ## Technology
 
@@ -64,6 +67,7 @@ not execute shell commands, downloaded binaries, or arbitrary remote code.
 - cached CPU calibration plus low-frequency CPU/RAM resource snapshots
 - local-first placement for bounded CPU benchmark and matrix workloads
 - bounded multi-Agent matrix chunk scheduling, progress, and result aggregation
+- bounded retry and healthy-worker reassignment for failed remote matrix chunks
 - runtime pause/resume of a device's Swagri contribution
 - durable local SQLite lifecycle and result history for swarm tasks
 - native Rust desktop Debugger with live logs, resource comparison, and controls

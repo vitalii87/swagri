@@ -56,7 +56,8 @@ well-characterized workload without regressing unsuitable workloads.
 - [x] bounded independent chunks for the first matrix workload;
 - [x] deterministic matrix result aggregation;
 - content-addressed inputs and cached artifacts;
-- retry and reassignment after disconnects;
+- [x] bounded retry and reassignment of matrix chunks after request failures;
+- retry and reassignment after disconnects for general workloads;
 - redundant execution for critical results;
 - [x] local control-stream progress for matrix chunks;
 - network streaming progress and partial results for general workloads;

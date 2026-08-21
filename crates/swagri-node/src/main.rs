@@ -40,6 +40,7 @@ use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 const REMOTE_RESOURCE_MAX_AGE: Duration = Duration::from_secs(20);
+const MAX_MATRIX_CHUNK_ATTEMPTS: u8 = 3;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -185,12 +186,15 @@ struct OutboundTaskMeta {
     tracked: bool,
     matrix_job: Option<String>,
     matrix_worker: Option<MatrixWorker>,
+    matrix_chunk: Option<MatrixChunkPlan>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct MatrixChunkPlan {
     index: u16,
     row_start: u16,
     row_end: u16,
+    attempts: u8,
 }
 
 struct DistributedMatrixJob {
@@ -607,6 +611,7 @@ async fn main() -> Result<()> {
                     complete_matrix_chunk(
                         &job_id,
                         worker,
+                        None,
                         &completed.response,
                         local_peer_id,
                         &mut matrix_jobs,
@@ -1199,10 +1204,20 @@ fn handle_request_response(
             if !is_node_info {
                 report_task_response(peer, &response);
                 if let Some(outbound) = outbound
-                    && let (Some(job_id), Some(worker)) =
-                        (outbound.matrix_job, outbound.matrix_worker)
+                    && let (Some(job_id), Some(worker), Some(chunk)) = (
+                        outbound.matrix_job,
+                        outbound.matrix_worker,
+                        outbound.matrix_chunk,
+                    )
                 {
-                    complete_matrix_chunk(&job_id, worker, &response, local_peer_id, matrix_jobs);
+                    complete_matrix_chunk(
+                        &job_id,
+                        worker,
+                        Some(chunk),
+                        &response,
+                        local_peer_id,
+                        matrix_jobs,
+                    );
                 }
             }
         }
@@ -1222,10 +1237,12 @@ fn handle_request_response(
                 } else {
                     emit_event("PEER_POLL_FAILED", &[&peer.to_string(), &error.to_string()]);
                 }
-                if let Some(job_id) = outbound.matrix_job {
-                    fail_matrix_job(
+                if let (Some(job_id), Some(chunk)) = (outbound.matrix_job, outbound.matrix_chunk) {
+                    retry_matrix_chunk(
                         &job_id,
-                        &format!("chunk connection failed: {error}"),
+                        MatrixWorker::Remote(peer),
+                        chunk,
+                        &format!("connection to {peer} failed: {error}"),
                         local_peer_id,
                         matrix_jobs,
                     );
@@ -2180,6 +2197,7 @@ fn submit_task(
             tracked,
             matrix_job: None,
             matrix_worker: None,
+            matrix_chunk: None,
         },
     );
     if tracked {
@@ -2420,6 +2438,7 @@ fn start_distributed_matrix(
                 index,
                 row_start,
                 row_end: (row_start + chunk_rows).min(size),
+                attempts: 0,
             }
         })
         .collect::<VecDeque<_>>();
@@ -2457,25 +2476,38 @@ struct MatrixDispatch {
     task_id: String,
     task: Task,
     worker: MatrixWorker,
+    chunk: MatrixChunkPlan,
 }
 
 fn take_matrix_dispatches(job: &mut DistributedMatrixJob) -> Vec<MatrixDispatch> {
     let mut dispatches = Vec::new();
     while let Some(worker) = job.available_workers.pop_front() {
-        let Some(chunk) = job.pending.pop_front() else {
+        let Some(mut chunk) = job.pending.pop_front() else {
             job.available_workers.push_front(worker);
             break;
         };
+        chunk.attempts += 1;
         job.in_flight += 1;
+        let task_id = if chunk.attempts == 1 {
+            format!("{}-chunk-{}", job.id, chunk.index + 1)
+        } else {
+            format!(
+                "{}-chunk-{}-retry-{}",
+                job.id,
+                chunk.index + 1,
+                chunk.attempts
+            )
+        };
         dispatches.push(MatrixDispatch {
             job_id: job.id.clone(),
-            task_id: format!("{}-chunk-{}", job.id, chunk.index + 1),
+            task_id,
             task: Task::MatrixChunk {
                 size: job.size,
                 row_start: chunk.row_start,
                 row_end: chunk.row_end,
             },
             worker,
+            chunk,
         });
     }
     dispatches
@@ -2534,6 +2566,7 @@ fn dispatch_matrix_jobs(
                         tracked: true,
                         matrix_job: Some(dispatch.job_id),
                         matrix_worker: Some(MatrixWorker::Remote(peer)),
+                        matrix_chunk: Some(dispatch.chunk),
                     },
                 );
             }
@@ -2544,6 +2577,7 @@ fn dispatch_matrix_jobs(
 fn complete_matrix_chunk(
     job_id: &str,
     worker: MatrixWorker,
+    chunk: Option<MatrixChunkPlan>,
     response: &TaskResponse,
     local_peer_id: PeerId,
     matrix_jobs: &mut BTreeMap<String, DistributedMatrixJob>,
@@ -2554,14 +2588,16 @@ fn complete_matrix_chunk(
                 TaskResult::MatrixChunk {
                     checksum,
                     size,
-                    row_start: _,
-                    row_end: _,
+                    row_start,
+                    row_end,
                 },
-        } => Some((*checksum, *size)),
+        } => Some((*checksum, *size, *row_start, *row_end)),
         TaskOutcome::Success { .. } => None,
         TaskOutcome::Failure { message, .. } => {
-            fail_matrix_job(
+            fail_or_retry_matrix_chunk(
                 job_id,
+                worker,
+                chunk,
                 &format!("chunk failed: {message}"),
                 local_peer_id,
                 matrix_jobs,
@@ -2569,9 +2605,11 @@ fn complete_matrix_chunk(
             return;
         }
     };
-    let Some((checksum, result_size)) = result else {
-        fail_matrix_job(
+    let Some((checksum, result_size, result_row_start, result_row_end)) = result else {
+        fail_or_retry_matrix_chunk(
             job_id,
+            worker,
+            chunk,
             "worker returned an unexpected result type",
             local_peer_id,
             matrix_jobs,
@@ -2582,9 +2620,24 @@ fn complete_matrix_chunk(
     let mut finished = None;
     if let Some(job) = matrix_jobs.get_mut(job_id) {
         if result_size != job.size {
-            fail_matrix_job(
+            fail_or_retry_matrix_chunk(
                 job_id,
+                worker,
+                chunk,
                 "worker returned a result for a different matrix size",
+                local_peer_id,
+                matrix_jobs,
+            );
+            return;
+        }
+        if let Some(expected) = chunk
+            && (result_row_start != expected.row_start || result_row_end != expected.row_end)
+        {
+            fail_or_retry_matrix_chunk(
+                job_id,
+                worker,
+                Some(expected),
+                "worker returned a result for different matrix rows",
                 local_peer_id,
                 matrix_jobs,
             );
@@ -2626,6 +2679,80 @@ fn complete_matrix_chunk(
             },
         );
         report_task_response(local_peer_id, &response);
+    }
+}
+
+fn fail_or_retry_matrix_chunk(
+    job_id: &str,
+    worker: MatrixWorker,
+    chunk: Option<MatrixChunkPlan>,
+    message: &str,
+    local_peer_id: PeerId,
+    matrix_jobs: &mut BTreeMap<String, DistributedMatrixJob>,
+) {
+    if let (MatrixWorker::Remote(_), Some(chunk)) = (worker, chunk) {
+        retry_matrix_chunk(job_id, worker, chunk, message, local_peer_id, matrix_jobs);
+    } else {
+        fail_matrix_job(job_id, message, local_peer_id, matrix_jobs);
+    }
+}
+
+fn retry_matrix_chunk(
+    job_id: &str,
+    failed_worker: MatrixWorker,
+    chunk: MatrixChunkPlan,
+    message: &str,
+    local_peer_id: PeerId,
+    matrix_jobs: &mut BTreeMap<String, DistributedMatrixJob>,
+) {
+    let mut terminal_failure = None;
+    if let Some(job) = matrix_jobs.get_mut(job_id) {
+        job.in_flight = job.in_flight.saturating_sub(1);
+        job.available_workers
+            .retain(|worker| *worker != failed_worker);
+
+        if chunk.attempts >= MAX_MATRIX_CHUNK_ATTEMPTS {
+            terminal_failure = Some(format!(
+                "chunk {} failed after {} attempts: {message}",
+                chunk.index + 1,
+                chunk.attempts
+            ));
+        } else {
+            let next_attempt = chunk.attempts + 1;
+            job.pending.push_front(chunk);
+            emit_event(
+                "MATRIX_RETRY",
+                &[
+                    &job.id,
+                    &(chunk.index + 1).to_string(),
+                    &next_attempt.to_string(),
+                    &MAX_MATRIX_CHUNK_ATTEMPTS.to_string(),
+                    message,
+                ],
+            );
+            emit_event(
+                "TASK_PROGRESS",
+                &[
+                    &job.id,
+                    &job.completed_chunks.to_string(),
+                    &job.total_chunks.to_string(),
+                    &format!(
+                        "chunk {} queued for retry {next_attempt}/{MAX_MATRIX_CHUNK_ATTEMPTS}: {message}",
+                        chunk.index + 1
+                    ),
+                ],
+            );
+            if job.available_workers.is_empty() && job.in_flight == 0 {
+                terminal_failure = Some(format!(
+                    "chunk {} could not be reassigned because no healthy worker remains: {message}",
+                    chunk.index + 1
+                ));
+            }
+        }
+    }
+
+    if let Some(message) = terminal_failure {
+        fail_matrix_job(job_id, &message, local_peer_id, matrix_jobs);
     }
 }
 
@@ -2865,6 +2992,7 @@ mod tests {
                     index,
                     row_start: index * 96,
                     row_end: (index + 1) * 96,
+                    attempts: 0,
                 })
                 .collect(),
             available_workers: VecDeque::from([MatrixWorker::Local]),
@@ -2885,6 +3013,89 @@ mod tests {
 
         assert!(job.pending.is_empty());
         assert_eq!(job.available_workers, VecDeque::from([MatrixWorker::Local]));
+    }
+
+    #[test]
+    fn failed_remote_matrix_chunk_is_reassigned_to_a_healthy_worker() {
+        let local_peer_id = PeerId::from(identity::Keypair::generate_ed25519().public());
+        let failed_worker =
+            MatrixWorker::Remote(PeerId::from(identity::Keypair::generate_ed25519().public()));
+        let chunk = MatrixChunkPlan {
+            index: 2,
+            row_start: 192,
+            row_end: 288,
+            attempts: 1,
+        };
+        let mut jobs = BTreeMap::from([(
+            "distributed-retry".into(),
+            DistributedMatrixJob {
+                id: "distributed-retry".into(),
+                size: 768,
+                total_chunks: 8,
+                completed_chunks: 1,
+                checksum: 42,
+                started_at: Instant::now(),
+                pending: VecDeque::new(),
+                available_workers: VecDeque::from([MatrixWorker::Local]),
+                in_flight: 1,
+            },
+        )]);
+
+        retry_matrix_chunk(
+            "distributed-retry",
+            failed_worker,
+            chunk,
+            "test disconnect",
+            local_peer_id,
+            &mut jobs,
+        );
+
+        let job = jobs.get_mut("distributed-retry").unwrap();
+        assert_eq!(job.in_flight, 0);
+        assert_eq!(job.pending, VecDeque::from([chunk]));
+        let dispatches = take_matrix_dispatches(job);
+        assert_eq!(dispatches.len(), 1);
+        assert_eq!(dispatches[0].worker, MatrixWorker::Local);
+        assert_eq!(dispatches[0].chunk.attempts, 2);
+        assert_eq!(dispatches[0].task_id, "distributed-retry-chunk-3-retry-2");
+    }
+
+    #[test]
+    fn matrix_job_fails_instead_of_hanging_without_a_healthy_worker() {
+        let local_peer_id = PeerId::from(identity::Keypair::generate_ed25519().public());
+        let failed_worker =
+            MatrixWorker::Remote(PeerId::from(identity::Keypair::generate_ed25519().public()));
+        let chunk = MatrixChunkPlan {
+            index: 0,
+            row_start: 0,
+            row_end: 96,
+            attempts: 1,
+        };
+        let mut jobs = BTreeMap::from([(
+            "distributed-no-worker".into(),
+            DistributedMatrixJob {
+                id: "distributed-no-worker".into(),
+                size: 768,
+                total_chunks: 8,
+                completed_chunks: 0,
+                checksum: 0,
+                started_at: Instant::now(),
+                pending: VecDeque::new(),
+                available_workers: VecDeque::new(),
+                in_flight: 1,
+            },
+        )]);
+
+        retry_matrix_chunk(
+            "distributed-no-worker",
+            failed_worker,
+            chunk,
+            "test disconnect",
+            local_peer_id,
+            &mut jobs,
+        );
+
+        assert!(jobs.is_empty());
     }
 
     #[tokio::test]

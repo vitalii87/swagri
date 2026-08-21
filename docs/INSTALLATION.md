@@ -122,13 +122,23 @@ the smart task fails visibly instead of silently running on the paused PC.
    show the other computer as executor; Windows and non-Swagri programs remain
    unaffected.
 
-Both Agents must be version 0.10 because matrix chunks use protocol version 4.
+Both Agents must be version 0.10 or newer because matrix chunks use protocol
+version 4.
 
 Version 0.10.1 fixes the initial 0.10.0 test build losing queued chunks while
 all workers were busy. It also marks every active Debugger task as interrupted
 immediately when its managed Agent stops, so elapsed timers cannot continue for
 work that is no longer running. Use 0.10.1 or newer for distributed-matrix
 testing.
+
+Version 0.11 adds bounded recovery for remote matrix chunks. If a remote request
+fails or a remote Agent rejects the chunk, the failed attempt remains visible in
+the task history and the coordinator queues a new attempt on another healthy
+worker. The parent task keeps its completed-chunk count, performs at most three
+attempts per chunk, and fails explicitly instead of hanging when no healthy
+replacement remains. To test reassignment, use at least three Agents (or leave
+the coordinator's local resources enabled), start a distributed matrix, and
+stop one remote Agent while it owns a chunk.
 
 ## Task activity and history
 
@@ -199,7 +209,7 @@ Debugger, or use the installer fallback on both. Beginning with 0.5, later
 Debugger versions can update each other entirely through P2P. Agent 0.4 can
 still update itself to 0.5 through the existing P2P mechanism.
 
-Once Debugger 0.5 or newer is installed, version 0.10 can be distributed as a
+Once Debugger 0.5 or newer is installed, version 0.11 can be distributed as a
 complete Debugger-to-Debugger P2P upgrade test.
 
 ## Build packages locally
