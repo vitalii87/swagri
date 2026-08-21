@@ -57,6 +57,7 @@ well-characterized workload without regressing unsuitable workloads.
 - [x] deterministic matrix result aggregation;
 - content-addressed inputs and cached artifacts;
 - [x] bounded retry and reassignment of matrix chunks after request failures;
+- [x] controlled one-shot matrix failure/delay injection for recovery tests;
 - retry and reassignment after disconnects for general workloads;
 - redundant execution for critical results;
 - [x] local control-stream progress for matrix chunks;

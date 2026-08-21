@@ -8,7 +8,7 @@ use std::{
     str::FromStr,
     sync::{
         Arc,
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -263,6 +263,28 @@ struct ResourceMonitor {
     ewma_agent_cpu: Option<f32>,
 }
 
+#[derive(Default)]
+struct DebugFaults {
+    fail_next_matrix_chunk: AtomicBool,
+    delay_next_matrix_chunk_ms: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DebugMatrixFault {
+    fail: bool,
+    delay_ms: u64,
+}
+
+fn take_debug_matrix_fault(task: &Task, faults: &DebugFaults) -> DebugMatrixFault {
+    if !matches!(task, Task::MatrixChunk { .. }) {
+        return DebugMatrixFault::default();
+    }
+    DebugMatrixFault {
+        fail: faults.fail_next_matrix_chunk.swap(false, Ordering::AcqRel),
+        delay_ms: faults.delay_next_matrix_chunk_ms.swap(0, Ordering::AcqRel),
+    }
+}
+
 impl ResourceMonitor {
     fn new(
         calibration_path: &Path,
@@ -502,6 +524,7 @@ async fn main() -> Result<()> {
     let mut matrix_jobs = BTreeMap::<String, DistributedMatrixJob>::new();
     let request_counter = AtomicU64::new(1);
     let active_tasks = Arc::new(AtomicU32::new(0));
+    let debug_faults = Arc::new(DebugFaults::default());
     let mut resources = ResourceMonitor::new(
         &calibration_path,
         args.max_cpu_percent,
@@ -545,6 +568,7 @@ async fn main() -> Result<()> {
                             &peer_resources,
                             &local_completed_tx,
                             &active_tasks,
+                            &debug_faults,
                             &mut outbound_tasks,
                             &mut matrix_jobs,
                         ) {
@@ -575,6 +599,7 @@ async fn main() -> Result<()> {
                     &restart_arguments,
                     &resources.snapshot,
                     &active_tasks,
+                    &debug_faults,
                     &args.name,
                     &mut outbound_tasks,
                     &mut matrix_jobs,
@@ -968,6 +993,7 @@ fn handle_swarm_event(
     restart_arguments: &[String],
     resources: &ResourceSnapshot,
     active_tasks: &Arc<AtomicU32>,
+    debug_faults: &Arc<DebugFaults>,
     node_name: &str,
     outbound_tasks: &mut HashMap<request_response::OutboundRequestId, OutboundTaskMeta>,
     matrix_jobs: &mut BTreeMap<String, DistributedMatrixJob>,
@@ -1034,6 +1060,7 @@ fn handle_swarm_event(
                 node_name,
                 resources,
                 active_tasks,
+                debug_faults,
                 peer_resources,
                 outbound_tasks,
                 matrix_jobs,
@@ -1084,6 +1111,7 @@ fn handle_request_response(
     node_name: &str,
     resources: &ResourceSnapshot,
     active_tasks: &Arc<AtomicU32>,
+    debug_faults: &Arc<DebugFaults>,
     peer_resources: &mut BTreeMap<PeerId, PeerResourceObservation>,
     outbound_tasks: &mut HashMap<request_response::OutboundRequestId, OutboundTaskMeta>,
     matrix_jobs: &mut BTreeMap<String, DistributedMatrixJob>,
@@ -1136,6 +1164,17 @@ fn handle_request_response(
                 });
                 return;
             }
+            let debug_fault = take_debug_matrix_fault(&request.task, debug_faults);
+            if debug_fault != DebugMatrixFault::default() {
+                emit_event(
+                    "DEBUG_FAULT_CONSUMED",
+                    &[
+                        &request.id,
+                        &debug_fault.fail.to_string(),
+                        &debug_fault.delay_ms.to_string(),
+                    ],
+                );
+            }
             emit_task_started(
                 &request.id,
                 &task_description(&request.task),
@@ -1146,7 +1185,23 @@ fn handle_request_response(
             let active_tasks = active_tasks.clone();
             active_tasks.fetch_add(1, Ordering::Relaxed);
             tokio::task::spawn_blocking(move || {
-                let response = execute(request);
+                let started_at = Instant::now();
+                if debug_fault.delay_ms > 0 {
+                    std::thread::sleep(Duration::from_millis(debug_fault.delay_ms));
+                }
+                let mut response = if debug_fault.fail {
+                    TaskResponse::failure(
+                        request.id,
+                        0,
+                        "debug_injected_failure",
+                        "the worker intentionally failed this matrix chunk for a retry test",
+                    )
+                } else {
+                    execute(request)
+                };
+                if debug_fault.delay_ms > 0 {
+                    response.duration_ms = started_at.elapsed().as_millis() as u64;
+                }
                 active_tasks.fetch_sub(1, Ordering::Relaxed);
                 let _ = completed_tx.send(CompletedResponse {
                     channel,
@@ -1822,6 +1877,7 @@ fn handle_command(
     peer_resources: &BTreeMap<PeerId, PeerResourceObservation>,
     local_completed_tx: &mpsc::UnboundedSender<CompletedLocalTask>,
     active_tasks: &Arc<AtomicU32>,
+    debug_faults: &Arc<DebugFaults>,
     outbound_tasks: &mut HashMap<request_response::OutboundRequestId, OutboundTaskMeta>,
     matrix_jobs: &mut BTreeMap<String, DistributedMatrixJob>,
 ) -> bool {
@@ -1944,6 +2000,39 @@ fn handle_command(
                 &local_peer_id.to_string(),
                 &resources.snapshot,
             );
+        }
+        "debug-fail-next-matrix-chunk" => {
+            debug_faults
+                .fail_next_matrix_chunk
+                .store(true, Ordering::Release);
+            println!("Debug fault armed: the next inbound matrix chunk will fail.");
+            emit_event("DEBUG_FAULT_ARMED", &["fail-next-matrix-chunk", "1"]);
+        }
+        "debug-delay-next-matrix-chunk" => {
+            let delay = parts
+                .next()
+                .context("debug-delay-next-matrix-chunk requires milliseconds")
+                .and_then(|value| {
+                    value
+                        .parse::<u64>()
+                        .context("delay must be an integer number of milliseconds")
+                });
+            match delay {
+                Ok(delay_ms @ 1..=30_000) => {
+                    debug_faults
+                        .delay_next_matrix_chunk_ms
+                        .store(delay_ms, Ordering::Release);
+                    println!(
+                        "Debug delay armed: the next inbound matrix chunk will wait {delay_ms} ms."
+                    );
+                    emit_event(
+                        "DEBUG_FAULT_ARMED",
+                        &["delay-next-matrix-chunk", &delay_ms.to_string()],
+                    );
+                }
+                Ok(_) => println!("Debug delay must be between 1 and 30000 ms."),
+                Err(error) => println!("Invalid debug delay: {error:#}"),
+            }
         }
         "local-resources" => {
             println!("{:#?}", resources.snapshot);
@@ -2835,6 +2924,8 @@ fn print_help() {
          auto-benchmark <iterations>        Place CPU work locally or on a stronger peer\n\
          auto-matrix <size>                 Smart-place deterministic matrix work\n\
          distributed-matrix <size> [rows]   Split matrix work across eligible Agents\n\
+         debug-fail-next-matrix-chunk       Fail the next inbound matrix chunk once\n\
+         debug-delay-next-matrix-chunk <ms> Delay the next inbound matrix chunk once (max 30000)\n\
          quit                              Stop the node"
     );
 }
@@ -2954,6 +3045,50 @@ mod tests {
                 row_end: 8,
             }
         ));
+    }
+
+    #[test]
+    fn debug_matrix_fault_is_one_shot_and_ignores_other_tasks() {
+        let faults = DebugFaults::default();
+        faults.fail_next_matrix_chunk.store(true, Ordering::Release);
+        faults
+            .delay_next_matrix_chunk_ms
+            .store(5_000, Ordering::Release);
+
+        assert_eq!(
+            take_debug_matrix_fault(
+                &Task::Echo {
+                    message: "control".into(),
+                },
+                &faults,
+            ),
+            DebugMatrixFault::default()
+        );
+        assert_eq!(
+            take_debug_matrix_fault(
+                &Task::MatrixChunk {
+                    size: 768,
+                    row_start: 0,
+                    row_end: 96,
+                },
+                &faults,
+            ),
+            DebugMatrixFault {
+                fail: true,
+                delay_ms: 5_000,
+            }
+        );
+        assert_eq!(
+            take_debug_matrix_fault(
+                &Task::MatrixChunk {
+                    size: 768,
+                    row_start: 96,
+                    row_end: 192,
+                },
+                &faults,
+            ),
+            DebugMatrixFault::default()
+        );
     }
 
     #[test]

@@ -140,6 +140,22 @@ replacement remains. To test reassignment, use at least three Agents (or leave
 the coordinator's local resources enabled), start a distributed matrix, and
 stop one remote Agent while it owns a chunk.
 
+Version 0.11.1 makes the same test deterministic with two Debuggers:
+
+1. Start both Agents, allow Swagri resources on both, and refresh resources.
+2. On computer B click **Збій наступного chunk**. This arms only its next
+   inbound matrix chunk and cannot be triggered remotely.
+3. On computer A click **Distributed Matrix 768×768**.
+4. Computer A should retain a failed child attempt from B, queue a row with a
+   `retry-2` task ID on its healthy local worker, and complete the parent at
+   `8/8` with the usual deterministic checksum.
+5. To inspect an in-flight chunk or test a real process stop, arm **Затримати
+   chunk на 5 с** on computer B before starting the matrix on A.
+
+Both diagnostic controls are one-shot. Echo, resource polling, and other task
+types do not consume them. They affect only matrix chunks received from another
+Agent, not work coordinated locally on the same computer.
+
 ## Task activity and history
 
 Version 0.10 provides a persistent-on-screen **Swarm tasks** panel. It lists work
@@ -209,7 +225,7 @@ Debugger, or use the installer fallback on both. Beginning with 0.5, later
 Debugger versions can update each other entirely through P2P. Agent 0.4 can
 still update itself to 0.5 through the existing P2P mechanism.
 
-Once Debugger 0.5 or newer is installed, version 0.11 can be distributed as a
+Once Debugger 0.5 or newer is installed, version 0.11.1 can be distributed as a
 complete Debugger-to-Debugger P2P upgrade test.
 
 ## Build packages locally

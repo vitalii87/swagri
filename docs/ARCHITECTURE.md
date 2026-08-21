@@ -116,6 +116,13 @@ remain future work. Other running tasks show elapsed wall time rather
 than an invented percentage. The database is Debugger-local and stores task
 metadata/results only; resource measurement persistence remains a later step.
 
+Version 0.11.1 exposes two one-shot diagnostics through the local Agent stdin:
+fail or delay the next inbound matrix chunk. They are not network requests and
+cannot be armed by a remote peer. Non-matrix tasks do not consume them, and the
+atomic state resets as soon as one inbound chunk takes it. This makes retry and
+disconnect tests repeatable on two physical devices without weakening task
+authorization.
+
 ## Identity and trust
 
 The MVP persists an Ed25519 keypair and derives a stable PeerId from it. This

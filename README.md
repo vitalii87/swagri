@@ -50,6 +50,8 @@ into one result with truthful chunk progress. Debugger retains both the parent
 job and every executor-visible chunk in its bounded SQLite task history. Version
 0.11 requeues a failed remote matrix chunk and reassigns it to another healthy
 worker, while bounding retries and failing explicitly if no worker remains.
+Version 0.11.1 adds local one-shot fault and delay controls so this recovery can
+be reproduced safely from two Debuggers without changing the wire protocol.
 Swagri does **not** yet split, migrate, retry, or cancel general workloads, and
 it does not execute shell commands, downloaded binaries, or arbitrary remote
 code.
@@ -68,6 +70,7 @@ code.
 - local-first placement for bounded CPU benchmark and matrix workloads
 - bounded multi-Agent matrix chunk scheduling, progress, and result aggregation
 - bounded retry and healthy-worker reassignment for failed remote matrix chunks
+- local one-shot failure and delay injection for reproducible recovery tests
 - runtime pause/resume of a device's Swagri contribution
 - durable local SQLite lifecycle and result history for swarm tasks
 - native Rust desktop Debugger with live logs, resource comparison, and controls

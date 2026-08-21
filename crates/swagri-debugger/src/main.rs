@@ -537,6 +537,20 @@ impl DebuggerApp {
         self.send("distributed-matrix 768 96");
     }
 
+    fn fail_next_inbound_matrix_chunk(&mut self) {
+        self.send("debug-fail-next-matrix-chunk");
+        self.notice(
+            "Тест відмови активовано: наступний matrix-chunk, отриманий цим ПК з рою, завершиться контрольованою помилкою.",
+        );
+    }
+
+    fn delay_next_inbound_matrix_chunk(&mut self) {
+        self.send("debug-delay-next-matrix-chunk 5000");
+        self.notice(
+            "Тест затримки активовано: наступний matrix-chunk, отриманий цим ПК з рою, чекатиме 5 секунд.",
+        );
+    }
+
     fn toggle_local_contribution(&mut self) {
         let paused = self
             .local_resources
@@ -931,7 +945,7 @@ impl DebuggerApp {
                     let task = details.first().copied().unwrap_or("CPU task");
                     let message = if *target_kind == "remote" {
                         format!(
-                            "Scheduler 0.10 ({task}): обрано агент {} — сила {:.1} проти {:.1} локально (потрібно ≥ {:.1}; кандидатів {}).",
+                            "Scheduler 0.11 ({task}): обрано агент {} — сила {:.1} проти {:.1} локально (потрібно ≥ {:.1}; кандидатів {}).",
                             short_peer(target_peer),
                             selected,
                             local,
@@ -940,7 +954,7 @@ impl DebuggerApp {
                         )
                     } else {
                         format!(
-                            "Scheduler 0.10 ({task}): обрано цей комп'ютер — локальна сила {:.1}; жоден із {} агентів не перевищив поріг {:.1}.",
+                            "Scheduler 0.11 ({task}): обрано цей комп'ютер — локальна сила {:.1}; жоден із {} агентів не перевищив поріг {:.1}.",
                             local, candidate_count, required
                         )
                     };
@@ -963,6 +977,23 @@ impl DebuggerApp {
                 } else {
                     self.notice("Локальний Agent знову приймає нові обчислення.");
                 }
+            }
+            ["DEBUG_FAULT_ARMED", kind, value, ..] => {
+                let message = if *kind == "fail-next-matrix-chunk" {
+                    "Діагностика готова: наступний вхідний matrix-chunk буде навмисно зламано."
+                        .to_owned()
+                } else {
+                    format!(
+                        "Діагностика готова: наступний вхідний matrix-chunk буде затримано на {value} ms."
+                    )
+                };
+                self.notice(message);
+            }
+            ["DEBUG_FAULT_CONSUMED", task_id, fail, delay_ms, ..] => {
+                self.notice(format!(
+                    "Діагностичну умову застосовано до {}: помилка={}, затримка={} ms.",
+                    task_id, fail, delay_ms
+                ));
             }
             ["INBOUND_TASK_REJECTED", peer_id, ..] => {
                 self.notice(format!(
@@ -1230,6 +1261,30 @@ impl DebuggerApp {
                     .clicked()
                 {
                     self.run_distributed_matrix();
+                }
+                if ui
+                    .add_enabled(
+                        self.agent.is_some(),
+                        egui::Button::new("⚠ Збій наступного chunk"),
+                    )
+                    .on_hover_text(
+                        "Лише для тесту: наступний matrix-chunk, який цей ПК отримає від іншого Agent, поверне контрольовану помилку",
+                    )
+                    .clicked()
+                {
+                    self.fail_next_inbound_matrix_chunk();
+                }
+                if ui
+                    .add_enabled(
+                        self.agent.is_some(),
+                        egui::Button::new("⏱ Затримати chunk на 5 с"),
+                    )
+                    .on_hover_text(
+                        "Лише для тесту: наступний matrix-chunk, який цей ПК отримає від іншого Agent, почекає 5 секунд",
+                    )
+                    .clicked()
+                {
+                    self.delay_next_inbound_matrix_chunk();
                 }
                 let contribution_label = if contribution_paused {
                     "▶ Дозволити ресурси цього ПК"
