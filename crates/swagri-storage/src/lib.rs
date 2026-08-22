@@ -16,6 +16,8 @@ use thiserror::Error;
 
 /// Stable block size used by the first Swagri artifact protocol.
 pub const BLOCK_BYTES: usize = 256 * 1024;
+/// Protects peers from manifests that would allocate an unbounded block list.
+pub const MAX_ARTIFACT_BLOCKS: usize = 16_384;
 const MANIFEST_VERSION: u16 = 1;
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -136,6 +138,7 @@ impl ArtifactStore {
 
     pub fn import(&self, source: &Path) -> Result<ArtifactManifest, StorageError> {
         let manifest = describe(source)?;
+        validate_manifest(&manifest)?;
         let manifest_bytes =
             serde_json::to_vec_pretty(&manifest).expect("manifest is serializable");
         let mut unique_new = BTreeSet::new();
@@ -210,48 +213,127 @@ impl ArtifactStore {
                 source,
             }
         })?;
-        if manifest.version != MANIFEST_VERSION
-            || manifest.id != id
-            || manifest.block_size != BLOCK_BYTES as u32
-            || manifest
-                .blocks
-                .iter()
-                .any(|block| block.size == 0 || block.size as usize > BLOCK_BYTES)
-        {
-            return Err(StorageError::Integrity(
-                id,
-                "invalid manifest metadata".into(),
-            ));
+        validate_manifest(&manifest)?;
+        if manifest.id != id {
+            return Err(StorageError::Integrity(id, "manifest ID mismatch".into()));
         }
         Ok(manifest)
     }
 
-    pub fn verify(&self, id: ContentId) -> Result<ArtifactManifest, StorageError> {
-        let manifest = self.manifest(id)?;
-        let mut artifact_hasher = Sha256::new();
-        let mut total = 0_u64;
+    pub fn missing_blocks(
+        &self,
+        manifest: &ArtifactManifest,
+    ) -> Result<Vec<BlockRef>, StorageError> {
+        validate_manifest(manifest)?;
+        let mut missing = Vec::new();
+        let mut seen = BTreeSet::new();
         for block in &manifest.blocks {
+            if !seen.insert(block.id) {
+                continue;
+            }
             let path = self.block_path(block.id);
-            let bytes = fs::read(&path).map_err(|source| StorageError::Io {
+            let valid = fs::read(&path).ok().is_some_and(|bytes| {
+                bytes.len() == block.size as usize && digest(&bytes) == block.id
+            });
+            if !valid {
+                missing.push(block.clone());
+            }
+        }
+        Ok(missing)
+    }
+
+    pub fn read_block(&self, block: &BlockRef) -> Result<Vec<u8>, StorageError> {
+        let path = self.block_path(block.id);
+        let bytes = fs::read(&path).map_err(|source| StorageError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        if bytes.len() != block.size as usize || digest(&bytes) != block.id {
+            return Err(StorageError::Integrity(
+                block.id,
+                "cached block digest mismatch".into(),
+            ));
+        }
+        Ok(bytes)
+    }
+
+    pub fn store_block(&self, block: &BlockRef, bytes: &[u8]) -> Result<(), StorageError> {
+        if block.size == 0
+            || block.size as usize > BLOCK_BYTES
+            || bytes.len() != block.size as usize
+            || digest(bytes) != block.id
+        {
+            return Err(StorageError::Integrity(
+                block.id,
+                "received block does not match its content address".into(),
+            ));
+        }
+        let path = self.block_path(block.id);
+        let existing = fs::read(&path).ok();
+        if existing
+            .as_ref()
+            .is_some_and(|value| value.len() == bytes.len() && digest(value) == block.id)
+        {
+            return Ok(());
+        }
+        let stats = self.stats()?;
+        let reclaimable = existing.as_ref().map_or(0, |value| value.len() as u64);
+        let available = self
+            .quota_bytes
+            .saturating_sub(stats.used_bytes)
+            .saturating_add(reclaimable);
+        if bytes.len() as u64 > available {
+            return Err(StorageError::QuotaExceeded {
+                needed: bytes.len() as u64,
+                available,
+            });
+        }
+        if path.is_file() {
+            fs::remove_file(&path).map_err(|source| StorageError::Io {
                 path: path.clone(),
                 source,
             })?;
-            if bytes.len() != block.size as usize || digest(&bytes) != block.id {
-                return Err(StorageError::Integrity(
-                    id,
-                    format!("damaged block {}", block.id),
-                ));
-            }
+        }
+        write_atomic(&path, bytes)
+    }
+
+    pub fn commit_manifest(&self, manifest: &ArtifactManifest) -> Result<(), StorageError> {
+        validate_manifest(manifest)?;
+        verify_manifest_blocks(self, manifest)?;
+        let path = self.manifest_path(manifest.id);
+        if path.is_file() {
+            return Ok(());
+        }
+        let bytes = serde_json::to_vec_pretty(manifest).expect("manifest is serializable");
+        let stats = self.stats()?;
+        let available = self.quota_bytes.saturating_sub(stats.used_bytes);
+        if bytes.len() as u64 > available {
+            return Err(StorageError::QuotaExceeded {
+                needed: bytes.len() as u64,
+                available,
+            });
+        }
+        write_atomic(&path, &bytes)
+    }
+
+    pub fn verify(&self, id: ContentId) -> Result<ArtifactManifest, StorageError> {
+        let manifest = self.manifest(id)?;
+        verify_manifest_blocks(self, &manifest)?;
+        Ok(manifest)
+    }
+
+    fn verified_artifact_digest(
+        &self,
+        manifest: &ArtifactManifest,
+    ) -> Result<(u64, ContentId), StorageError> {
+        let mut artifact_hasher = Sha256::new();
+        let mut total = 0_u64;
+        for block in &manifest.blocks {
+            let bytes = self.read_block(block)?;
             total += bytes.len() as u64;
             artifact_hasher.update(&bytes);
         }
-        if total != manifest.size || finalize(artifact_hasher) != id {
-            return Err(StorageError::Integrity(
-                id,
-                "artifact digest mismatch".into(),
-            ));
-        }
-        Ok(manifest)
+        Ok((total, finalize(artifact_hasher)))
     }
 
     pub fn export(&self, id: ContentId, destination: &Path) -> Result<(), StorageError> {
@@ -337,6 +419,45 @@ impl ArtifactStore {
             .join("sha256")
             .join(format!("{}.json", id.hex()))
     }
+}
+
+fn validate_manifest(manifest: &ArtifactManifest) -> Result<(), StorageError> {
+    let invalid_blocks = manifest.blocks.is_empty() && manifest.size != 0
+        || manifest.blocks.len() > MAX_ARTIFACT_BLOCKS
+        || manifest
+            .blocks
+            .iter()
+            .any(|block| block.size == 0 || block.size as usize > BLOCK_BYTES);
+    let declared_size = manifest
+        .blocks
+        .iter()
+        .map(|block| u64::from(block.size))
+        .sum::<u64>();
+    if manifest.version != MANIFEST_VERSION
+        || manifest.block_size != BLOCK_BYTES as u32
+        || invalid_blocks
+        || declared_size != manifest.size
+    {
+        return Err(StorageError::Integrity(
+            manifest.id,
+            "invalid manifest metadata".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn verify_manifest_blocks(
+    store: &ArtifactStore,
+    manifest: &ArtifactManifest,
+) -> Result<(), StorageError> {
+    let (total, digest) = store.verified_artifact_digest(manifest)?;
+    if total != manifest.size || digest != manifest.id {
+        return Err(StorageError::Integrity(
+            manifest.id,
+            "artifact digest mismatch".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn describe(path: &Path) -> Result<ArtifactManifest, StorageError> {
@@ -538,5 +659,35 @@ mod tests {
         let id = digest(b"swagri");
         assert_eq!(ContentId::from_str(&id.hex()).unwrap(), id);
         assert_eq!(ContentId::from_str(&id.to_string()).unwrap(), id);
+    }
+
+    #[test]
+    fn peer_blocks_resume_and_commit_only_after_complete_verification() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source_path = temporary.path().join("source.bin");
+        let mut bytes = vec![1_u8; BLOCK_BYTES];
+        bytes.extend(vec![2_u8; BLOCK_BYTES]);
+        bytes.extend(b"tail");
+        fs::write(&source_path, bytes).unwrap();
+
+        let source = ArtifactStore::open(temporary.path().join("source"), 10_000_000).unwrap();
+        let target = ArtifactStore::open(temporary.path().join("target"), 10_000_000).unwrap();
+        let manifest = source.import(&source_path).unwrap();
+        let missing = target.missing_blocks(&manifest).unwrap();
+        assert_eq!(missing.len(), 3);
+
+        let first = source.read_block(&missing[0]).unwrap();
+        target.store_block(&missing[0], &first).unwrap();
+        assert_eq!(target.missing_blocks(&manifest).unwrap().len(), 2);
+        assert!(target.commit_manifest(&manifest).is_err());
+
+        for block in &missing[1..] {
+            target
+                .store_block(block, &source.read_block(block).unwrap())
+                .unwrap();
+        }
+        target.commit_manifest(&manifest).unwrap();
+        assert_eq!(target.verify(manifest.id).unwrap(), manifest);
+        assert!(target.store_block(&missing[0], b"wrong").is_err());
     }
 }

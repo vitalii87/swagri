@@ -149,6 +149,15 @@ struct ArtifactStoreView {
     path: String,
 }
 
+#[derive(Clone, Debug)]
+struct RemoteArtifactView {
+    peer: String,
+    id: String,
+    size: u64,
+    blocks: usize,
+    progress: Option<(usize, usize, usize)>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TaskState {
     Running,
@@ -357,6 +366,8 @@ struct DebuggerApp {
     artifacts: VecDeque<ArtifactView>,
     artifact_store: Option<ArtifactStoreView>,
     selected_artifact: Option<String>,
+    remote_artifacts: VecDeque<RemoteArtifactView>,
+    selected_remote_artifact: Option<(String, String)>,
     max_cpu_percent: f32,
     max_memory_percent: f32,
     show_raw_console: bool,
@@ -432,6 +443,8 @@ impl DebuggerApp {
             artifacts: VecDeque::new(),
             artifact_store: None,
             selected_artifact: None,
+            remote_artifacts: VecDeque::new(),
+            selected_remote_artifact: None,
             max_cpu_percent: 75.0,
             max_memory_percent: 50.0,
             show_raw_console: false,
@@ -457,6 +470,8 @@ impl DebuggerApp {
         self.artifacts.clear();
         self.artifact_store = None;
         self.selected_artifact = None;
+        self.remote_artifacts.clear();
+        self.selected_remote_artifact = None;
 
         match spawn_agent(
             &self.agent_path,
@@ -595,6 +610,48 @@ impl DebuggerApp {
             self.send(format!("artifact-verify {id}"));
         } else {
             self.notice("Спочатку додайте або виберіть файл у Swagri-сховищі.");
+        }
+    }
+
+    fn trust_selected_peer_for_artifacts(&mut self) {
+        if let Some(peer) = self.selected_peer_id() {
+            self.send(format!("trust {peer}"));
+            self.notice(format!(
+                "{} локально дозволено для оновлень і файлів. Зробіть те саме на іншому Debugger, щоб довіра була взаємною.",
+                short_peer(&peer)
+            ));
+        } else {
+            self.notice("Спочатку знайдіть та оберіть агент.");
+        }
+    }
+
+    fn refresh_peer_artifacts(&mut self) {
+        if let Some(peer) = self.selected_peer_id() {
+            self.send(format!("artifact-peer-list {peer}"));
+            self.notice(format!(
+                "Запитуємо список CAS-файлів у {}…",
+                short_peer(&peer)
+            ));
+        } else {
+            self.notice("Спочатку знайдіть та оберіть агент.");
+        }
+    }
+
+    fn fetch_selected_remote_artifact(&mut self) {
+        let selected = self.selected_remote_artifact.clone().or_else(|| {
+            self.remote_artifacts
+                .front()
+                .map(|artifact| (artifact.peer.clone(), artifact.id.clone()))
+        });
+        if let Some((peer, id)) = selected {
+            self.send(format!("artifact-fetch {peer} {id}"));
+            self.notice(format!(
+                "Докачуємо відсутні блоки {} з {}…",
+                short_content_id(&id),
+                short_peer(&peer)
+            ));
+        } else {
+            self.notice("Спочатку оновіть список файлів вибраного peer.");
         }
     }
 
@@ -1135,6 +1192,97 @@ impl DebuggerApp {
             }
             ["ARTIFACT_FAILED", operation, error, ..] => {
                 self.notice(format!("Помилка CAS ({operation}): {error}"));
+            }
+            ["ARTIFACT_PEER_STARTED", peer, operation, ..] => {
+                self.notice(format!(
+                    "P2P CAS {}: {}.",
+                    short_peer(peer),
+                    short_content_id(operation)
+                ));
+            }
+            ["ARTIFACT_PEER_INVENTORY", peer, "begin", ..] => {
+                self.remote_artifacts
+                    .retain(|artifact| artifact.peer != *peer);
+                self.selected_remote_artifact = None;
+            }
+            ["ARTIFACT_PEER_INVENTORY", peer, "complete", ..] => {
+                let count = self
+                    .remote_artifacts
+                    .iter()
+                    .filter(|artifact| artifact.peer == *peer)
+                    .count();
+                self.notice(format!(
+                    "{} поділився списком із {} CAS-файлів.",
+                    short_peer(peer),
+                    count
+                ));
+            }
+            ["ARTIFACT_PEER_ITEM", peer, id, size, blocks, ..] => {
+                if let (Ok(size), Ok(blocks)) = (size.parse(), blocks.parse()) {
+                    upsert_remote_artifact(
+                        &mut self.remote_artifacts,
+                        RemoteArtifactView {
+                            peer: (*peer).into(),
+                            id: (*id).into(),
+                            size,
+                            blocks,
+                            progress: None,
+                        },
+                    );
+                    if self.selected_remote_artifact.is_none() {
+                        self.selected_remote_artifact = Some(((*peer).into(), (*id).into()));
+                    }
+                }
+            }
+            [
+                "ARTIFACT_PEER_PROGRESS",
+                peer,
+                id,
+                completed,
+                total,
+                reused,
+                ..,
+            ] => {
+                if let (Ok(completed), Ok(total), Ok(reused)) =
+                    (completed.parse(), total.parse(), reused.parse())
+                    && let Some(artifact) = self
+                        .remote_artifacts
+                        .iter_mut()
+                        .find(|artifact| artifact.peer == *peer && artifact.id == *id)
+                {
+                    artifact.progress = Some((completed, total, reused));
+                }
+            }
+            [
+                "ARTIFACT_PEER_COMPLETE",
+                peer,
+                id,
+                size,
+                blocks,
+                downloaded,
+                reused,
+                ..,
+            ] => {
+                if let (Ok(size), Ok(blocks)) = (size.parse(), blocks.parse()) {
+                    upsert_artifact(
+                        &mut self.artifacts,
+                        ArtifactView {
+                            id: (*id).into(),
+                            size,
+                            blocks,
+                            source: Some(format!("P2P: {peer}")),
+                            verified: true,
+                        },
+                    );
+                    self.selected_artifact = Some((*id).into());
+                }
+                self.notice(format!(
+                    "P2P-файл {} готовий: завантажено блоків {}, повторно використано {}. Повний SHA-256 підтверджено.",
+                    short_content_id(id), downloaded, reused
+                ));
+            }
+            ["ARTIFACT_PEER_FAILED", peer, error, ..] => {
+                self.notice(format!("P2P CAS {}: {}", short_peer(peer), error));
             }
             ["INBOUND_TASK_REJECTED", peer_id, ..] => {
                 self.notice(format!(
@@ -1789,6 +1937,39 @@ impl DebuggerApp {
                 {
                     self.verify_selected_artifact();
                 }
+                if ui
+                    .add_enabled(
+                        self.agent.is_some() && self.selected_peer_id().is_some(),
+                        egui::Button::new("🔒 Довірити peer для файлів"),
+                    )
+                    .on_hover_text(
+                        "Дозволити цьому Peer ID запитувати CAS-файли; довіру треба надати на обох ПК",
+                    )
+                    .clicked()
+                {
+                    self.trust_selected_peer_for_artifacts();
+                }
+                if ui
+                    .add_enabled(
+                        self.agent.is_some() && self.selected_peer_id().is_some(),
+                        egui::Button::new("⌕ Файли вибраного peer"),
+                    )
+                    .clicked()
+                {
+                    self.refresh_peer_artifacts();
+                }
+                if ui
+                    .add_enabled(
+                        self.agent.is_some() && !self.remote_artifacts.is_empty(),
+                        egui::Button::new("⇩ Докачати вибраний файл"),
+                    )
+                    .on_hover_text(
+                        "Завантажити лише відсутні блоки; вже перевірені блоки залишаються після обриву",
+                    )
+                    .clicked()
+                {
+                    self.fetch_selected_remote_artifact();
+                }
             });
 
             if let Some(store) = &self.artifact_store {
@@ -1809,7 +1990,7 @@ impl DebuggerApp {
                 ui.label("Статистика сховища з’явиться після запуску Agent.");
             }
             ui.small(
-                "v0.12.0: блоки незмінні, адресуються SHA-256 і дедуплікуються. Мережевий обмін блоками буде наступним етапом.",
+                "v0.12.1: довірені агенти обмінюються manifest і відсутніми SHA-256 блоками. Після обриву перевірені блоки використовуються повторно.",
             );
 
             if !self.artifacts.is_empty() {
@@ -1842,6 +2023,46 @@ impl DebuggerApp {
                             let response = ui.label(status);
                             if let Some(source) = &artifact.source {
                                 response.on_hover_text(source);
+                            }
+                            ui.end_row();
+                        }
+                    });
+            }
+
+            if !self.remote_artifacts.is_empty() {
+                ui.add_space(6.0);
+                ui.label(RichText::new("Доступно на довірених агентах").strong());
+                egui::Grid::new("remote_artifact_grid")
+                    .striped(true)
+                    .num_columns(6)
+                    .show(ui, |ui| {
+                        ui.strong("Вибір");
+                        ui.strong("Agent");
+                        ui.strong("Content ID");
+                        ui.strong("Розмір");
+                        ui.strong("Блоки");
+                        ui.strong("Передача");
+                        ui.end_row();
+                        for artifact in &self.remote_artifacts {
+                            ui.radio_value(
+                                &mut self.selected_remote_artifact,
+                                Some((artifact.peer.clone(), artifact.id.clone())),
+                                "",
+                            );
+                            let peer = self
+                                .peers
+                                .get(&artifact.peer)
+                                .map(|view| peer_label(&artifact.peer, view))
+                                .unwrap_or_else(|| short_peer(&artifact.peer));
+                            ui.label(peer).on_hover_text(&artifact.peer);
+                            ui.label(short_content_id(&artifact.id))
+                                .on_hover_text(&artifact.id);
+                            ui.label(format_bytes(artifact.size));
+                            ui.label(artifact.blocks.to_string());
+                            if let Some((completed, total, reused)) = artifact.progress {
+                                ui.label(format!("{completed}/{total} · кеш {reused}"));
+                            } else {
+                                ui.label("готово до запиту");
                             }
                             ui.end_row();
                         }
@@ -2309,6 +2530,23 @@ fn upsert_artifact(artifacts: &mut VecDeque<ArtifactView>, mut incoming: Artifac
             incoming.source = artifacts[position].source.clone();
         }
         incoming.verified |= artifacts[position].verified;
+        artifacts.remove(position);
+    }
+    artifacts.push_front(incoming);
+    artifacts.truncate(MAX_TASK_HISTORY);
+}
+
+fn upsert_remote_artifact(
+    artifacts: &mut VecDeque<RemoteArtifactView>,
+    mut incoming: RemoteArtifactView,
+) {
+    if let Some(position) = artifacts
+        .iter()
+        .position(|item| item.peer == incoming.peer && item.id == incoming.id)
+    {
+        if incoming.progress.is_none() {
+            incoming.progress = artifacts[position].progress;
+        }
         artifacts.remove(position);
     }
     artifacts.push_front(incoming);

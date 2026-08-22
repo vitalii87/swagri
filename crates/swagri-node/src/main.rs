@@ -25,13 +25,14 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use swagri_core::{
-    MAX_DISTRIBUTED_MATRIX_SIZE, MAX_MATRIX_CHUNK_ROWS, MAX_UPDATE_BYTES, NODE_PROTOCOL_VERSION,
-    REMOTE_CPU_MINIMUM_GAIN, ResourceSnapshot, SignedUpdateManifest, TASK_PROTOCOL_V1, Task,
-    TaskOutcome, TaskRequest, TaskResponse, TaskResult, UPDATE_CHUNK_BYTES, UPDATE_PROTOCOL_V1,
-    UpdateManifest, UpdateRequest, UpdateResponse, choose_cpu_placement, effective_cpu_score,
+    ARTIFACT_PROTOCOL_V1, MAX_DISTRIBUTED_MATRIX_SIZE, MAX_MATRIX_CHUNK_ROWS, MAX_UPDATE_BYTES,
+    NODE_PROTOCOL_VERSION, REMOTE_CPU_MINIMUM_GAIN, ResourceSnapshot, SignedUpdateManifest,
+    TASK_PROTOCOL_V1, Task, TaskOutcome, TaskRequest, TaskResponse, TaskResult, UPDATE_CHUNK_BYTES,
+    UPDATE_PROTOCOL_V1, UpdateManifest, UpdateRequest, UpdateResponse, choose_cpu_placement,
+    effective_cpu_score,
 };
 use swagri_executor::execute;
-use swagri_storage::{ArtifactManifest, ArtifactStore, ContentId};
+use swagri_storage::{ArtifactManifest, ArtifactStore, BlockRef, ContentId};
 use sysinfo::{Disks, Pid, ProcessesToUpdate, System};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
@@ -128,6 +129,7 @@ struct Behaviour {
     mdns: mdns::tokio::Behaviour,
     request_response: request_response::cbor::Behaviour<TaskRequest, TaskResponse>,
     updates: request_response::cbor::Behaviour<UpdateRequest, UpdateResponse>,
+    artifacts: request_response::cbor::Behaviour<ArtifactRequest, ArtifactResponse>,
     identify: identify::Behaviour,
     ping: ping::Behaviour,
 }
@@ -148,11 +150,68 @@ enum ArtifactCompletion {
     },
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum ArtifactRequest {
+    Inventory,
+    Manifest { id: ContentId },
+    Block { block: BlockRef },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum ArtifactResponse {
+    Inventory {
+        artifacts: Vec<ArtifactSummary>,
+    },
+    Manifest {
+        manifest: ArtifactManifest,
+    },
+    Block {
+        block: BlockRef,
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+    },
+    Error {
+        message: String,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ArtifactSummary {
+    id: ContentId,
+    size: u64,
+    blocks: u32,
+}
+
+enum ArtifactOutbound {
+    Inventory {
+        peer: PeerId,
+    },
+    Manifest {
+        peer: PeerId,
+        id: ContentId,
+    },
+    Block {
+        peer: PeerId,
+        artifact_id: ContentId,
+        block: BlockRef,
+    },
+}
+
+struct ArtifactDownload {
+    peer: PeerId,
+    manifest: ArtifactManifest,
+    pending: VecDeque<BlockRef>,
+    completed: usize,
+    reused: usize,
+    total_missing: usize,
+}
+
 #[derive(Debug)]
 enum BehaviourEvent {
     Mdns(mdns::Event),
     RequestResponse(request_response::Event<TaskRequest, TaskResponse>),
     Update(request_response::Event<UpdateRequest, UpdateResponse>),
+    Artifact(request_response::Event<ArtifactRequest, ArtifactResponse>),
     Identify(Box<identify::Event>),
     Ping(ping::Event),
 }
@@ -160,6 +219,12 @@ enum BehaviourEvent {
 impl From<mdns::Event> for BehaviourEvent {
     fn from(event: mdns::Event) -> Self {
         Self::Mdns(event)
+    }
+}
+
+impl From<request_response::Event<ArtifactRequest, ArtifactResponse>> for BehaviourEvent {
+    fn from(event: request_response::Event<ArtifactRequest, ArtifactResponse>) -> Self {
+        Self::Artifact(event)
     }
 }
 
@@ -565,6 +630,9 @@ async fn main() -> Result<()> {
     let mut outbound_tasks =
         HashMap::<request_response::OutboundRequestId, OutboundTaskMeta>::new();
     let mut matrix_jobs = BTreeMap::<String, DistributedMatrixJob>::new();
+    let mut artifact_outbound =
+        HashMap::<request_response::OutboundRequestId, ArtifactOutbound>::new();
+    let mut artifact_downloads = BTreeMap::<ContentId, ArtifactDownload>::new();
     let request_counter = AtomicU64::new(1);
     let active_tasks = Arc::new(AtomicU32::new(0));
     let debug_faults = Arc::new(DebugFaults::default());
@@ -615,6 +683,8 @@ async fn main() -> Result<()> {
                             &debug_faults,
                             &artifact_store,
                             &artifact_completed_tx,
+                            &mut artifact_outbound,
+                            &artifact_downloads,
                             &mut outbound_tasks,
                             &mut matrix_jobs,
                         ) {
@@ -647,6 +717,9 @@ async fn main() -> Result<()> {
                     &active_tasks,
                     &debug_faults,
                     &args.name,
+                    &artifact_store,
+                    &mut artifact_outbound,
+                    &mut artifact_downloads,
                     &mut outbound_tasks,
                     &mut matrix_jobs,
                 ) {
@@ -1011,11 +1084,19 @@ fn build_swarm(
                 )],
                 request_response::Config::default().with_request_timeout(request_timeout),
             );
+            let artifacts = request_response::cbor::Behaviour::new(
+                [(
+                    StreamProtocol::new(ARTIFACT_PROTOCOL_V1),
+                    ProtocolSupport::Full,
+                )],
+                request_response::Config::default().with_request_timeout(request_timeout),
+            );
 
             Ok(Behaviour {
                 mdns: mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)?,
                 request_response,
                 updates,
+                artifacts,
                 identify: identify::Behaviour::new(
                     identify::Config::new("/swagri/identify/1".into(), key.public())
                         .with_agent_version(agent_version),
@@ -1075,6 +1156,9 @@ fn handle_swarm_event(
     active_tasks: &Arc<AtomicU32>,
     debug_faults: &Arc<DebugFaults>,
     node_name: &str,
+    artifact_store: &ArtifactStore,
+    artifact_outbound: &mut HashMap<request_response::OutboundRequestId, ArtifactOutbound>,
+    artifact_downloads: &mut BTreeMap<ContentId, ArtifactDownload>,
     outbound_tasks: &mut HashMap<request_response::OutboundRequestId, OutboundTaskMeta>,
     matrix_jobs: &mut BTreeMap<String, DistributedMatrixJob>,
 ) -> bool {
@@ -1095,6 +1179,8 @@ fn handle_swarm_event(
             peer_resources.remove(&peer_id);
             info!(peer = %peer_id, ?cause, "peer disconnected");
             emit_event("PEER_DISCONNECTED", &[&peer_id.to_string()]);
+            artifact_outbound.retain(|_, request| artifact_request_context(request).0 != peer_id);
+            fail_artifact_downloads_from(peer_id, "peer disconnected", artifact_downloads);
         }
         SwarmEvent::OutgoingConnectionError {
             peer_id: Some(peer_id),
@@ -1148,6 +1234,16 @@ fn handle_swarm_event(
         }
         SwarmEvent::Behaviour(BehaviourEvent::Update(event)) => {
             shutdown = handle_update_event(event, swarm, updates, restart_arguments);
+        }
+        SwarmEvent::Behaviour(BehaviourEvent::Artifact(event)) => {
+            handle_artifact_event(
+                event,
+                swarm,
+                artifact_store,
+                &updates.trusted,
+                artifact_outbound,
+                artifact_downloads,
+            );
         }
         SwarmEvent::Behaviour(BehaviourEvent::Identify(event)) => {
             if let identify::Event::Received { peer_id, info, .. } = *event {
@@ -1803,6 +1899,347 @@ fn serve_update_chunk(
     }
 }
 
+fn handle_artifact_event(
+    event: request_response::Event<ArtifactRequest, ArtifactResponse>,
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    store: &ArtifactStore,
+    trusted: &BTreeSet<PeerId>,
+    outbound: &mut HashMap<request_response::OutboundRequestId, ArtifactOutbound>,
+    downloads: &mut BTreeMap<ContentId, ArtifactDownload>,
+) {
+    match event {
+        request_response::Event::Message {
+            peer,
+            message:
+                request_response::Message::Request {
+                    request, channel, ..
+                },
+            ..
+        } => {
+            let response = if trusted.contains(&peer) {
+                serve_artifact_request(request, store)
+            } else {
+                ArtifactResponse::Error {
+                    message: "requesting peer is not trusted for artifact sharing".into(),
+                }
+            };
+            if swarm
+                .behaviour_mut()
+                .artifacts
+                .send_response(channel, response)
+                .is_err()
+            {
+                warn!(%peer, "artifact requester disconnected before response");
+            }
+        }
+        request_response::Event::Message {
+            peer,
+            message:
+                request_response::Message::Response {
+                    request_id,
+                    response,
+                },
+            ..
+        } => {
+            let Some(expected) = outbound.remove(&request_id) else {
+                warn!(%peer, ?request_id, "ignored unsolicited artifact response");
+                return;
+            };
+            handle_artifact_response(response, expected, swarm, store, outbound, downloads);
+        }
+        request_response::Event::OutboundFailure {
+            peer,
+            request_id,
+            error,
+            ..
+        } => {
+            let artifact_id = outbound
+                .remove(&request_id)
+                .and_then(|request| match request {
+                    ArtifactOutbound::Manifest { id, .. } => Some(id),
+                    ArtifactOutbound::Block { artifact_id, .. } => Some(artifact_id),
+                    ArtifactOutbound::Inventory { .. } => None,
+                });
+            if let Some(id) = artifact_id {
+                downloads.remove(&id);
+            }
+            emit_event(
+                "ARTIFACT_PEER_FAILED",
+                &[
+                    &peer.to_string(),
+                    &format!("transfer interrupted; verified blocks were retained: {error}"),
+                ],
+            );
+        }
+        request_response::Event::InboundFailure { peer, error, .. } => {
+            warn!(%peer, %error, "inbound artifact request failed");
+        }
+        request_response::Event::ResponseSent { .. } => {}
+    }
+}
+
+fn serve_artifact_request(request: ArtifactRequest, store: &ArtifactStore) -> ArtifactResponse {
+    match request {
+        ArtifactRequest::Inventory => match store.list() {
+            Ok(manifests) => ArtifactResponse::Inventory {
+                artifacts: manifests
+                    .into_iter()
+                    .take(128)
+                    .map(|manifest| ArtifactSummary {
+                        id: manifest.id,
+                        size: manifest.size,
+                        blocks: manifest.blocks.len().min(u32::MAX as usize) as u32,
+                    })
+                    .collect(),
+            },
+            Err(error) => ArtifactResponse::Error {
+                message: error.to_string(),
+            },
+        },
+        ArtifactRequest::Manifest { id } => match store.manifest(id) {
+            Ok(manifest) => ArtifactResponse::Manifest { manifest },
+            Err(error) => ArtifactResponse::Error {
+                message: error.to_string(),
+            },
+        },
+        ArtifactRequest::Block { block } => match store.read_block(&block) {
+            Ok(data) => ArtifactResponse::Block { block, data },
+            Err(error) => ArtifactResponse::Error {
+                message: error.to_string(),
+            },
+        },
+    }
+}
+
+fn handle_artifact_response(
+    response: ArtifactResponse,
+    expected: ArtifactOutbound,
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    store: &ArtifactStore,
+    outbound: &mut HashMap<request_response::OutboundRequestId, ArtifactOutbound>,
+    downloads: &mut BTreeMap<ContentId, ArtifactDownload>,
+) {
+    match (expected, response) {
+        (ArtifactOutbound::Inventory { peer }, ArtifactResponse::Inventory { artifacts }) => {
+            emit_event("ARTIFACT_PEER_INVENTORY", &[&peer.to_string(), "begin"]);
+            for artifact in artifacts.into_iter().take(128) {
+                emit_event(
+                    "ARTIFACT_PEER_ITEM",
+                    &[
+                        &peer.to_string(),
+                        &artifact.id.to_string(),
+                        &artifact.size.to_string(),
+                        &artifact.blocks.to_string(),
+                    ],
+                );
+            }
+            emit_event("ARTIFACT_PEER_INVENTORY", &[&peer.to_string(), "complete"]);
+        }
+        (ArtifactOutbound::Manifest { peer, id }, ArtifactResponse::Manifest { manifest })
+            if manifest.id == id =>
+        {
+            let missing = match store.missing_blocks(&manifest) {
+                Ok(missing) => missing,
+                Err(error) => {
+                    emit_event(
+                        "ARTIFACT_PEER_FAILED",
+                        &[&peer.to_string(), &error.to_string()],
+                    );
+                    return;
+                }
+            };
+            let unique_blocks = manifest
+                .blocks
+                .iter()
+                .map(|block| block.id)
+                .collect::<BTreeSet<_>>()
+                .len();
+            let reused = unique_blocks.saturating_sub(missing.len());
+            if missing.is_empty() {
+                finish_artifact_download(peer, manifest, 0, reused, store);
+                return;
+            }
+            let total_missing = missing.len();
+            downloads.insert(
+                id,
+                ArtifactDownload {
+                    peer,
+                    manifest,
+                    pending: missing.into(),
+                    completed: 0,
+                    reused,
+                    total_missing,
+                },
+            );
+            request_next_artifact_block(id, swarm, outbound, downloads);
+        }
+        (
+            ArtifactOutbound::Block {
+                peer,
+                artifact_id,
+                block: expected_block,
+            },
+            ArtifactResponse::Block { block, data },
+        ) if block == expected_block => {
+            let result = store.store_block(&block, &data);
+            let Some(download) = downloads.get_mut(&artifact_id) else {
+                return;
+            };
+            if download.peer != peer {
+                downloads.remove(&artifact_id);
+                emit_event(
+                    "ARTIFACT_PEER_FAILED",
+                    &[
+                        &peer.to_string(),
+                        "artifact block came from an unexpected peer",
+                    ],
+                );
+                return;
+            }
+            if let Err(error) = result {
+                downloads.remove(&artifact_id);
+                emit_event(
+                    "ARTIFACT_PEER_FAILED",
+                    &[&peer.to_string(), &error.to_string()],
+                );
+                return;
+            }
+            download.completed += 1;
+            emit_event(
+                "ARTIFACT_PEER_PROGRESS",
+                &[
+                    &peer.to_string(),
+                    &artifact_id.to_string(),
+                    &download.completed.to_string(),
+                    &download.total_missing.to_string(),
+                    &download.reused.to_string(),
+                ],
+            );
+            if download.pending.is_empty() {
+                let download = downloads.remove(&artifact_id).expect("download exists");
+                finish_artifact_download(
+                    peer,
+                    download.manifest,
+                    download.completed,
+                    download.reused,
+                    store,
+                );
+            } else {
+                request_next_artifact_block(artifact_id, swarm, outbound, downloads);
+            }
+        }
+        (expected, ArtifactResponse::Error { message }) => {
+            let (peer, artifact_id) = artifact_request_context(&expected);
+            if let Some(id) = artifact_id {
+                downloads.remove(&id);
+            }
+            emit_event("ARTIFACT_PEER_FAILED", &[&peer.to_string(), &message]);
+        }
+        (expected, _) => {
+            let (peer, artifact_id) = artifact_request_context(&expected);
+            if let Some(id) = artifact_id {
+                downloads.remove(&id);
+            }
+            emit_event(
+                "ARTIFACT_PEER_FAILED",
+                &[
+                    &peer.to_string(),
+                    "artifact response did not match the request",
+                ],
+            );
+        }
+    }
+}
+
+fn artifact_request_context(expected: &ArtifactOutbound) -> (PeerId, Option<ContentId>) {
+    match expected {
+        ArtifactOutbound::Inventory { peer } => (*peer, None),
+        ArtifactOutbound::Manifest { peer, id } => (*peer, Some(*id)),
+        ArtifactOutbound::Block {
+            peer, artifact_id, ..
+        } => (*peer, Some(*artifact_id)),
+    }
+}
+
+fn request_next_artifact_block(
+    artifact_id: ContentId,
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    outbound: &mut HashMap<request_response::OutboundRequestId, ArtifactOutbound>,
+    downloads: &mut BTreeMap<ContentId, ArtifactDownload>,
+) {
+    let Some(download) = downloads.get_mut(&artifact_id) else {
+        return;
+    };
+    let Some(block) = download.pending.pop_front() else {
+        return;
+    };
+    let peer = download.peer;
+    let request_id = swarm.behaviour_mut().artifacts.send_request(
+        &peer,
+        ArtifactRequest::Block {
+            block: block.clone(),
+        },
+    );
+    outbound.insert(
+        request_id,
+        ArtifactOutbound::Block {
+            peer,
+            artifact_id,
+            block,
+        },
+    );
+}
+
+fn finish_artifact_download(
+    peer: PeerId,
+    manifest: ArtifactManifest,
+    downloaded: usize,
+    reused: usize,
+    store: &ArtifactStore,
+) {
+    match store.commit_manifest(&manifest) {
+        Ok(()) => {
+            emit_event(
+                "ARTIFACT_PEER_COMPLETE",
+                &[
+                    &peer.to_string(),
+                    &manifest.id.to_string(),
+                    &manifest.size.to_string(),
+                    &manifest.blocks.len().to_string(),
+                    &downloaded.to_string(),
+                    &reused.to_string(),
+                ],
+            );
+            emit_artifact_status(store);
+        }
+        Err(error) => emit_event(
+            "ARTIFACT_PEER_FAILED",
+            &[&peer.to_string(), &error.to_string()],
+        ),
+    }
+}
+
+fn fail_artifact_downloads_from(
+    peer: PeerId,
+    reason: &str,
+    downloads: &mut BTreeMap<ContentId, ArtifactDownload>,
+) {
+    let failed = downloads
+        .iter()
+        .filter_map(|(id, download)| (download.peer == peer).then_some(*id))
+        .collect::<Vec<_>>();
+    for id in failed {
+        downloads.remove(&id);
+        emit_event(
+            "ARTIFACT_PEER_FAILED",
+            &[
+                &peer.to_string(),
+                &format!("{reason}; verified blocks were retained for resume"),
+            ],
+        );
+    }
+}
+
 fn request_next_update_chunk(swarm: &mut libp2p::Swarm<Behaviour>, updates: &UpdateManager) {
     if let Some(pending) = &updates.pending {
         let request = match pending.component {
@@ -1960,6 +2397,8 @@ fn handle_command(
     debug_faults: &Arc<DebugFaults>,
     artifact_store: &Arc<ArtifactStore>,
     artifact_completed_tx: &mpsc::UnboundedSender<ArtifactCompletion>,
+    artifact_outbound: &mut HashMap<request_response::OutboundRequestId, ArtifactOutbound>,
+    artifact_downloads: &BTreeMap<ContentId, ArtifactDownload>,
     outbound_tasks: &mut HashMap<request_response::OutboundRequestId, OutboundTaskMeta>,
     matrix_jobs: &mut BTreeMap<String, DistributedMatrixJob>,
 ) -> bool {
@@ -2081,6 +2520,68 @@ fn handle_command(
                 ),
             }
         }
+        "artifact-peer-list" => match parse_peer(&mut parts) {
+            Ok(peer) if updates.trusted.contains(&peer) => {
+                let request_id = swarm
+                    .behaviour_mut()
+                    .artifacts
+                    .send_request(&peer, ArtifactRequest::Inventory);
+                artifact_outbound.insert(request_id, ArtifactOutbound::Inventory { peer });
+                emit_event("ARTIFACT_PEER_STARTED", &[&peer.to_string(), "inventory"]);
+            }
+            Ok(peer) => emit_event(
+                "ARTIFACT_PEER_FAILED",
+                &[
+                    &peer.to_string(),
+                    "trust this Peer ID before reading its artifact inventory",
+                ],
+            ),
+            Err(error) => emit_event(
+                "ARTIFACT_PEER_FAILED",
+                &["unknown", &format!("invalid peer: {error:#}")],
+            ),
+        },
+        "artifact-fetch" => {
+            let parsed = parse_peer(&mut parts).and_then(|peer| {
+                let id = parts
+                    .next()
+                    .context("artifact-fetch requires a content ID")?
+                    .parse::<ContentId>()
+                    .context("invalid content ID")?;
+                Ok((peer, id))
+            });
+            match parsed {
+                Ok((peer, id)) if !updates.trusted.contains(&peer) => emit_event(
+                    "ARTIFACT_PEER_FAILED",
+                    &[
+                        &peer.to_string(),
+                        "trust this Peer ID before downloading artifacts",
+                    ],
+                ),
+                Ok((peer, id)) if artifact_downloads.contains_key(&id) => emit_event(
+                    "ARTIFACT_PEER_FAILED",
+                    &[
+                        &peer.to_string(),
+                        "this artifact download is already active",
+                    ],
+                ),
+                Ok((peer, id)) => {
+                    let request_id = swarm
+                        .behaviour_mut()
+                        .artifacts
+                        .send_request(&peer, ArtifactRequest::Manifest { id });
+                    artifact_outbound.insert(request_id, ArtifactOutbound::Manifest { peer, id });
+                    emit_event(
+                        "ARTIFACT_PEER_STARTED",
+                        &[&peer.to_string(), &id.to_string()],
+                    );
+                }
+                Err(error) => emit_event(
+                    "ARTIFACT_PEER_FAILED",
+                    &["unknown", &format!("invalid fetch command: {error:#}")],
+                ),
+            }
+        }
         "trusted" => {
             if updates.trusted.is_empty() {
                 println!("No peers are trusted for updates.");
@@ -2095,7 +2596,7 @@ fn handle_command(
                 updates.trusted.insert(peer);
                 match updates.persist_trust() {
                     Ok(()) => {
-                        println!("Trusted {peer} for signed agent updates.");
+                        println!("Trusted {peer} for signed updates and artifact sharing.");
                         emit_event("UPDATE_TRUSTED", &[&peer.to_string()]);
                     }
                     Err(error) => println!("Could not save update trust: {error:#}"),
@@ -2108,7 +2609,7 @@ fn handle_command(
                 updates.trusted.remove(&peer);
                 match updates.persist_trust() {
                     Ok(()) => {
-                        println!("Removed update trust for {peer}.");
+                        println!("Removed update and artifact trust for {peer}.");
                         emit_event("UPDATE_UNTRUSTED", &[&peer.to_string()]);
                     }
                     Err(error) => println!("Could not save update trust: {error:#}"),
@@ -3172,9 +3673,11 @@ fn print_help() {
          artifact-import <path>           Split, hash, verify, and cache a file\n\
          artifact-verify <sha256:id>       Verify every cached block\n\
          artifact-export <id> <path>       Reconstruct a verified file\n\
+         artifact-peer-list <peer-id>      List artifacts shared by a trusted peer\n\
+         artifact-fetch <peer-id> <id>     Resume-download missing verified blocks\n\
          trusted                           List peers trusted for updates\n\
-         trust <peer-id>                   Trust a peer identity for signed updates\n\
-         untrust <peer-id>                 Remove update trust\n\
+         trust <peer-id>                   Trust a peer for updates and artifacts\n\
+         untrust <peer-id>                 Remove update and artifact trust\n\
          update <peer-id>                  Download, verify, apply, and restart\n\
          download-update <peer-id>         Download and verify without applying\n\
          download-debugger-update <peer>   Download and verify the peer Debugger\n\

@@ -38,6 +38,7 @@ Every node has the same role and can initiate or execute requests. The MVP uses:
 - libp2p PeerId values derived from persistent Ed25519 identities;
 - CBOR messages on versioned protocol `/swagri/task/1`;
 - separately signed Agent and Debugger manifests and chunks on `/swagri/update/1`;
+- trusted artifact inventories, manifests, and blocks on `/swagri/artifact/1`;
 - small, allowlisted task kinds;
 - aggregate resource snapshots in `NodeInfo` responses;
 - cached one-time CPU calibration and five-second dynamic sampling;
@@ -152,10 +153,17 @@ not reserved space: an empty cache consumes almost nothing. Import, verification
 and export use blocking workers so hashing a large video cannot stall QUIC,
 mDNS, task progress, or resource polling.
 
-This version does not advertise or transfer blocks to peers. The next wire
-protocol will exchange manifests and missing-block inventories, request bounded
-blocks from multiple trusted providers, verify each received digest before
-commit, and resume from already-present blocks. Replication or erasure coding
+Version 0.12.1 adds the first artifact wire protocol. Only Peer IDs in the
+owner's persisted trust list can request or serve inventories, manifests, and
+blocks. A receiver validates bounded manifest structure, finds already-present
+blocks, requests missing blocks sequentially from the selected peer, verifies
+each SHA-256 digest before committing it, and publishes the manifest only after
+the reconstructed whole-file digest matches. If the connection drops, verified
+blocks remain in CAS and the next fetch skips them.
+
+The current scheduler uses one explicitly selected provider. The next iteration
+will discover all providers for a content ID and request bounded blocks from
+several peers in parallel. Replication or erasure coding
 must be a separate durability policy: content addressing detects missing or
 corrupt data but does not by itself preserve a file when its only node leaves.
 

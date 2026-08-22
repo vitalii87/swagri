@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "0.12.0-alpha",
+    [string]$Version = "0.12.1-alpha",
     [string]$Configuration = "release"
 )
 
@@ -43,6 +43,7 @@ Agent package:
 
 Artifacts: Debugger can split files into immutable SHA-256 blocks in a local
 content-addressed store. The default disk contribution limit is 5%.
+Trusted peers can list artifacts and resume-download only missing verified blocks.
 
 Updates: both packages include swagri-updater.exe. Trust a specific Peer ID
 before receiving signed P2P updates. Debugger packages can share both Agent and

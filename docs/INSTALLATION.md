@@ -178,8 +178,25 @@ artifact-export sha256:<content-id> C:\data\restored-video.mp4
 
 The default quota is 5% of the physical disk that contains the artifact store.
 Change it with `--artifact-storage-percent`, from 0.1 to 25. Version 0.12.0 is
-local-only: it establishes integrity and deduplication before the following
-release adds resumable multi-peer block transfer.
+the local integrity foundation; version 0.12.1 adds resumable trusted-peer
+block transfer on top of it.
+
+### Test trusted P2P artifact transfer in v0.12.1
+
+1. Run Debugger 0.12.1 on both computers and connect the Agents.
+2. On each Debugger select the other Agent and click **Trust peer for files**.
+   Trust is deliberately mutual: trusting B on A does not silently make A
+   trusted on B.
+3. On computer A click **Add file** and wait for its verified local CAS row.
+4. On computer B select A, click **Files of selected peer**, select the remote
+   row, then click **Resume selected file**.
+5. B downloads only blocks it does not already have, verifies every SHA-256,
+   verifies the complete artifact, and then adds it to its local table.
+
+To test resume, use a sufficiently large file, stop A during transfer, reconnect,
+and repeat the inventory/fetch action. B retains verified blocks from the first
+attempt and reports them as reused. Version 0.12.1 downloads from one selected
+trusted Agent; multi-provider parallelism is the following development step.
 
 ## Task activity and history
 

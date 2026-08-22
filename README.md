@@ -57,9 +57,13 @@ split into immutable 256 KiB blocks, addressed and verified with SHA-256,
 deduplicated, and held under a default 5% physical-disk quota. Block exchange
 between peers is the next protocol step; this version intentionally proves the
 local integrity boundary first. Swagri does **not** yet split, migrate, retry,
-or cancel general workloads, and
-it does not execute shell commands, downloaded binaries, or arbitrary remote
-code.
+or cancel general workloads. Version 0.12.1 adds an explicitly trusted P2P
+artifact protocol: a node can inspect a peer's bounded inventory, fetch a
+manifest, download only missing blocks, retain verified blocks across an
+interruption, and publish the artifact only after its complete digest matches.
+The current fetch uses one selected provider; multi-source swarm selection and
+durability replication remain future steps. Swagri does not execute shell
+commands, downloaded binaries, or arbitrary remote code.
 
 ## Technology
 
@@ -78,6 +82,7 @@ code.
 - local one-shot failure and delay injection for reproducible recovery tests
 - content-addressed 256 KiB artifact blocks with SHA-256 integrity, deduplication,
   atomic writes, reconstruction, and a disk quota
+- trusted peer inventory and resumable verified artifact block downloads
 - runtime pause/resume of a device's Swagri contribution
 - durable local SQLite lifecycle and result history for swarm tasks
 - native Rust desktop Debugger with live logs, resource comparison, and controls
@@ -122,6 +127,8 @@ distributed-matrix 768 96
 artifact-import C:\data\video.mp4
 artifact-list
 artifact-verify sha256:<content-id>
+artifact-peer-list <trusted-peer-id>
+artifact-fetch <trusted-peer-id> sha256:<content-id>
 pause-resources
 resume-resources
 resources <peer-id>

@@ -9,6 +9,9 @@ pub const TASK_PROTOCOL_V1: &str = "/swagri/task/1";
 /// Signed, chunked agent-update protocol.
 pub const UPDATE_PROTOCOL_V1: &str = "/swagri/update/1";
 
+/// Trusted manifest inventory and verified content-addressed block exchange.
+pub const ARTIFACT_PROTOCOL_V1: &str = "/swagri/artifact/1";
+
 /// Maximum executable size accepted through the update protocol.
 pub const MAX_UPDATE_BYTES: u64 = 128 * 1024 * 1024;
 
