@@ -2551,7 +2551,7 @@ fn handle_command(
                 Ok((peer, id))
             });
             match parsed {
-                Ok((peer, id)) if !updates.trusted.contains(&peer) => emit_event(
+                Ok((peer, _id)) if !updates.trusted.contains(&peer) => emit_event(
                     "ARTIFACT_PEER_FAILED",
                     &[
                         &peer.to_string(),
