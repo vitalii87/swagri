@@ -741,13 +741,22 @@ fn validate_resource_limits(args: &Args) -> Result<()> {
 }
 
 fn disk_quota_bytes(path: &Path, percent: f32) -> Result<u64> {
+    let absolute = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir()
+            .context("could not resolve the current directory")?
+            .join(path)
+    };
     let canonical = path
         .canonicalize()
         .with_context(|| format!("could not resolve artifact store {}", path.display()))?;
     let disks = Disks::new_with_refreshed_list();
     let disk = disks
         .iter()
-        .filter(|disk| canonical.starts_with(disk.mount_point()))
+        .filter(|disk| {
+            absolute.starts_with(disk.mount_point()) || canonical.starts_with(disk.mount_point())
+        })
         .max_by_key(|disk| disk.mount_point().components().count())
         .with_context(|| format!("could not determine disk capacity for {}", path.display()))?;
     let quota = (disk.total_space() as f64 * f64::from(percent) / 100.0) as u64;
