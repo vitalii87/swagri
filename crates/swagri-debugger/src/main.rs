@@ -131,6 +131,24 @@ struct ResourceView {
     contribution_paused: bool,
 }
 
+#[derive(Clone, Debug)]
+struct ArtifactView {
+    id: String,
+    size: u64,
+    blocks: usize,
+    source: Option<String>,
+    verified: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ArtifactStoreView {
+    artifacts: u64,
+    blocks: u64,
+    used_bytes: u64,
+    quota_bytes: u64,
+    path: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TaskState {
     Running,
@@ -336,6 +354,9 @@ struct DebuggerApp {
     task_store_path: PathBuf,
     local_resources: Option<ResourceView>,
     last_placement: Option<String>,
+    artifacts: VecDeque<ArtifactView>,
+    artifact_store: Option<ArtifactStoreView>,
+    selected_artifact: Option<String>,
     max_cpu_percent: f32,
     max_memory_percent: f32,
     show_raw_console: bool,
@@ -408,6 +429,9 @@ impl DebuggerApp {
             task_store_path,
             local_resources: None,
             last_placement: None,
+            artifacts: VecDeque::new(),
+            artifact_store: None,
+            selected_artifact: None,
             max_cpu_percent: 75.0,
             max_memory_percent: 50.0,
             show_raw_console: false,
@@ -430,6 +454,9 @@ impl DebuggerApp {
         self.listen_addresses.clear();
         self.peers.clear();
         self.selected_peer = None;
+        self.artifacts.clear();
+        self.artifact_store = None;
+        self.selected_artifact = None;
 
         match spawn_agent(
             &self.agent_path,
@@ -535,6 +562,40 @@ impl DebuggerApp {
     fn run_distributed_matrix(&mut self) {
         self.notice("Ділимо Matrix 768×768 на 8 частин і розподіляємо між доступними Agent…");
         self.send("distributed-matrix 768 96");
+    }
+
+    fn import_artifact(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Оберіть файл для Swagri-сховища")
+            .pick_file()
+        else {
+            return;
+        };
+        self.notice(format!(
+            "Хешуємо та ділимо {} на перевірювані блоки у фоні…",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("файл")
+        ));
+        self.send(format!("artifact-import {}", path.display()));
+    }
+
+    fn refresh_artifacts(&mut self) {
+        self.artifacts.clear();
+        self.send("artifact-list");
+    }
+
+    fn verify_selected_artifact(&mut self) {
+        let id = self
+            .selected_artifact
+            .clone()
+            .or_else(|| self.artifacts.front().map(|artifact| artifact.id.clone()));
+        if let Some(id) = id {
+            self.notice(format!("Перевіряємо всі блоки {}…", short_content_id(&id)));
+            self.send(format!("artifact-verify {id}"));
+        } else {
+            self.notice("Спочатку додайте або виберіть файл у Swagri-сховищі.");
+        }
     }
 
     fn fail_next_inbound_matrix_chunk(&mut self) {
@@ -795,10 +856,12 @@ impl DebuggerApp {
                 if !node_name.is_empty() {
                     self.node_name = (*node_name).into();
                 }
+                self.send("artifact-list");
             }
             ["STARTED", peer_id, version] => {
                 self.local_peer_id = Some((*peer_id).into());
                 self.agent_version = (*version).into();
+                self.send("artifact-list");
             }
             ["LISTENING", address, ..] => {
                 if !self.listen_addresses.iter().any(|item| item == address) {
@@ -994,6 +1057,84 @@ impl DebuggerApp {
                     "Діагностичну умову застосовано до {}: помилка={}, затримка={} ms.",
                     task_id, fail, delay_ms
                 ));
+            }
+            ["ARTIFACT_STATUS", artifacts, blocks, used, quota, path, ..] => {
+                if let (Ok(artifacts), Ok(blocks), Ok(used_bytes), Ok(quota_bytes)) = (
+                    artifacts.parse(),
+                    blocks.parse(),
+                    used.parse(),
+                    quota.parse(),
+                ) {
+                    self.artifact_store = Some(ArtifactStoreView {
+                        artifacts,
+                        blocks,
+                        used_bytes,
+                        quota_bytes,
+                        path: (*path).into(),
+                    });
+                }
+            }
+            ["ARTIFACT_LIST", id, size, blocks, ..] => {
+                if let (Ok(size), Ok(blocks)) = (size.parse(), blocks.parse()) {
+                    upsert_artifact(
+                        &mut self.artifacts,
+                        ArtifactView {
+                            id: (*id).into(),
+                            size,
+                            blocks,
+                            source: None,
+                            verified: false,
+                        },
+                    );
+                    if self.selected_artifact.is_none() {
+                        self.selected_artifact = Some((*id).into());
+                    }
+                }
+            }
+            ["ARTIFACT_STARTED", operation, target, ..] => {
+                self.notice(format!("CAS {operation}: {target}"));
+            }
+            ["ARTIFACT_STORED", id, size, blocks, source, ..] => {
+                if let (Ok(size), Ok(blocks)) = (size.parse(), blocks.parse()) {
+                    upsert_artifact(
+                        &mut self.artifacts,
+                        ArtifactView {
+                            id: (*id).into(),
+                            size,
+                            blocks,
+                            source: Some((*source).into()),
+                            verified: true,
+                        },
+                    );
+                    self.selected_artifact = Some((*id).into());
+                    self.notice(format!(
+                        "Файл збережено як {}: {}, блоків {}. Повторний такий самий блок не займає місце двічі.",
+                        short_content_id(id),
+                        format_bytes(size),
+                        blocks
+                    ));
+                }
+            }
+            ["ARTIFACT_VERIFIED", id, size, blocks, ..] => {
+                if let Some(artifact) = self.artifacts.iter_mut().find(|item| item.id == *id) {
+                    artifact.verified = true;
+                }
+                self.notice(format!(
+                    "Цілісність {} підтверджено: {}, блоків {}.",
+                    short_content_id(id),
+                    size,
+                    blocks
+                ));
+            }
+            ["ARTIFACT_EXPORTED", id, path, ..] => {
+                self.notice(format!(
+                    "{} відновлено у {} після повної перевірки.",
+                    short_content_id(id),
+                    path
+                ));
+            }
+            ["ARTIFACT_FAILED", operation, error, ..] => {
+                self.notice(format!("Помилка CAS ({operation}): {error}"));
             }
             ["INBOUND_TASK_REJECTED", peer_id, ..] => {
                 self.notice(format!(
@@ -1620,6 +1761,95 @@ impl DebuggerApp {
         });
     }
 
+    fn draw_artifacts(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Файли рою (CAS)").strong().size(18.0));
+                if ui
+                    .add_enabled(self.agent.is_some(), egui::Button::new("＋ Додати файл"))
+                    .on_hover_text(
+                        "Поділити файл на SHA-256 блоки й покласти у локальне Swagri-сховище",
+                    )
+                    .clicked()
+                {
+                    self.import_artifact();
+                }
+                if ui
+                    .add_enabled(self.agent.is_some(), egui::Button::new("↻ Оновити список"))
+                    .clicked()
+                {
+                    self.refresh_artifacts();
+                }
+                if ui
+                    .add_enabled(
+                        self.agent.is_some() && !self.artifacts.is_empty(),
+                        egui::Button::new("✓ Перевірити цілісність"),
+                    )
+                    .clicked()
+                {
+                    self.verify_selected_artifact();
+                }
+            });
+
+            if let Some(store) = &self.artifact_store {
+                let percent = if store.quota_bytes == 0 {
+                    0.0
+                } else {
+                    store.used_bytes as f64 * 100.0 / store.quota_bytes as f64
+                };
+                ui.label(format!(
+                    "{} файлів · {} унікальних блоків · {} / {} ({percent:.3}%)",
+                    store.artifacts,
+                    store.blocks,
+                    format_bytes(store.used_bytes),
+                    format_bytes(store.quota_bytes)
+                ))
+                .on_hover_text(format!("Локальне сховище: {}", store.path));
+            } else {
+                ui.label("Статистика сховища з’явиться після запуску Agent.");
+            }
+            ui.small(
+                "v0.12.0: блоки незмінні, адресуються SHA-256 і дедуплікуються. Мережевий обмін блоками буде наступним етапом.",
+            );
+
+            if !self.artifacts.is_empty() {
+                egui::Grid::new("artifact_grid")
+                    .striped(true)
+                    .num_columns(5)
+                    .show(ui, |ui| {
+                        ui.strong("Вибір");
+                        ui.strong("Content ID");
+                        ui.strong("Розмір");
+                        ui.strong("Блоки");
+                        ui.strong("Стан");
+                        ui.end_row();
+                        for artifact in &self.artifacts {
+                            ui.radio_value(
+                                &mut self.selected_artifact,
+                                Some(artifact.id.clone()),
+                                "",
+                            );
+                            ui.label(short_content_id(&artifact.id))
+                                .on_hover_text(&artifact.id);
+                            ui.label(format_bytes(artifact.size));
+                            ui.label(artifact.blocks.to_string());
+                            let status = if artifact.verified {
+                                RichText::new("перевірено")
+                                    .color(Color32::from_rgb(70, 210, 130))
+                            } else {
+                                RichText::new("у кеші").color(Color32::LIGHT_GRAY)
+                            };
+                            let response = ui.label(status);
+                            if let Some(source) = &artifact.source {
+                                response.on_hover_text(source);
+                            }
+                            ui.end_row();
+                        }
+                    });
+            }
+        });
+    }
+
     fn draw_metrics(&self, ui: &mut egui::Ui) {
         let used_gib = self.system.used_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
         let total_gib = self.system.total_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
@@ -1874,6 +2104,8 @@ impl eframe::App for DebuggerApp {
                 ui.separator();
                 self.draw_tasks(ui);
                 ui.separator();
+                self.draw_artifacts(ui);
+                ui.separator();
                 self.draw_peers(ui);
                 ui.separator();
                 self.draw_metrics(ui);
@@ -2062,6 +2294,27 @@ fn short_peer(peer: &str) -> String {
     }
 }
 
+fn short_content_id(id: &str) -> String {
+    let digest = id.strip_prefix("sha256:").unwrap_or(id);
+    if digest.len() > 18 {
+        format!("sha256:{}…{}", &digest[..10], &digest[digest.len() - 6..])
+    } else {
+        id.into()
+    }
+}
+
+fn upsert_artifact(artifacts: &mut VecDeque<ArtifactView>, mut incoming: ArtifactView) {
+    if let Some(position) = artifacts.iter().position(|item| item.id == incoming.id) {
+        if incoming.source.is_none() {
+            incoming.source = artifacts[position].source.clone();
+        }
+        incoming.verified |= artifacts[position].verified;
+        artifacts.remove(position);
+    }
+    artifacts.push_front(incoming);
+    artifacts.truncate(MAX_TASK_HISTORY);
+}
+
 fn peer_label(peer_id: &str, peer: &PeerView) -> String {
     peer.node_name
         .as_deref()
@@ -2244,6 +2497,22 @@ fn interrupt_running_tasks(tasks: &mut VecDeque<TaskView>, reason: &str) -> Vec<
 
 fn format_gib(bytes: u64) -> String {
     format!("{:.2} GiB", bytes as f64 / 1024.0 / 1024.0 / 1024.0)
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= GIB {
+        format!("{:.2} GiB", bytes / GIB)
+    } else if bytes >= MIB {
+        format!("{:.2} MiB", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{:.2} KiB", bytes / KIB)
+    } else {
+        format!("{bytes:.0} B")
+    }
 }
 
 fn parse_resource_view(values: &[&str]) -> Option<ResourceView> {

@@ -52,7 +52,12 @@ job and every executor-visible chunk in its bounded SQLite task history. Version
 worker, while bounding retries and failing explicitly if no worker remains.
 Version 0.11.1 adds local one-shot fault and delay controls so this recovery can
 be reproduced safely from two Debuggers without changing the wire protocol.
-Swagri does **not** yet split, migrate, retry, or cancel general workloads, and
+Version 0.12.0 adds the local storage foundation for large inputs: files are
+split into immutable 256 KiB blocks, addressed and verified with SHA-256,
+deduplicated, and held under a default 5% physical-disk quota. Block exchange
+between peers is the next protocol step; this version intentionally proves the
+local integrity boundary first. Swagri does **not** yet split, migrate, retry,
+or cancel general workloads, and
 it does not execute shell commands, downloaded binaries, or arbitrary remote
 code.
 
@@ -71,6 +76,8 @@ code.
 - bounded multi-Agent matrix chunk scheduling, progress, and result aggregation
 - bounded retry and healthy-worker reassignment for failed remote matrix chunks
 - local one-shot failure and delay injection for reproducible recovery tests
+- content-addressed 256 KiB artifact blocks with SHA-256 integrity, deduplication,
+  atomic writes, reconstruction, and a disk quota
 - runtime pause/resume of a device's Swagri contribution
 - durable local SQLite lifecycle and result history for swarm tasks
 - native Rust desktop Debugger with live logs, resource comparison, and controls
@@ -112,6 +119,9 @@ auto-benchmark 1000000
 matrix <peer-id> 192
 auto-matrix 320
 distributed-matrix 768 96
+artifact-import C:\data\video.mp4
+artifact-list
+artifact-verify sha256:<content-id>
 pause-resources
 resume-resources
 resources <peer-id>

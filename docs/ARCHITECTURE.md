@@ -66,6 +66,14 @@ libp2p so these types can later be reused by other transports and SDKs.
 Validates and executes the allowlisted built-in tasks. Networking must not have
 direct access to shell execution or dynamic native libraries.
 
+### `swagri-storage`
+
+Owns the local content-addressed store. It has no networking dependency. Files
+are represented by a small manifest and immutable 256 KiB blocks; both complete
+artifacts and individual blocks use SHA-256 identities. Imports use atomic
+same-directory writes, identical blocks occupy disk once, and exports happen
+only after every block and the complete artifact digest pass verification.
+
 ### `swagri-node`
 
 Owns peer identity, discovery, transport, request/response coordination, and
@@ -122,6 +130,34 @@ cannot be armed by a remote peer. Non-matrix tasks do not consume them, and the
 atomic state resets as soon as one inbound chunk takes it. This makes retry and
 disconnect tests repeatable on two physical devices without weakening task
 authorization.
+
+## Content-addressed artifact storage
+
+Version 0.12.0 deliberately separates storage correctness from network
+distribution:
+
+```text
+local file
+  -> stream in 256 KiB blocks (no whole-file RAM copy)
+  -> SHA-256 every block and the complete byte stream
+  -> check the node's disk quota before committing
+  -> atomically place new immutable blocks in blocks/sha256/
+  -> atomically publish manifests/sha256/<artifact-id>.json
+  -> verify every block before reconstruction
+```
+
+The Agent defaults to offering at most 5% of the physical disk containing its
+artifact directory (`--artifact-storage-percent`). This is a policy ceiling,
+not reserved space: an empty cache consumes almost nothing. Import, verification,
+and export use blocking workers so hashing a large video cannot stall QUIC,
+mDNS, task progress, or resource polling.
+
+This version does not advertise or transfer blocks to peers. The next wire
+protocol will exchange manifests and missing-block inventories, request bounded
+blocks from multiple trusted providers, verify each received digest before
+commit, and resume from already-present blocks. Replication or erasure coding
+must be a separate durability policy: content addressing detects missing or
+corrupt data but does not by itself preserve a file when its only node leaves.
 
 ## Identity and trust
 

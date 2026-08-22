@@ -156,6 +156,31 @@ Both diagnostic controls are one-shot. Echo, resource polling, and other task
 types do not consume them. They affect only matrix chunks received from another
 Agent, not work coordinated locally on the same computer.
 
+## Test the v0.12 local artifact store
+
+Start Debugger and expand **Files of the swarm (CAS)**. Click **Add file** and
+choose any test file, including a video. Agent hashes it on a background worker,
+splits it into immutable 256 KiB blocks, and displays its `sha256:` content ID,
+size, block count, used storage, and quota. Select the row and click **Verify
+integrity** to reread and hash every block.
+
+Importing the same file twice should keep the same content ID and should not
+duplicate its blocks. Files with repeated identical 256 KiB regions also reuse
+those blocks. Headless commands are:
+
+```text
+artifact-status
+artifact-import C:\data\video.mp4
+artifact-list
+artifact-verify sha256:<content-id>
+artifact-export sha256:<content-id> C:\data\restored-video.mp4
+```
+
+The default quota is 5% of the physical disk that contains the artifact store.
+Change it with `--artifact-storage-percent`, from 0.1 to 25. Version 0.12.0 is
+local-only: it establishes integrity and deduplication before the following
+release adds resumable multi-peer block transfer.
+
 ## Task activity and history
 
 Version 0.10 provides a persistent-on-screen **Swarm tasks** panel. It lists work

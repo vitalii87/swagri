@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "0.11.1-alpha",
+    [string]$Version = "0.12.0-alpha",
     [string]$Configuration = "release"
 )
 
@@ -40,6 +40,9 @@ Agent package:
   Run swagri-agent.exe --name <device-name>
   Type help for commands. The persistent identity is stored under LocalAppData.
   Resource sampling defaults to 5 seconds; CPU calibration is cached after one run.
+
+Artifacts: Debugger can split files into immutable SHA-256 blocks in a local
+content-addressed store. The default disk contribution limit is 5%.
 
 Updates: both packages include swagri-updater.exe. Trust a specific Peer ID
 before receiving signed P2P updates. Debugger packages can share both Agent and

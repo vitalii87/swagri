@@ -4674,7 +4674,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "swagri-agent"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -4687,6 +4687,7 @@ dependencies = [
  "sha2",
  "swagri-core",
  "swagri-executor",
+ "swagri-storage",
  "sysinfo",
  "tokio",
  "tracing",
@@ -4695,7 +4696,7 @@ dependencies = [
 
 [[package]]
 name = "swagri-core"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "serde",
  "serde_bytes",
@@ -4704,7 +4705,7 @@ dependencies = [
 
 [[package]]
 name = "swagri-debugger"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "eframe",
@@ -4720,7 +4721,7 @@ dependencies = [
 
 [[package]]
 name = "swagri-executor"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "hex",
  "sha2",
@@ -4728,8 +4729,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "swagri-storage"
+version = "0.12.0"
+dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "swagri-updater"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "clap",

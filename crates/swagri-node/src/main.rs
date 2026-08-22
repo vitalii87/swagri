@@ -31,7 +31,8 @@ use swagri_core::{
     UpdateManifest, UpdateRequest, UpdateResponse, choose_cpu_placement, effective_cpu_score,
 };
 use swagri_executor::execute;
-use sysinfo::{Pid, ProcessesToUpdate, System};
+use swagri_storage::{ArtifactManifest, ArtifactStore, ContentId};
+use sysinfo::{Disks, Pid, ProcessesToUpdate, System};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     sync::mpsc,
@@ -104,6 +105,14 @@ struct Args {
     /// File containing the cached one-time CPU calibration.
     #[arg(long)]
     calibration: Option<PathBuf>,
+
+    /// Directory used for immutable content-addressed artifacts.
+    #[arg(long)]
+    artifact_store: Option<PathBuf>,
+
+    /// Maximum percentage of the artifact store's physical disk offered to Swagri.
+    #[arg(long, default_value_t = 5.0)]
+    artifact_storage_percent: f32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -121,6 +130,22 @@ struct Behaviour {
     updates: request_response::cbor::Behaviour<UpdateRequest, UpdateResponse>,
     identify: identify::Behaviour,
     ping: ping::Behaviour,
+}
+
+enum ArtifactCompletion {
+    Imported {
+        source: PathBuf,
+        result: Result<ArtifactManifest, String>,
+    },
+    Verified {
+        id: ContentId,
+        result: Result<ArtifactManifest, String>,
+    },
+    Exported {
+        id: ContentId,
+        destination: PathBuf,
+        result: Result<(), String>,
+    },
 }
 
 #[derive(Debug)]
@@ -480,6 +505,21 @@ async fn main() -> Result<()> {
         .calibration
         .clone()
         .unwrap_or_else(|| identity_path.with_file_name("cpu-calibration.json"));
+    let artifact_path = args
+        .artifact_store
+        .clone()
+        .unwrap_or_else(|| identity_path.with_file_name("artifacts"));
+    fs::create_dir_all(&artifact_path).with_context(|| {
+        format!(
+            "could not create artifact store at {}",
+            artifact_path.display()
+        )
+    })?;
+    let artifact_quota = disk_quota_bytes(&artifact_path, args.artifact_storage_percent)?;
+    let artifact_store = Arc::new(
+        ArtifactStore::open(&artifact_path, artifact_quota)
+            .context("could not initialize content-addressed artifact storage")?,
+    );
     let restart_arguments = restart_arguments(
         &args,
         &identity_path,
@@ -487,6 +527,7 @@ async fn main() -> Result<()> {
         &staging,
         &updater,
         &calibration_path,
+        &artifact_path,
     );
     let source = build_update_source(&keypair)?;
     let debugger_source = build_debugger_update_source(&keypair)?;
@@ -515,6 +556,8 @@ async fn main() -> Result<()> {
     let (completed_tx, mut completed_rx) = mpsc::unbounded_channel::<CompletedResponse>();
     let (local_completed_tx, mut local_completed_rx) =
         mpsc::unbounded_channel::<CompletedLocalTask>();
+    let (artifact_completed_tx, mut artifact_completed_rx) =
+        mpsc::unbounded_channel::<ArtifactCompletion>();
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut known_peers = BTreeMap::<PeerId, BTreeSet<Multiaddr>>::new();
     let mut connected_peers = BTreeSet::<PeerId>::new();
@@ -546,6 +589,7 @@ async fn main() -> Result<()> {
             &args.name,
         ],
     );
+    emit_artifact_status(&artifact_store);
     for peer in &updates.trusted {
         emit_event("UPDATE_TRUSTED", &[&peer.to_string()]);
     }
@@ -569,6 +613,8 @@ async fn main() -> Result<()> {
                             &local_completed_tx,
                             &active_tasks,
                             &debug_faults,
+                            &artifact_store,
+                            &artifact_completed_tx,
                             &mut outbound_tasks,
                             &mut matrix_jobs,
                         ) {
@@ -651,6 +697,9 @@ async fn main() -> Result<()> {
                     );
                 }
             }
+            Some(completed) = artifact_completed_rx.recv() => {
+                report_artifact_completion(completed, &artifact_store);
+            }
             _ = resource_tick.tick() => {
                 resources.refresh();
                 emit_resource_event("LOCAL_RESOURCES", &local_peer_id.to_string(), &resources.snapshot);
@@ -685,7 +734,24 @@ fn validate_resource_limits(args: &Args) -> Result<()> {
     if args.resource_poll_seconds < 2 {
         bail!("--resource-poll-seconds must be at least 2");
     }
+    if !(0.1..=25.0).contains(&args.artifact_storage_percent) {
+        bail!("--artifact-storage-percent must be between 0.1 and 25");
+    }
     Ok(())
+}
+
+fn disk_quota_bytes(path: &Path, percent: f32) -> Result<u64> {
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("could not resolve artifact store {}", path.display()))?;
+    let disks = Disks::new_with_refreshed_list();
+    let disk = disks
+        .iter()
+        .filter(|disk| canonical.starts_with(disk.mount_point()))
+        .max_by_key(|disk| disk.mount_point().components().count())
+        .with_context(|| format!("could not determine disk capacity for {}", path.display()))?;
+    let quota = (disk.total_space() as f64 * f64::from(percent) / 100.0) as u64;
+    Ok(quota.max(1024 * 1024))
 }
 
 fn default_identity_path() -> PathBuf {
@@ -868,6 +934,7 @@ fn restart_arguments(
     staging: &Path,
     updater: &Path,
     calibration: &Path,
+    artifact_store: &Path,
 ) -> Vec<String> {
     let mut result = vec![
         "--name".into(),
@@ -899,6 +966,10 @@ fn restart_arguments(
         args.resource_poll_seconds.to_string(),
         "--calibration".into(),
         calibration.to_string_lossy().into_owned(),
+        "--artifact-store".into(),
+        artifact_store.to_string_lossy().into_owned(),
+        "--artifact-storage-percent".into(),
+        args.artifact_storage_percent.to_string(),
         "--daemon".into(),
     ];
     for address in &args.dial {
@@ -1878,6 +1949,8 @@ fn handle_command(
     local_completed_tx: &mpsc::UnboundedSender<CompletedLocalTask>,
     active_tasks: &Arc<AtomicU32>,
     debug_faults: &Arc<DebugFaults>,
+    artifact_store: &Arc<ArtifactStore>,
+    artifact_completed_tx: &mpsc::UnboundedSender<ArtifactCompletion>,
     outbound_tasks: &mut HashMap<request_response::OutboundRequestId, OutboundTaskMeta>,
     matrix_jobs: &mut BTreeMap<String, DistributedMatrixJob>,
 ) -> bool {
@@ -1893,6 +1966,112 @@ fn handle_command(
         "help" => print_help(),
         "id" => println!("{local_peer_id}"),
         "peers" => print_peers(known_peers),
+        "artifact-status" => emit_artifact_status(artifact_store),
+        "artifact-list" => match artifact_store.list() {
+            Ok(manifests) => {
+                for manifest in manifests {
+                    println!(
+                        "Artifact {}: {} bytes in {} blocks",
+                        manifest.id,
+                        manifest.size,
+                        manifest.blocks.len()
+                    );
+                    emit_event(
+                        "ARTIFACT_LIST",
+                        &[
+                            &manifest.id.to_string(),
+                            &manifest.size.to_string(),
+                            &manifest.blocks.len().to_string(),
+                        ],
+                    );
+                }
+                emit_artifact_status(artifact_store);
+            }
+            Err(error) => emit_event("ARTIFACT_FAILED", &["list", &error.to_string()]),
+        },
+        "artifact-import" => {
+            let source = command_tail(line, command).map(PathBuf::from);
+            match source {
+                Some(source) if source.is_file() => {
+                    println!(
+                        "Importing artifact {} in the background...",
+                        source.display()
+                    );
+                    emit_event("ARTIFACT_STARTED", &["import", &source.to_string_lossy()]);
+                    let store = Arc::clone(artifact_store);
+                    let completed_tx = artifact_completed_tx.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let result = store.import(&source).map_err(|error| error.to_string());
+                        let _ = completed_tx.send(ArtifactCompletion::Imported { source, result });
+                    });
+                }
+                Some(source) => emit_event(
+                    "ARTIFACT_FAILED",
+                    &[
+                        "import",
+                        &format!("file does not exist: {}", source.display()),
+                    ],
+                ),
+                None => emit_event(
+                    "ARTIFACT_FAILED",
+                    &["import", "artifact-import requires a file path"],
+                ),
+            }
+        }
+        "artifact-verify" => match parts.next().map(ContentId::from_str) {
+            Some(Ok(id)) => {
+                emit_event("ARTIFACT_STARTED", &["verify", &id.to_string()]);
+                let store = Arc::clone(artifact_store);
+                let completed_tx = artifact_completed_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let result = store.verify(id).map_err(|error| error.to_string());
+                    let _ = completed_tx.send(ArtifactCompletion::Verified { id, result });
+                });
+            }
+            Some(Err(error)) => {
+                emit_event("ARTIFACT_FAILED", &["verify", &error.to_string()]);
+            }
+            None => emit_event(
+                "ARTIFACT_FAILED",
+                &["verify", "artifact-verify requires a content ID"],
+            ),
+        },
+        "artifact-export" => {
+            let parsed = command_tail(line, command).and_then(|tail| tail.split_once(' '));
+            match parsed {
+                Some((id, destination)) => match ContentId::from_str(id) {
+                    Ok(id) => {
+                        let destination = PathBuf::from(destination.trim().trim_matches('"'));
+                        emit_event(
+                            "ARTIFACT_STARTED",
+                            &["export", &destination.to_string_lossy()],
+                        );
+                        let store = Arc::clone(artifact_store);
+                        let completed_tx = artifact_completed_tx.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let result = store
+                                .export(id, &destination)
+                                .map_err(|error| error.to_string());
+                            let _ = completed_tx.send(ArtifactCompletion::Exported {
+                                id,
+                                destination,
+                                result,
+                            });
+                        });
+                    }
+                    Err(error) => {
+                        emit_event("ARTIFACT_FAILED", &["export", &error.to_string()]);
+                    }
+                },
+                None => emit_event(
+                    "ARTIFACT_FAILED",
+                    &[
+                        "export",
+                        "artifact-export requires an ID and destination path",
+                    ],
+                ),
+            }
+        }
         "trusted" => {
             if updates.trusted.is_empty() {
                 println!("No peers are trusted for updates.");
@@ -2898,12 +3077,92 @@ fn print_peers(peers: &BTreeMap<PeerId, BTreeSet<Multiaddr>>) {
     }
 }
 
+fn command_tail<'a>(line: &'a str, command: &str) -> Option<&'a str> {
+    let tail = line.strip_prefix(command)?.trim().trim_matches('"').trim();
+    (!tail.is_empty()).then_some(tail)
+}
+
+fn emit_artifact_status(store: &ArtifactStore) {
+    match store.stats() {
+        Ok(stats) => {
+            println!(
+                "Artifact store: {} artifacts, {} blocks, {} / {} bytes",
+                stats.artifacts, stats.blocks, stats.used_bytes, stats.quota_bytes
+            );
+            emit_event(
+                "ARTIFACT_STATUS",
+                &[
+                    &stats.artifacts.to_string(),
+                    &stats.blocks.to_string(),
+                    &stats.used_bytes.to_string(),
+                    &stats.quota_bytes.to_string(),
+                    &store.root().to_string_lossy(),
+                ],
+            );
+        }
+        Err(error) => emit_event("ARTIFACT_FAILED", &["status", &error.to_string()]),
+    }
+}
+
+fn report_artifact_completion(completed: ArtifactCompletion, store: &ArtifactStore) {
+    match completed {
+        ArtifactCompletion::Imported { source, result } => match result {
+            Ok(manifest) => {
+                println!(
+                    "Stored artifact {}: {} bytes in {} blocks",
+                    manifest.id,
+                    manifest.size,
+                    manifest.blocks.len()
+                );
+                emit_event(
+                    "ARTIFACT_STORED",
+                    &[
+                        &manifest.id.to_string(),
+                        &manifest.size.to_string(),
+                        &manifest.blocks.len().to_string(),
+                        &source.to_string_lossy(),
+                    ],
+                );
+            }
+            Err(error) => emit_event("ARTIFACT_FAILED", &["import", &error]),
+        },
+        ArtifactCompletion::Verified { id, result } => match result {
+            Ok(manifest) => emit_event(
+                "ARTIFACT_VERIFIED",
+                &[
+                    &id.to_string(),
+                    &manifest.size.to_string(),
+                    &manifest.blocks.len().to_string(),
+                ],
+            ),
+            Err(error) => emit_event("ARTIFACT_FAILED", &["verify", &error]),
+        },
+        ArtifactCompletion::Exported {
+            id,
+            destination,
+            result,
+        } => match result {
+            Ok(()) => emit_event(
+                "ARTIFACT_EXPORTED",
+                &[&id.to_string(), &destination.to_string_lossy()],
+            ),
+            Err(error) => emit_event("ARTIFACT_FAILED", &["export", &error]),
+        },
+    }
+    emit_artifact_status(store);
+}
+
 fn print_help() {
     println!(
         "Commands:\n\
          help                              Show this help\n\
          id                                Print this node's peer ID\n\
          peers                             List discovered or connected peers\n\
+         artifact-status                  Show local CAS usage and quota\n\
+         artifact-list                    List locally cached artifacts\n\
+         artifact-import <path>           Split, hash, verify, and cache a file\n\
+         artifact-verify <sha256:id>       Verify every cached block\n\
+         artifact-export <id> <path>       Reconstruct a verified file\n\
          trusted                           List peers trusted for updates\n\
          trust <peer-id>                   Trust a peer identity for signed updates\n\
          untrust <peer-id>                 Remove update trust\n\

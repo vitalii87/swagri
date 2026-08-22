@@ -55,7 +55,10 @@ well-characterized workload without regressing unsuitable workloads.
 - task graphs and independent chunks;
 - [x] bounded independent chunks for the first matrix workload;
 - [x] deterministic matrix result aggregation;
-- content-addressed inputs and cached artifacts;
+- [x] local content-addressed artifact cache with block deduplication and integrity checks;
+- artifact references as typed task inputs;
+- peer inventory and resumable content-addressed block exchange;
+- replication/erasure policy for artifacts that must survive node loss;
 - [x] bounded retry and reassignment of matrix chunks after request failures;
 - [x] controlled one-shot matrix failure/delay injection for recovery tests;
 - retry and reassignment after disconnects for general workloads;
