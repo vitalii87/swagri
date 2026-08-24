@@ -61,8 +61,11 @@ or cancel general workloads. Version 0.12.1 adds an explicitly trusted P2P
 artifact protocol: a node can inspect a peer's bounded inventory, fetch a
 manifest, download only missing blocks, retain verified blocks across an
 interruption, and publish the artifact only after its complete digest matches.
-The current fetch uses one selected provider; multi-source swarm selection and
-durability replication remain future steps. Swagri does not execute shell
+Version 0.13.0 discovers matching content IDs in the inventories of trusted
+Agents and fetches up to four missing blocks concurrently, rotating requests
+across as many as eight providers. A failed provider is removed without
+discarding verified blocks or stopping healthy sources. Durability replication
+remains a future step. Swagri does not execute shell
 commands, downloaded binaries, or arbitrary remote code.
 
 ## Technology
@@ -83,9 +86,11 @@ commands, downloaded binaries, or arbitrary remote code.
 - content-addressed 256 KiB artifact blocks with SHA-256 integrity, deduplication,
   atomic writes, reconstruction, and a disk quota
 - trusted peer inventory and resumable verified artifact block downloads
+- bounded four-block parallel downloads with round-robin multi-provider failover
 - runtime pause/resume of a device's Swagri contribution
 - durable local SQLite lifecycle and result history for swarm tasks
-- native Rust desktop Debugger with live logs, resource comparison, and controls
+- native Rust desktop Debugger with timestamped searchable/exportable logs,
+  resource comparison, and controls
 
 See [Architecture](docs/ARCHITECTURE.md) for the design boundaries and
 [Roadmap](docs/ROADMAP.md) for the staged research plan. Ready-made and portable
@@ -129,6 +134,7 @@ artifact-list
 artifact-verify sha256:<content-id>
 artifact-peer-list <trusted-peer-id>
 artifact-fetch <trusted-peer-id> sha256:<content-id>
+artifact-fetch-many sha256:<content-id> <trusted-peer-id> <trusted-peer-id> ...
 pause-resources
 resume-resources
 resources <peer-id>

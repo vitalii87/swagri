@@ -16,6 +16,7 @@ rfd.workspace = true
 semver.workspace = true
 webbrowser.workspace = true
 rusqlite.workspace = true
+chrono.workspace = true
 swagri-core = { path = "../swagri-core" }
 
 [dev-dependencies]

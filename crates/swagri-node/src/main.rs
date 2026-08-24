@@ -43,6 +43,8 @@ use tracing_subscriber::EnvFilter;
 
 const REMOTE_RESOURCE_MAX_AGE: Duration = Duration::from_secs(20);
 const MAX_MATRIX_CHUNK_ATTEMPTS: u8 = 3;
+const MAX_ARTIFACT_PROVIDERS: usize = 8;
+const MAX_PARALLEL_ARTIFACT_BLOCKS: usize = 4;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -182,6 +184,7 @@ struct ArtifactSummary {
     blocks: u32,
 }
 
+#[derive(Clone)]
 enum ArtifactOutbound {
     Inventory {
         peer: PeerId,
@@ -198,12 +201,49 @@ enum ArtifactOutbound {
 }
 
 struct ArtifactDownload {
-    peer: PeerId,
-    manifest: ArtifactManifest,
+    providers: Vec<PeerId>,
+    failed_providers: BTreeSet<PeerId>,
+    next_provider: usize,
+    manifest: Option<ArtifactManifest>,
     pending: VecDeque<BlockRef>,
+    in_flight: usize,
     completed: usize,
     reused: usize,
     total_missing: usize,
+}
+
+impl ArtifactDownload {
+    fn new(providers: Vec<PeerId>) -> Self {
+        Self {
+            providers,
+            failed_providers: BTreeSet::new(),
+            next_provider: 0,
+            manifest: None,
+            pending: VecDeque::new(),
+            in_flight: 0,
+            completed: 0,
+            reused: 0,
+            total_missing: 0,
+        }
+    }
+
+    fn active_provider_count(&self) -> usize {
+        self.providers
+            .iter()
+            .filter(|peer| !self.failed_providers.contains(peer))
+            .count()
+    }
+
+    fn next_active_provider(&mut self) -> Option<PeerId> {
+        for _ in 0..self.providers.len() {
+            let peer = self.providers[self.next_provider % self.providers.len()];
+            self.next_provider = (self.next_provider + 1) % self.providers.len();
+            if !self.failed_providers.contains(&peer) {
+                return Some(peer);
+            }
+        }
+        None
+    }
 }
 
 #[derive(Debug)]
@@ -684,7 +724,7 @@ async fn main() -> Result<()> {
                             &artifact_store,
                             &artifact_completed_tx,
                             &mut artifact_outbound,
-                            &artifact_downloads,
+                            &mut artifact_downloads,
                             &mut outbound_tasks,
                             &mut matrix_jobs,
                         ) {
@@ -1179,8 +1219,13 @@ fn handle_swarm_event(
             peer_resources.remove(&peer_id);
             info!(peer = %peer_id, ?cause, "peer disconnected");
             emit_event("PEER_DISCONNECTED", &[&peer_id.to_string()]);
-            artifact_outbound.retain(|_, request| artifact_request_context(request).0 != peer_id);
-            fail_artifact_downloads_from(peer_id, "peer disconnected", artifact_downloads);
+            fail_artifact_provider(
+                peer_id,
+                "peer disconnected",
+                swarm,
+                artifact_outbound,
+                artifact_downloads,
+            );
         }
         SwarmEvent::OutgoingConnectionError {
             peer_id: Some(peer_id),
@@ -1953,23 +1998,16 @@ fn handle_artifact_event(
             error,
             ..
         } => {
-            let artifact_id = outbound
-                .remove(&request_id)
-                .and_then(|request| match request {
-                    ArtifactOutbound::Manifest { id, .. } => Some(id),
-                    ArtifactOutbound::Block { artifact_id, .. } => Some(artifact_id),
-                    ArtifactOutbound::Inventory { .. } => None,
-                });
-            if let Some(id) = artifact_id {
-                downloads.remove(&id);
+            if let Some(expected) = outbound.remove(&request_id) {
+                let message = format!("request failed: {error}");
+                handle_artifact_request_failure(expected, &message, swarm, outbound, downloads);
+                fail_artifact_provider(peer, &message, swarm, outbound, downloads);
+            } else {
+                emit_event(
+                    "ARTIFACT_PEER_FAILED",
+                    &[&peer.to_string(), &format!("request failed: {error}")],
+                );
             }
-            emit_event(
-                "ARTIFACT_PEER_FAILED",
-                &[
-                    &peer.to_string(),
-                    &format!("transfer interrupted; verified blocks were retained: {error}"),
-                ],
-            );
         }
         request_response::Event::InboundFailure { peer, error, .. } => {
             warn!(%peer, %error, "inbound artifact request failed");
@@ -2041,9 +2079,12 @@ fn handle_artifact_response(
             let missing = match store.missing_blocks(&manifest) {
                 Ok(missing) => missing,
                 Err(error) => {
-                    emit_event(
-                        "ARTIFACT_PEER_FAILED",
-                        &[&peer.to_string(), &error.to_string()],
+                    handle_artifact_request_failure(
+                        ArtifactOutbound::Manifest { peer, id },
+                        &error.to_string(),
+                        swarm,
+                        outbound,
+                        downloads,
                     );
                     return;
                 }
@@ -2056,22 +2097,33 @@ fn handle_artifact_response(
                 .len();
             let reused = unique_blocks.saturating_sub(missing.len());
             if missing.is_empty() {
-                finish_artifact_download(peer, manifest, 0, reused, store);
+                let Some(mut download) = downloads.remove(&id) else {
+                    return;
+                };
+                download.manifest = Some(manifest);
+                download.reused = reused;
+                finish_artifact_download(download, store);
                 return;
             }
-            let total_missing = missing.len();
-            downloads.insert(
-                id,
-                ArtifactDownload {
-                    peer,
-                    manifest,
-                    pending: missing.into(),
-                    completed: 0,
-                    reused,
-                    total_missing,
-                },
-            );
-            request_next_artifact_block(id, swarm, outbound, downloads);
+            let Some(download) = downloads.get_mut(&id) else {
+                return;
+            };
+            download.manifest = Some(manifest);
+            download.total_missing = missing.len();
+            download.pending = missing.into();
+            download.reused = reused;
+            if download.providers.len() > 1 {
+                emit_event(
+                    "ARTIFACT_MULTI_STARTED",
+                    &[
+                        &id.to_string(),
+                        &download.providers.len().to_string(),
+                        &download.total_missing.to_string(),
+                        &download.reused.to_string(),
+                    ],
+                );
+            }
+            request_artifact_blocks(id, swarm, outbound, downloads);
         }
         (
             ArtifactOutbound::Block {
@@ -2085,17 +2137,7 @@ fn handle_artifact_response(
             let Some(download) = downloads.get_mut(&artifact_id) else {
                 return;
             };
-            if download.peer != peer {
-                downloads.remove(&artifact_id);
-                emit_event(
-                    "ARTIFACT_PEER_FAILED",
-                    &[
-                        &peer.to_string(),
-                        "artifact block came from an unexpected peer",
-                    ],
-                );
-                return;
-            }
+            download.in_flight = download.in_flight.saturating_sub(1);
             if let Err(error) = result {
                 downloads.remove(&artifact_id);
                 emit_event(
@@ -2105,48 +2147,24 @@ fn handle_artifact_response(
                 return;
             }
             download.completed += 1;
-            emit_event(
-                "ARTIFACT_PEER_PROGRESS",
-                &[
-                    &peer.to_string(),
-                    &artifact_id.to_string(),
-                    &download.completed.to_string(),
-                    &download.total_missing.to_string(),
-                    &download.reused.to_string(),
-                ],
-            );
-            if download.pending.is_empty() {
+            emit_artifact_download_progress(artifact_id, peer, download);
+            if download.pending.is_empty() && download.in_flight == 0 {
                 let download = downloads.remove(&artifact_id).expect("download exists");
-                finish_artifact_download(
-                    peer,
-                    download.manifest,
-                    download.completed,
-                    download.reused,
-                    store,
-                );
+                finish_artifact_download(download, store);
             } else {
-                request_next_artifact_block(artifact_id, swarm, outbound, downloads);
+                request_artifact_blocks(artifact_id, swarm, outbound, downloads);
             }
         }
         (expected, ArtifactResponse::Error { message }) => {
-            let (peer, artifact_id) = artifact_request_context(&expected);
-            if let Some(id) = artifact_id {
-                downloads.remove(&id);
-            }
-            emit_event("ARTIFACT_PEER_FAILED", &[&peer.to_string(), &message]);
+            let peer = artifact_request_context(&expected).0;
+            handle_artifact_request_failure(expected, &message, swarm, outbound, downloads);
+            fail_artifact_provider(peer, &message, swarm, outbound, downloads);
         }
         (expected, _) => {
-            let (peer, artifact_id) = artifact_request_context(&expected);
-            if let Some(id) = artifact_id {
-                downloads.remove(&id);
-            }
-            emit_event(
-                "ARTIFACT_PEER_FAILED",
-                &[
-                    &peer.to_string(),
-                    "artifact response did not match the request",
-                ],
-            );
+            let peer = artifact_request_context(&expected).0;
+            let message = "artifact response did not match the request";
+            handle_artifact_request_failure(expected, message, swarm, outbound, downloads);
+            fail_artifact_provider(peer, message, swarm, outbound, downloads);
         }
     }
 }
@@ -2161,82 +2179,277 @@ fn artifact_request_context(expected: &ArtifactOutbound) -> (PeerId, Option<Cont
     }
 }
 
-fn request_next_artifact_block(
+fn begin_artifact_download(
+    id: ContentId,
+    providers: Vec<PeerId>,
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    outbound: &mut HashMap<request_response::OutboundRequestId, ArtifactOutbound>,
+    downloads: &mut BTreeMap<ContentId, ArtifactDownload>,
+) {
+    downloads.insert(id, ArtifactDownload::new(providers));
+    request_artifact_manifest(id, swarm, outbound, downloads);
+}
+
+fn request_artifact_manifest(
     artifact_id: ContentId,
     swarm: &mut libp2p::Swarm<Behaviour>,
     outbound: &mut HashMap<request_response::OutboundRequestId, ArtifactOutbound>,
     downloads: &mut BTreeMap<ContentId, ArtifactDownload>,
 ) {
-    let Some(download) = downloads.get_mut(&artifact_id) else {
+    let peer = downloads
+        .get_mut(&artifact_id)
+        .and_then(ArtifactDownload::next_active_provider);
+    let Some(peer) = peer else {
+        downloads.remove(&artifact_id);
+        emit_event(
+            "ARTIFACT_PEER_FAILED",
+            &[
+                "swarm",
+                "no trusted artifact provider remains; verified blocks were retained",
+            ],
+        );
         return;
     };
-    let Some(block) = download.pending.pop_front() else {
-        return;
-    };
-    let peer = download.peer;
-    let request_id = swarm.behaviour_mut().artifacts.send_request(
-        &peer,
-        ArtifactRequest::Block {
-            block: block.clone(),
-        },
-    );
+    let request_id = swarm
+        .behaviour_mut()
+        .artifacts
+        .send_request(&peer, ArtifactRequest::Manifest { id: artifact_id });
     outbound.insert(
         request_id,
+        ArtifactOutbound::Manifest {
+            peer,
+            id: artifact_id,
+        },
+    );
+}
+
+fn request_artifact_blocks(
+    artifact_id: ContentId,
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    outbound: &mut HashMap<request_response::OutboundRequestId, ArtifactOutbound>,
+    downloads: &mut BTreeMap<ContentId, ArtifactDownload>,
+) {
+    loop {
+        let next = {
+            let Some(download) = downloads.get_mut(&artifact_id) else {
+                return;
+            };
+            if download.in_flight >= MAX_PARALLEL_ARTIFACT_BLOCKS {
+                return;
+            }
+            let Some(block) = download.pending.pop_front() else {
+                return;
+            };
+            if let Some(peer) = download.next_active_provider() {
+                download.in_flight += 1;
+                Some((peer, block))
+            } else {
+                download.pending.push_front(block);
+                None
+            }
+        };
+        let Some((peer, block)) = next else {
+            downloads.remove(&artifact_id);
+            emit_event(
+                "ARTIFACT_PEER_FAILED",
+                &[
+                    "swarm",
+                    "all artifact providers failed; verified blocks were retained for resume",
+                ],
+            );
+            return;
+        };
+        let request_id = swarm.behaviour_mut().artifacts.send_request(
+            &peer,
+            ArtifactRequest::Block {
+                block: block.clone(),
+            },
+        );
+        outbound.insert(
+            request_id,
+            ArtifactOutbound::Block {
+                peer,
+                artifact_id,
+                block,
+            },
+        );
+    }
+}
+
+fn finish_artifact_download(download: ArtifactDownload, store: &ArtifactStore) {
+    let Some(manifest) = download.manifest else {
+        emit_event(
+            "ARTIFACT_PEER_FAILED",
+            &["swarm", "artifact manifest was not received"],
+        );
+        return;
+    };
+    match store.commit_manifest(&manifest) {
+        Ok(()) => {
+            if download.providers.len() == 1 {
+                emit_event(
+                    "ARTIFACT_PEER_COMPLETE",
+                    &[
+                        &download.providers[0].to_string(),
+                        &manifest.id.to_string(),
+                        &manifest.size.to_string(),
+                        &manifest.blocks.len().to_string(),
+                        &download.completed.to_string(),
+                        &download.reused.to_string(),
+                    ],
+                );
+            } else {
+                emit_event(
+                    "ARTIFACT_MULTI_COMPLETE",
+                    &[
+                        &manifest.id.to_string(),
+                        &manifest.size.to_string(),
+                        &manifest.blocks.len().to_string(),
+                        &download.completed.to_string(),
+                        &download.reused.to_string(),
+                        &download.providers.len().to_string(),
+                    ],
+                );
+            }
+            emit_artifact_status(store);
+        }
+        Err(error) => emit_event("ARTIFACT_PEER_FAILED", &["swarm", &error.to_string()]),
+    }
+}
+
+fn emit_artifact_download_progress(
+    artifact_id: ContentId,
+    peer: PeerId,
+    download: &ArtifactDownload,
+) {
+    if download.providers.len() == 1 {
+        emit_event(
+            "ARTIFACT_PEER_PROGRESS",
+            &[
+                &peer.to_string(),
+                &artifact_id.to_string(),
+                &download.completed.to_string(),
+                &download.total_missing.to_string(),
+                &download.reused.to_string(),
+            ],
+        );
+    } else {
+        emit_event(
+            "ARTIFACT_MULTI_PROGRESS",
+            &[
+                &artifact_id.to_string(),
+                &download.completed.to_string(),
+                &download.total_missing.to_string(),
+                &download.reused.to_string(),
+                &peer.to_string(),
+                &download.active_provider_count().to_string(),
+            ],
+        );
+    }
+}
+
+fn handle_artifact_request_failure(
+    expected: ArtifactOutbound,
+    reason: &str,
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    outbound: &mut HashMap<request_response::OutboundRequestId, ArtifactOutbound>,
+    downloads: &mut BTreeMap<ContentId, ArtifactDownload>,
+) {
+    match expected {
+        ArtifactOutbound::Inventory { peer } => {
+            emit_event("ARTIFACT_PEER_FAILED", &[&peer.to_string(), reason]);
+        }
+        ArtifactOutbound::Manifest { peer, id } => {
+            let Some(download) = downloads.get_mut(&id) else {
+                return;
+            };
+            download.failed_providers.insert(peer);
+            emit_event(
+                "ARTIFACT_PROVIDER_FAILED",
+                &[
+                    &id.to_string(),
+                    &peer.to_string(),
+                    reason,
+                    &download.active_provider_count().to_string(),
+                ],
+            );
+            request_artifact_manifest(id, swarm, outbound, downloads);
+        }
         ArtifactOutbound::Block {
             peer,
             artifact_id,
             block,
-        },
-    );
-}
-
-fn finish_artifact_download(
-    peer: PeerId,
-    manifest: ArtifactManifest,
-    downloaded: usize,
-    reused: usize,
-    store: &ArtifactStore,
-) {
-    match store.commit_manifest(&manifest) {
-        Ok(()) => {
+        } => {
+            let Some(download) = downloads.get_mut(&artifact_id) else {
+                return;
+            };
+            download.in_flight = download.in_flight.saturating_sub(1);
+            download.failed_providers.insert(peer);
+            download.pending.push_back(block);
+            let active = download.active_provider_count();
             emit_event(
-                "ARTIFACT_PEER_COMPLETE",
+                "ARTIFACT_PROVIDER_FAILED",
                 &[
+                    &artifact_id.to_string(),
                     &peer.to_string(),
-                    &manifest.id.to_string(),
-                    &manifest.size.to_string(),
-                    &manifest.blocks.len().to_string(),
-                    &downloaded.to_string(),
-                    &reused.to_string(),
+                    reason,
+                    &active.to_string(),
                 ],
             );
-            emit_artifact_status(store);
+            if active == 0 {
+                downloads.remove(&artifact_id);
+                emit_event(
+                    "ARTIFACT_PEER_FAILED",
+                    &[
+                        "swarm",
+                        "all artifact providers failed; verified blocks were retained for resume",
+                    ],
+                );
+            } else {
+                request_artifact_blocks(artifact_id, swarm, outbound, downloads);
+            }
         }
-        Err(error) => emit_event(
-            "ARTIFACT_PEER_FAILED",
-            &[&peer.to_string(), &error.to_string()],
-        ),
     }
 }
 
-fn fail_artifact_downloads_from(
+fn fail_artifact_provider(
     peer: PeerId,
     reason: &str,
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    outbound: &mut HashMap<request_response::OutboundRequestId, ArtifactOutbound>,
     downloads: &mut BTreeMap<ContentId, ArtifactDownload>,
 ) {
-    let failed = downloads
+    let failed_requests = outbound
         .iter()
-        .filter_map(|(id, download)| (download.peer == peer).then_some(*id))
+        .filter(|(_, request)| artifact_request_context(request).0 == peer)
+        .map(|(request_id, request)| (*request_id, request.clone()))
         .collect::<Vec<_>>();
-    for id in failed {
-        downloads.remove(&id);
-        emit_event(
-            "ARTIFACT_PEER_FAILED",
-            &[
-                &peer.to_string(),
-                &format!("{reason}; verified blocks were retained for resume"),
-            ],
-        );
+    for (request_id, request) in failed_requests {
+        outbound.remove(&request_id);
+        handle_artifact_request_failure(request, reason, swarm, outbound, downloads);
+    }
+
+    let affected = downloads
+        .iter()
+        .filter_map(|(id, download)| download.providers.contains(&peer).then_some(*id))
+        .collect::<Vec<_>>();
+    for id in affected {
+        let Some(download) = downloads.get_mut(&id) else {
+            continue;
+        };
+        download.failed_providers.insert(peer);
+        if download.active_provider_count() == 0 {
+            downloads.remove(&id);
+            emit_event(
+                "ARTIFACT_PEER_FAILED",
+                &[
+                    "swarm",
+                    "all artifact providers disconnected; verified blocks were retained for resume",
+                ],
+            );
+        } else if download.manifest.is_some() {
+            request_artifact_blocks(id, swarm, outbound, downloads);
+        }
     }
 }
 
@@ -2398,7 +2611,7 @@ fn handle_command(
     artifact_store: &Arc<ArtifactStore>,
     artifact_completed_tx: &mpsc::UnboundedSender<ArtifactCompletion>,
     artifact_outbound: &mut HashMap<request_response::OutboundRequestId, ArtifactOutbound>,
-    artifact_downloads: &BTreeMap<ContentId, ArtifactDownload>,
+    artifact_downloads: &mut BTreeMap<ContentId, ArtifactDownload>,
     outbound_tasks: &mut HashMap<request_response::OutboundRequestId, OutboundTaskMeta>,
     matrix_jobs: &mut BTreeMap<String, DistributedMatrixJob>,
 ) -> bool {
@@ -2566,11 +2779,13 @@ fn handle_command(
                     ],
                 ),
                 Ok((peer, id)) => {
-                    let request_id = swarm
-                        .behaviour_mut()
-                        .artifacts
-                        .send_request(&peer, ArtifactRequest::Manifest { id });
-                    artifact_outbound.insert(request_id, ArtifactOutbound::Manifest { peer, id });
+                    begin_artifact_download(
+                        id,
+                        vec![peer],
+                        swarm,
+                        artifact_outbound,
+                        artifact_downloads,
+                    );
                     emit_event(
                         "ARTIFACT_PEER_STARTED",
                         &[&peer.to_string(), &id.to_string()],
@@ -2579,6 +2794,68 @@ fn handle_command(
                 Err(error) => emit_event(
                     "ARTIFACT_PEER_FAILED",
                     &["unknown", &format!("invalid fetch command: {error:#}")],
+                ),
+            }
+        }
+        "artifact-fetch-many" => {
+            let parsed = (|| -> Result<(ContentId, Vec<PeerId>)> {
+                let id = parts
+                    .next()
+                    .context("artifact-fetch-many requires a content ID")?
+                    .parse::<ContentId>()
+                    .context("invalid content ID")?;
+                let values = parts.collect::<Vec<_>>();
+                if values.len() > MAX_ARTIFACT_PROVIDERS {
+                    bail!("artifact-fetch-many accepts at most {MAX_ARTIFACT_PROVIDERS} providers");
+                }
+                let mut providers = Vec::new();
+                for value in values {
+                    let peer = PeerId::from_str(value)
+                        .with_context(|| format!("invalid provider Peer ID: {value}"))?;
+                    if !providers.contains(&peer) {
+                        providers.push(peer);
+                    }
+                }
+                if providers.is_empty() {
+                    bail!("artifact-fetch-many requires at least one provider Peer ID");
+                }
+                Ok((id, providers))
+            })();
+            match parsed {
+                Ok((id, _)) if artifact_downloads.contains_key(&id) => emit_event(
+                    "ARTIFACT_PEER_FAILED",
+                    &["swarm", "this artifact download is already active"],
+                ),
+                Ok((id, providers)) => {
+                    let untrusted = providers
+                        .iter()
+                        .find(|peer| !updates.trusted.contains(peer));
+                    if let Some(peer) = untrusted {
+                        emit_event(
+                            "ARTIFACT_PEER_FAILED",
+                            &[
+                                &peer.to_string(),
+                                "every artifact provider must be explicitly trusted",
+                            ],
+                        );
+                    } else {
+                        let count = providers.len();
+                        begin_artifact_download(
+                            id,
+                            providers,
+                            swarm,
+                            artifact_outbound,
+                            artifact_downloads,
+                        );
+                        emit_event(
+                            "ARTIFACT_MULTI_REQUESTED",
+                            &[&id.to_string(), &count.to_string()],
+                        );
+                    }
+                }
+                Err(error) => emit_event(
+                    "ARTIFACT_PEER_FAILED",
+                    &["swarm", &format!("invalid multi-provider fetch: {error:#}")],
                 ),
             }
         }
@@ -3675,6 +3952,7 @@ fn print_help() {
          artifact-export <id> <path>       Reconstruct a verified file\n\
          artifact-peer-list <peer-id>      List artifacts shared by a trusted peer\n\
          artifact-fetch <peer-id> <id>     Resume-download missing verified blocks\n\
+         artifact-fetch-many <id> <peers>  Parallel resume-download from up to 8 providers\n\
          trusted                           List peers trusted for updates\n\
          trust <peer-id>                   Trust a peer for updates and artifacts\n\
          untrust <peer-id>                 Remove update and artifact trust\n\
@@ -3795,6 +4073,32 @@ mod tests {
         assert_eq!(protocol_hint_for_version("0.9.0"), 3);
         assert_eq!(protocol_hint_for_version("0.10.0"), NODE_PROTOCOL_VERSION);
         assert_eq!(protocol_hint_for_version("invalid"), 2);
+    }
+
+    #[test]
+    fn artifact_providers_are_selected_round_robin() {
+        let first = PeerId::from(identity::Keypair::generate_ed25519().public());
+        let second = PeerId::from(identity::Keypair::generate_ed25519().public());
+        let third = PeerId::from(identity::Keypair::generate_ed25519().public());
+        let mut download = ArtifactDownload::new(vec![first, second, third]);
+
+        assert_eq!(download.next_active_provider(), Some(first));
+        assert_eq!(download.next_active_provider(), Some(second));
+        assert_eq!(download.next_active_provider(), Some(third));
+        assert_eq!(download.next_active_provider(), Some(first));
+    }
+
+    #[test]
+    fn failed_artifact_provider_is_skipped_without_losing_others() {
+        let failed = PeerId::from(identity::Keypair::generate_ed25519().public());
+        let healthy = PeerId::from(identity::Keypair::generate_ed25519().public());
+        let mut download = ArtifactDownload::new(vec![failed, healthy]);
+        download.failed_providers.insert(failed);
+
+        assert_eq!(download.active_provider_count(), 1);
+        for _ in 0..8 {
+            assert_eq!(download.next_active_provider(), Some(healthy));
+        }
     }
 
     #[test]

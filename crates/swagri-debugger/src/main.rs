@@ -12,6 +12,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use chrono::Local;
 use eframe::egui::{self, Color32, RichText};
 use egui_plot::{Line, Plot, PlotPoints};
 use rusqlite::{Connection, params};
@@ -23,7 +24,86 @@ const MAX_LOG_LINES: usize = 2_000;
 const MAX_METRIC_SAMPLES: usize = 240;
 const MAX_TASK_HISTORY: usize = 100;
 const MAX_PERSISTED_TASKS: usize = 1_000;
+const MAX_ARTIFACT_PROVIDERS: usize = 8;
 const DOWNLOADS_URL: &str = "https://github.com/vitalii87/swagri/actions/workflows/packages.yml";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LogLevel {
+    Info,
+    Event,
+    Warning,
+    Error,
+}
+
+impl LogLevel {
+    const ALL: [Self; 4] = [Self::Info, Self::Event, Self::Warning, Self::Error];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Info => "INFO",
+            Self::Event => "EVENT",
+            Self::Warning => "WARN",
+            Self::Error => "ERROR",
+        }
+    }
+
+    fn color(self) -> Color32 {
+        match self {
+            Self::Info => Color32::LIGHT_GRAY,
+            Self::Event => Color32::from_rgb(95, 190, 255),
+            Self::Warning => Color32::from_rgb(255, 190, 70),
+            Self::Error => Color32::from_rgb(240, 90, 80),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LogSource {
+    Agent,
+    Debugger,
+    Command,
+}
+
+impl LogSource {
+    const ALL: [Self; 3] = [Self::Agent, Self::Debugger, Self::Command];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Agent => "AGENT",
+            Self::Debugger => "GUI",
+            Self::Command => "CMD",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct LogEntry {
+    timestamp: String,
+    level: LogLevel,
+    source: LogSource,
+    message: String,
+}
+
+impl LogEntry {
+    fn new(level: LogLevel, source: LogSource, message: impl Into<String>) -> Self {
+        Self {
+            timestamp: Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string(),
+            level,
+            source,
+            message: message.into(),
+        }
+    }
+
+    fn formatted(&self) -> String {
+        format!(
+            "{} {:<5} {:<5} {}",
+            self.timestamp,
+            self.level.label(),
+            self.source.label(),
+            self.message
+        )
+    }
+}
 
 fn main() -> eframe::Result {
     if std::env::args_os().skip(1).any(|argument| {
@@ -341,7 +421,11 @@ struct DebuggerApp {
     listen_address: String,
     dial_address: String,
     command: String,
-    logs: VecDeque<String>,
+    logs: VecDeque<LogEntry>,
+    log_query: String,
+    log_level_filter: Option<LogLevel>,
+    log_source_filter: Option<LogSource>,
+    log_auto_scroll: bool,
     notices: VecDeque<String>,
     output_tx: Sender<String>,
     output_rx: Receiver<String>,
@@ -419,6 +503,10 @@ impl DebuggerApp {
             dial_address: String::new(),
             command: String::new(),
             logs: VecDeque::new(),
+            log_query: String::new(),
+            log_level_filter: None,
+            log_source_filter: None,
+            log_auto_scroll: true,
             notices,
             output_tx,
             output_rx,
@@ -515,6 +603,11 @@ impl DebuggerApp {
     fn send(&mut self, command: impl Into<String>) {
         let command = command.into();
         if let Some(agent) = self.agent.as_mut() {
+            push_bounded(
+                &mut self.logs,
+                LogEntry::new(LogLevel::Info, LogSource::Command, format!("> {command}")),
+                MAX_LOG_LINES,
+            );
             if let Err(error) = agent.send(&command) {
                 self.notice(format!("Помилка команди: {error:#}"));
             }
@@ -637,6 +730,26 @@ impl DebuggerApp {
         }
     }
 
+    fn refresh_all_trusted_peer_artifacts(&mut self) {
+        let peers = self
+            .peers
+            .iter()
+            .filter(|(_, view)| view.trusted_for_updates && view.state == PeerState::Connected)
+            .map(|(peer, _)| peer.clone())
+            .collect::<Vec<_>>();
+        if peers.is_empty() {
+            self.notice("Немає підключених довірених агентів. Спочатку встановіть взаємну довіру.");
+            return;
+        }
+        for peer in &peers {
+            self.send(format!("artifact-peer-list {peer}"));
+        }
+        self.notice(format!(
+            "Запитуємо CAS-каталоги у {} довірених агентів…",
+            peers.len()
+        ));
+    }
+
     fn fetch_selected_remote_artifact(&mut self) {
         let selected = self.selected_remote_artifact.clone().or_else(|| {
             self.remote_artifacts
@@ -644,12 +757,36 @@ impl DebuggerApp {
                 .map(|artifact| (artifact.peer.clone(), artifact.id.clone()))
         });
         if let Some((peer, id)) = selected {
-            self.send(format!("artifact-fetch {peer} {id}"));
-            self.notice(format!(
-                "Докачуємо відсутні блоки {} з {}…",
-                short_content_id(&id),
-                short_peer(&peer)
-            ));
+            let mut providers = self
+                .remote_artifacts
+                .iter()
+                .filter(|artifact| artifact.id == id)
+                .map(|artifact| artifact.peer.clone())
+                .filter(|candidate| {
+                    self.peers.get(candidate).is_some_and(|view| {
+                        view.trusted_for_updates && view.state == PeerState::Connected
+                    })
+                })
+                .collect::<Vec<_>>();
+            providers.sort();
+            providers.dedup();
+            providers.truncate(MAX_ARTIFACT_PROVIDERS);
+            if providers.len() > 1 {
+                let command = format!("artifact-fetch-many {id} {}", providers.join(" "));
+                self.send(command);
+                self.notice(format!(
+                    "Паралельно докачуємо {} з {} джерел (до 4 блоків одночасно)…",
+                    short_content_id(&id),
+                    providers.len()
+                ));
+            } else {
+                self.send(format!("artifact-fetch {peer} {id}"));
+                self.notice(format!(
+                    "Докачуємо відсутні блоки {} з {}…",
+                    short_content_id(&id),
+                    short_peer(&peer)
+                ));
+            }
         } else {
             self.notice("Спочатку оновіть список файлів вибраного peer.");
         }
@@ -858,8 +995,13 @@ impl DebuggerApp {
 
     fn poll_agent(&mut self) {
         while let Ok(line) = self.output_rx.try_recv() {
-            self.handle_output(&line);
-            push_bounded(&mut self.logs, line, MAX_LOG_LINES);
+            let clean = strip_ansi_codes(&line);
+            self.handle_output(&clean);
+            push_bounded(
+                &mut self.logs,
+                LogEntry::new(classify_agent_log(&clean), LogSource::Agent, clean),
+                MAX_LOG_LINES,
+            );
         }
 
         let exit = self
@@ -1281,6 +1423,81 @@ impl DebuggerApp {
                     short_content_id(id), downloaded, reused
                 ));
             }
+            ["ARTIFACT_MULTI_REQUESTED", id, providers, ..] => {
+                self.notice(format!(
+                    "Ройове завантаження {} запущено з {} джерел.",
+                    short_content_id(id),
+                    providers
+                ));
+            }
+            ["ARTIFACT_MULTI_STARTED", id, providers, missing, reused, ..] => {
+                self.notice(format!(
+                    "Manifest {} узгоджено: джерел {}, треба блоків {}, уже в кеші {}.",
+                    short_content_id(id),
+                    providers,
+                    missing,
+                    reused
+                ));
+            }
+            [
+                "ARTIFACT_MULTI_PROGRESS",
+                id,
+                completed,
+                total,
+                reused,
+                _peer,
+                _active,
+                ..,
+            ] => {
+                if let (Ok(completed), Ok(total), Ok(reused)) =
+                    (completed.parse(), total.parse(), reused.parse())
+                {
+                    for artifact in self
+                        .remote_artifacts
+                        .iter_mut()
+                        .filter(|artifact| artifact.id == *id)
+                    {
+                        artifact.progress = Some((completed, total, reused));
+                    }
+                }
+            }
+            [
+                "ARTIFACT_MULTI_COMPLETE",
+                id,
+                size,
+                blocks,
+                downloaded,
+                reused,
+                providers,
+                ..,
+            ] => {
+                if let (Ok(size), Ok(blocks)) = (size.parse(), blocks.parse()) {
+                    upsert_artifact(
+                        &mut self.artifacts,
+                        ArtifactView {
+                            id: (*id).into(),
+                            size,
+                            blocks,
+                            source: Some(format!("P2P swarm: {providers} providers")),
+                            verified: true,
+                        },
+                    );
+                    self.selected_artifact = Some((*id).into());
+                }
+                self.notice(format!(
+                    "Ройовий файл {} готовий: джерел {}, отримано блоків {}, кешовано {}. Повний SHA-256 підтверджено.",
+                    short_content_id(id), providers, downloaded, reused
+                ));
+            }
+            ["ARTIFACT_PROVIDER_FAILED", id, peer, error, active, ..] => {
+                self.notice(format!(
+                    "Джерело {} відпало під час {}: {}. Активних джерел залишилось {}.",
+                    short_peer(peer),
+                    short_content_id(id),
+                    error,
+                    active
+                ));
+            }
             ["ARTIFACT_PEER_FAILED", peer, error, ..] => {
                 self.notice(format!("P2P CAS {}: {}", short_peer(peer), error));
             }
@@ -1417,7 +1634,156 @@ impl DebuggerApp {
     }
 
     fn notice(&mut self, message: impl Into<String>) {
-        push_bounded(&mut self.notices, message.into(), 100);
+        let message = message.into();
+        let level = classify_debugger_log(&message);
+        push_bounded(
+            &mut self.logs,
+            LogEntry::new(level, LogSource::Debugger, message.clone()),
+            MAX_LOG_LINES,
+        );
+        push_bounded(&mut self.notices, message, 100);
+    }
+
+    fn log_matches(&self, entry: &LogEntry) -> bool {
+        let level_matches = self
+            .log_level_filter
+            .is_none_or(|level| entry.level == level);
+        let source_matches = self
+            .log_source_filter
+            .is_none_or(|source| entry.source == source);
+        let query = self.log_query.trim().to_lowercase();
+        let query_matches = query.is_empty()
+            || entry.message.to_lowercase().contains(&query)
+            || entry.level.label().to_lowercase().contains(&query)
+            || entry.source.label().to_lowercase().contains(&query);
+        level_matches && source_matches && query_matches
+    }
+
+    fn filtered_log_text(&self) -> String {
+        self.logs
+            .iter()
+            .filter(|entry| self.log_matches(entry))
+            .map(LogEntry::formatted)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn save_filtered_log(&mut self) {
+        let suggested = format!(
+            "swagri-debugger-{}.log",
+            Local::now().format("%Y%m%d-%H%M%S")
+        );
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name(&suggested)
+            .add_filter("Swagri log", &["log", "txt"])
+            .save_file()
+        else {
+            return;
+        };
+        let text = self.filtered_log_text();
+        match fs::write(&path, text) {
+            Ok(()) => self.notice(format!("Журнал збережено: {}", path.display())),
+            Err(error) => self.notice(format!(
+                "Не вдалося зберегти журнал у {}: {error}",
+                path.display()
+            )),
+        }
+    }
+
+    fn draw_log_panel(&mut self, ui: &mut egui::Ui) {
+        let total = self.logs.len();
+        let visible = self
+            .logs
+            .iter()
+            .filter(|entry| self.log_matches(entry))
+            .count();
+        let errors = self
+            .logs
+            .iter()
+            .filter(|entry| entry.level == LogLevel::Error)
+            .count();
+        let warnings = self
+            .logs
+            .iter()
+            .filter(|entry| entry.level == LogLevel::Warning)
+            .count();
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Журнал Agent / Debugger").strong());
+            ui.small(format!(
+                "показано {visible}/{total} · попереджень {warnings} · помилок {errors}"
+            ));
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Пошук:");
+            ui.add_sized(
+                [220.0, 24.0],
+                egui::TextEdit::singleline(&mut self.log_query)
+                    .hint_text("peer, task, artifact, error…"),
+            );
+            egui::ComboBox::from_id_salt("log_level_filter")
+                .selected_text(self.log_level_filter.map_or("Усі рівні", LogLevel::label))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.log_level_filter, None, "Усі рівні");
+                    for level in LogLevel::ALL {
+                        ui.selectable_value(&mut self.log_level_filter, Some(level), level.label());
+                    }
+                });
+            egui::ComboBox::from_id_salt("log_source_filter")
+                .selected_text(
+                    self.log_source_filter
+                        .map_or("Усі джерела", LogSource::label),
+                )
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.log_source_filter, None, "Усі джерела");
+                    for source in LogSource::ALL {
+                        ui.selectable_value(
+                            &mut self.log_source_filter,
+                            Some(source),
+                            source.label(),
+                        );
+                    }
+                });
+            ui.checkbox(&mut self.log_auto_scroll, "Стежити за новими");
+        });
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Скопіювати видимі").clicked() {
+                ui.ctx().copy_text(self.filtered_log_text());
+                self.notice(format!("Скопійовано рядків журналу: {visible}."));
+            }
+            if ui.button("Зберегти видимі…").clicked() {
+                self.save_filtered_log();
+            }
+            if ui.button("Скинути фільтри").clicked() {
+                self.log_query.clear();
+                self.log_level_filter = None;
+                self.log_source_filter = None;
+            }
+            if ui
+                .add_enabled(total > 0, egui::Button::new("Очистити журнал"))
+                .clicked()
+            {
+                self.logs.clear();
+                self.notice("Журнал очищено користувачем.");
+            }
+            ui.small(format!(
+                "У пам’яті зберігаються останні {MAX_LOG_LINES} рядків."
+            ));
+        });
+
+        egui::ScrollArea::vertical()
+            .id_salt("agent_log")
+            .stick_to_bottom(self.log_auto_scroll)
+            .max_height(310.0)
+            .show(ui, |ui| {
+                for entry in self.logs.iter().filter(|entry| self.log_matches(entry)) {
+                    ui.monospace(
+                        RichText::new(entry.formatted())
+                            .color(entry.level.color())
+                            .size(11.5),
+                    );
+                }
+            });
     }
 
     fn persist_task(&mut self, task: &TaskView) {
@@ -1960,11 +2326,26 @@ impl DebuggerApp {
                 }
                 if ui
                     .add_enabled(
-                        self.agent.is_some() && !self.remote_artifacts.is_empty(),
-                        egui::Button::new("⇩ Докачати вибраний файл"),
+                        self.agent.is_some()
+                            && self.peers.values().any(|peer| {
+                                peer.trusted_for_updates && peer.state == PeerState::Connected
+                            }),
+                        egui::Button::new("⌕ Файли всіх довірених"),
                     )
                     .on_hover_text(
-                        "Завантажити лише відсутні блоки; вже перевірені блоки залишаються після обриву",
+                        "Оновити каталоги всіх підключених довірених агентів, щоб знайти кілька джерел одного файла",
+                    )
+                    .clicked()
+                {
+                    self.refresh_all_trusted_peer_artifacts();
+                }
+                if ui
+                    .add_enabled(
+                        self.agent.is_some() && !self.remote_artifacts.is_empty(),
+                        egui::Button::new("⇩ Докачати з доступних джерел"),
+                    )
+                    .on_hover_text(
+                        "Якщо однаковий Content ID знайдено на кількох довірених агентах, блоки завантажуються паралельно з усіх них",
                     )
                     .clicked()
                 {
@@ -1990,7 +2371,7 @@ impl DebuggerApp {
                 ui.label("Статистика сховища з’явиться після запуску Agent.");
             }
             ui.small(
-                "v0.12.1: довірені агенти обмінюються manifest і відсутніми SHA-256 блоками. Після обриву перевірені блоки використовуються повторно.",
+                "v0.13.0: до 4 блоків завантажуються паралельно з доступних довірених джерел; відмова одного джерела не скасовує решту передачі.",
             );
 
             if !self.artifacts.is_empty() {
@@ -2282,15 +2663,7 @@ impl DebuggerApp {
         ui.checkbox(&mut self.show_raw_console, "Показати технічний термінал");
 
         if self.show_raw_console {
-            egui::ScrollArea::vertical()
-                .id_salt("agent_log")
-                .stick_to_bottom(true)
-                .max_height(210.0)
-                .show(ui, |ui| {
-                    for line in &self.logs {
-                        ui.monospace(line);
-                    }
-                });
+            self.draw_log_panel(ui);
             ui.horizontal(|ui| {
                 let width = (ui.available_width() - 80.0).max(100.0);
                 let response = ui.add_sized(
@@ -2789,6 +3162,89 @@ fn is_newer(candidate: &str, current: &str) -> bool {
     }
 }
 
+fn classify_agent_log(line: &str) -> LogLevel {
+    let uppercase = line.to_ascii_uppercase();
+    if uppercase.contains("ERROR")
+        || uppercase.contains("FAILED")
+        || uppercase.contains("REJECTED")
+        || uppercase.contains("PANIC")
+    {
+        LogLevel::Error
+    } else if uppercase.contains("WARN")
+        || uppercase.contains("DISCONNECTED")
+        || uppercase.contains("INTERRUPTED")
+        || uppercase.contains("TIMEOUT")
+    {
+        LogLevel::Warning
+    } else if line.starts_with("SWAGRI_EVENT\t") {
+        LogLevel::Event
+    } else {
+        LogLevel::Info
+    }
+}
+
+fn classify_debugger_log(message: &str) -> LogLevel {
+    let lowercase = message.to_lowercase();
+    if lowercase.contains("помил") || lowercase.contains("не вдалося") {
+        LogLevel::Error
+    } else if lowercase.contains("перерван")
+        || lowercase.contains("зупинено")
+        || lowercase.contains("недоступ")
+    {
+        LogLevel::Warning
+    } else {
+        LogLevel::Info
+    }
+}
+
+fn strip_ansi_codes(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut result = String::with_capacity(value.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != 0x1b {
+            let character = value[index..]
+                .chars()
+                .next()
+                .expect("index points to a character boundary");
+            result.push(character);
+            index += character.len_utf8();
+            continue;
+        }
+
+        index += 1;
+        match bytes.get(index).copied() {
+            Some(b'[') => {
+                index += 1;
+                while index < bytes.len() {
+                    let byte = bytes[index];
+                    index += 1;
+                    if (0x40..=0x7e).contains(&byte) {
+                        break;
+                    }
+                }
+            }
+            Some(b']') => {
+                index += 1;
+                while index < bytes.len() {
+                    if bytes[index] == 0x07 {
+                        index += 1;
+                        break;
+                    }
+                    if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'\\') {
+                        index += 2;
+                        break;
+                    }
+                    index += 1;
+                }
+            }
+            Some(_) => index += 1,
+            None => {}
+        }
+    }
+    result
+}
+
 fn push_bounded<T>(items: &mut VecDeque<T>, item: T, limit: usize) {
     if items.len() == limit {
         items.pop_front();
@@ -2818,6 +3274,34 @@ mod tests {
     fn detects_newer_semantic_version() {
         assert!(is_newer("0.2.0", "0.1.0"));
         assert!(!is_newer("0.1.0", "0.2.0"));
+    }
+
+    #[test]
+    fn strips_terminal_escape_sequences_from_logs() {
+        assert_eq!(
+            strip_ansi_codes("\u{1b}[2m2026-08-24\u{1b}[0m INFO ready"),
+            "2026-08-24 INFO ready"
+        );
+        assert_eq!(
+            strip_ansi_codes("before\u{1b}]0;title\u{7}after"),
+            "beforeafter"
+        );
+    }
+
+    #[test]
+    fn classifies_structured_log_levels() {
+        assert_eq!(
+            classify_agent_log("SWAGRI_EVENT\tPEER_CONNECTED\tpeer"),
+            LogLevel::Event
+        );
+        assert_eq!(
+            classify_agent_log("SWAGRI_EVENT\tARTIFACT_PEER_FAILED\tpeer"),
+            LogLevel::Error
+        );
+        assert_eq!(
+            classify_agent_log("WARN connection lost"),
+            LogLevel::Warning
+        );
     }
 
     #[test]

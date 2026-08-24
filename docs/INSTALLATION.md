@@ -196,7 +196,27 @@ block transfer on top of it.
 To test resume, use a sufficiently large file, stop A during transfer, reconnect,
 and repeat the inventory/fetch action. B retains verified blocks from the first
 attempt and reports them as reused. Version 0.12.1 downloads from one selected
-trusted Agent; multi-provider parallelism is the following development step.
+trusted Agent.
+
+### Test multi-provider artifact transfer in v0.13.0
+
+1. Run Debugger 0.13.0 on three computers, connect the Agents, and establish
+   explicit mutual trust between the receiving computer and both providers.
+2. Add the same file on provider A and provider B. Its Content ID must match on
+   both machines.
+3. On the receiver click **Files of all trusted peers**. Select either row for
+   the shared Content ID and click **Resume from available sources**.
+4. The receiver requests up to four blocks concurrently and rotates them across
+   the available providers. The log records the provider used for each progress
+   event and reports if a source drops out.
+5. Stop one provider during a sufficiently large transfer. The remaining
+   provider continues; verified blocks are not discarded. The final artifact is
+   published only after its complete SHA-256 digest passes.
+
+The technical terminal in Debugger 0.13.0 timestamps every Agent, GUI, and
+command entry to milliseconds. It provides level/source filters, text search,
+follow/pause scrolling, copy, export to `.log`, and bounded clearing. ANSI
+terminal control sequences are removed before display and export.
 
 ## Task activity and history
 

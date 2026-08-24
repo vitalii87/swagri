@@ -58,7 +58,7 @@ well-characterized workload without regressing unsuitable workloads.
 - [x] local content-addressed artifact cache with block deduplication and integrity checks;
 - artifact references as typed task inputs;
 - [x] trusted peer inventory and resumable content-addressed block exchange;
-- multi-provider block selection and bounded parallel transfers;
+- [x] multi-provider block selection and bounded parallel transfers;
 - replication/erasure policy for artifacts that must survive node loss;
 - [x] bounded retry and reassignment of matrix chunks after request failures;
 - [x] controlled one-shot matrix failure/delay injection for recovery tests;

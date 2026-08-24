@@ -161,9 +161,14 @@ each SHA-256 digest before committing it, and publishes the manifest only after
 the reconstructed whole-file digest matches. If the connection drops, verified
 blocks remain in CAS and the next fetch skips them.
 
-The current scheduler uses one explicitly selected provider. The next iteration
-will discover all providers for a content ID and request bounded blocks from
-several peers in parallel. Replication or erasure coding
+Version 0.13.0 can combine inventories from explicitly trusted peers, select up
+to eight providers for one content ID, and keep up to four block requests in
+flight. Providers are selected round-robin. A request failure or disconnect
+removes that provider from the active set, requeues its unfinished block, and
+continues with healthy providers; every accepted block and the complete artifact
+still pass the same SHA-256 boundary as a single-source transfer.
+
+Replication or erasure coding
 must be a separate durability policy: content addressing detects missing or
 corrupt data but does not by itself preserve a file when its only node leaves.
 
