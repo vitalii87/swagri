@@ -2277,14 +2277,14 @@ fn request_artifact_blocks(
 }
 
 fn finish_artifact_download(download: ArtifactDownload, store: &ArtifactStore) {
-    let Some(manifest) = download.manifest else {
+    let Some(ref manifest) = download.manifest else {
         emit_event(
             "ARTIFACT_PEER_FAILED",
             &["swarm", "artifact manifest was not received"],
         );
         return;
     };
-    match store.commit_manifest(&manifest) {
+    match store.commit_manifest(manifest) {
         Ok(()) => {
             if download.providers.len() == 1 {
                 emit_event(
