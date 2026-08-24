@@ -1987,7 +1987,7 @@ fn handle_artifact_event(
             ..
         } => {
             let Some(expected) = outbound.remove(&request_id) else {
-                warn!(%peer, ?request_id, "ignored unsolicited artifact response");
+                debug!(%peer, ?request_id, "ignored late artifact response after provider failover");
                 return;
             };
             handle_artifact_response(response, expected, swarm, store, outbound, downloads);
@@ -2308,6 +2308,7 @@ fn finish_artifact_download(download: ArtifactDownload, store: &ArtifactStore) {
                         &download.completed.to_string(),
                         &download.reused.to_string(),
                         &download.providers.len().to_string(),
+                        &download.active_provider_count().to_string(),
                     ],
                 );
             }
@@ -2363,16 +2364,17 @@ fn handle_artifact_request_failure(
             let Some(download) = downloads.get_mut(&id) else {
                 return;
             };
-            download.failed_providers.insert(peer);
-            emit_event(
-                "ARTIFACT_PROVIDER_FAILED",
-                &[
-                    &id.to_string(),
-                    &peer.to_string(),
-                    reason,
-                    &download.active_provider_count().to_string(),
-                ],
-            );
+            if download.failed_providers.insert(peer) {
+                emit_event(
+                    "ARTIFACT_PROVIDER_FAILED",
+                    &[
+                        &id.to_string(),
+                        &peer.to_string(),
+                        reason,
+                        &download.active_provider_count().to_string(),
+                    ],
+                );
+            }
             request_artifact_manifest(id, swarm, outbound, downloads);
         }
         ArtifactOutbound::Block {
@@ -2384,18 +2386,20 @@ fn handle_artifact_request_failure(
                 return;
             };
             download.in_flight = download.in_flight.saturating_sub(1);
-            download.failed_providers.insert(peer);
+            let newly_failed = download.failed_providers.insert(peer);
             download.pending.push_back(block);
             let active = download.active_provider_count();
-            emit_event(
-                "ARTIFACT_PROVIDER_FAILED",
-                &[
-                    &artifact_id.to_string(),
-                    &peer.to_string(),
-                    reason,
-                    &active.to_string(),
-                ],
-            );
+            if newly_failed {
+                emit_event(
+                    "ARTIFACT_PROVIDER_FAILED",
+                    &[
+                        &artifact_id.to_string(),
+                        &peer.to_string(),
+                        reason,
+                        &active.to_string(),
+                    ],
+                );
+            }
             if active == 0 {
                 downloads.remove(&artifact_id);
                 emit_event(

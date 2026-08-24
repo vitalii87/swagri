@@ -1469,6 +1469,7 @@ impl DebuggerApp {
                 downloaded,
                 reused,
                 providers,
+                active,
                 ..,
             ] => {
                 if let (Ok(size), Ok(blocks)) = (size.parse(), blocks.parse()) {
@@ -1478,15 +1479,17 @@ impl DebuggerApp {
                             id: (*id).into(),
                             size,
                             blocks,
-                            source: Some(format!("P2P swarm: {providers} providers")),
+                            source: Some(format!(
+                                "P2P swarm: {active}/{providers} providers completed"
+                            )),
                             verified: true,
                         },
                     );
                     self.selected_artifact = Some((*id).into());
                 }
                 self.notice(format!(
-                    "Ройовий файл {} готовий: джерел {}, отримано блоків {}, кешовано {}. Повний SHA-256 підтверджено.",
-                    short_content_id(id), providers, downloaded, reused
+                    "Ройовий файл {} готовий: активних джерел {}/{}, отримано блоків {}, кешовано {}. Повний SHA-256 підтверджено.",
+                    short_content_id(id), active, providers, downloaded, reused
                 ));
             }
             ["ARTIFACT_PROVIDER_FAILED", id, peer, error, active, ..] => {
