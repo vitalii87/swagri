@@ -78,7 +78,16 @@ only after every block and the complete artifact digest pass verification.
 ### `swagri-node`
 
 Owns peer identity, discovery, transport, request/response coordination, and
-the interactive CLI.
+the interactive CLI. Since 0.14.0-alpha it builds both an `rlib` and Android
+`cdylib`; the CLI and Android foreground host feed commands into the same event
+loop instead of maintaining separate protocol implementations.
+
+### `android`
+
+Owns only Android lifecycle and presentation concerns: foreground-service
+activation, notification, mDNS multicast access, battery/thermal/network
+sampling, user settings, and JNI calls. It must not reimplement trust,
+transport, task validation, or artifact integrity in Kotlin.
 
 ## Request lifecycle
 
@@ -224,8 +233,23 @@ remaining owner-configured memory budget. The operator can pause contribution
 at runtime: the Agent advertises zero effective CPU and allocatable memory and
 rejects new compute requests while continuing to answer resource/version
 queries. Already-running work is allowed to finish. These limits are scheduler
-signals, not OS-enforced hard quotas yet. Temperature, accelerators, network
-quality, energy state, and workload-specific benchmarks remain planned inputs.
+signals, not OS-enforced hard quotas yet. Android 0.14.0-alpha appends battery
+percentage, charging state, simplified thermal status, and unmetered-network
+state as optional backward-compatible fields. Mobile contribution defaults to
+paused unless the device is charging, has at least 50% battery, uses unmetered
+Wi-Fi, and remains below severe thermal status. Desktop temperature,
+accelerators, network-quality measurements, and workload-specific benchmarks
+remain planned inputs.
+
+## Android lifecycle boundary
+
+Android is treated as an intermittent edge node, not an always-on daemon. The
+owner explicitly starts a foreground contribution session, Android displays a
+persistent notification, and the initial host bounds one session below six
+hours. The Rust node retains verified artifact blocks and the existing matrix
+retry logic tolerates lifecycle-driven disappearance. P2P self-update serving
+is disabled on Android: a later signed APK flow must still hand installation to
+the operating system and user.
 
 ## Adaptive scheduling direction
 

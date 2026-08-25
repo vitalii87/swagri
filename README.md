@@ -65,7 +65,12 @@ Version 0.13.0 discovers matching content IDs in the inventories of trusted
 Agents and fetches up to four missing blocks concurrently, rotating requests
 across as many as eight providers. A failed provider is removed without
 discarding verified blocks or stopping healthy sources. Durability replication
-remains a future step. Swagri does not execute shell
+remains a future step. Version 0.14.0-alpha begins the heterogeneous mobile
+stage: the Agent is now also a reusable Rust library, and an Android arm64 app
+can run the same identity, QUIC, typed-task, resource, trust, and artifact
+protocol inside an explicitly started foreground session. Mobile snapshots add
+battery, charging, thermal, and unmetered-network signals; conservative policy
+pauses contribution outside safe conditions. Swagri does not execute shell
 commands, downloaded binaries, or arbitrary remote code.
 
 ## Technology
@@ -91,10 +96,12 @@ commands, downloaded binaries, or arbitrary remote code.
 - durable local SQLite lifecycle and result history for swarm tasks
 - native Rust desktop Debugger with timestamped searchable/exportable logs,
   resource comparison, and controls
+- Android arm64 test Agent with a Kotlin control surface, foreground lifecycle,
+  mobile resource policy, peer controls, artifact import, and timestamped logs
 
 See [Architecture](docs/ARCHITECTURE.md) for the design boundaries and
-[Roadmap](docs/ROADMAP.md) for the staged research plan. Ready-made and portable
-Windows packages are described in [Installation](docs/INSTALLATION.md).
+[Roadmap](docs/ROADMAP.md) for the staged research plan. Windows packages and
+the Android test APK are described in [Installation](docs/INSTALLATION.md).
 
 ## Quick start
 
@@ -160,6 +167,7 @@ crates/
 ├── swagri-node/       Lightweight P2P Agent implementation
 ├── swagri-debugger/   Desktop test console and host telemetry
 └── swagri-updater/    Atomic Agent replacement and rollback helper
+android/               Kotlin UI and foreground host for the Rust Agent library
 ```
 
 ## Safety

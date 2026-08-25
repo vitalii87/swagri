@@ -71,6 +71,18 @@ pub struct ResourceSnapshot {
     pub effective_cpu_score: f64,
     #[serde(default)]
     pub contribution_paused: bool,
+    /// Mobile battery level when the platform exposes it.
+    #[serde(default)]
+    pub battery_percent: Option<u8>,
+    /// Whether a mobile node is connected to external power.
+    #[serde(default)]
+    pub charging: Option<bool>,
+    /// Android thermal status (0 none through 6 shutdown).
+    #[serde(default)]
+    pub thermal_status: Option<u8>,
+    /// Whether the current mobile network is unmetered.
+    #[serde(default)]
+    pub unmetered_network: Option<bool>,
 }
 
 pub fn effective_cpu_score(

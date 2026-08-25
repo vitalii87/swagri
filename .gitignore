@@ -12,3 +12,6 @@
 *.swo
 .DS_Store
 Thumbs.db
+/android/.gradle/
+/android/app/build/
+/android/app/src/main/jniLibs/

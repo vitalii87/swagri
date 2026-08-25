@@ -209,6 +209,10 @@ struct ResourceView {
     calibrated_cpu_score: f64,
     effective_cpu_score: f64,
     contribution_paused: bool,
+    battery_percent: Option<u8>,
+    charging: Option<bool>,
+    thermal_status: Option<u8>,
+    unmetered_network: Option<bool>,
 }
 
 #[derive(Clone, Debug)]
@@ -2056,7 +2060,7 @@ impl DebuggerApp {
         egui::ScrollArea::horizontal().show(ui, |ui| {
             egui::Grid::new("resource_table")
                 .striped(true)
-                .num_columns(8)
+                .num_columns(9)
                 .show(ui, |ui| {
                     ui.strong("Агент");
                     ui.strong("Процесор");
@@ -2064,6 +2068,7 @@ impl DebuggerApp {
                     ui.strong("CPU пристрою");
                     ui.strong("Вільна RAM");
                     ui.strong("Swagri");
+                    ui.strong("Мобільний стан");
                     ui.strong("Ефективна сила");
                     ui.strong("Вибір");
                     ui.end_row();
@@ -2111,6 +2116,29 @@ impl DebuggerApp {
                                     resources.observed_at_unix_ms
                                 ));
                             }
+                            let mobile = resources.battery_percent.map_or_else(
+                                || "—".into(),
+                                |battery| {
+                                    format!(
+                                        "{}% {} · T{} · {}",
+                                        battery,
+                                        if resources.charging == Some(true) {
+                                            "⚡"
+                                        } else {
+                                            "🔋"
+                                        },
+                                        resources.thermal_status.unwrap_or_default(),
+                                        if resources.unmetered_network == Some(true) {
+                                            "Wi-Fi"
+                                        } else {
+                                            "metered"
+                                        }
+                                    )
+                                },
+                            );
+                            ui.label(mobile).on_hover_text(
+                                "Заряд, живлення, Android thermal status і тип мережі",
+                            );
                             ui.label(format!("{:.1}", resources.effective_cpu_score));
                             if recommended == Some(peer_id.as_str()) {
                                 ui.label(
@@ -2123,7 +2151,7 @@ impl DebuggerApp {
                             }
                         } else {
                             ui.label("очікуємо дані");
-                            for _ in 0..6 {
+                            for _ in 0..7 {
                                 ui.label("—");
                             }
                         }
@@ -3155,7 +3183,15 @@ fn parse_resource_view(values: &[&str]) -> Option<ResourceView> {
             .get(17)
             .and_then(|value| value.parse().ok())
             .unwrap_or(false),
+        battery_percent: parse_optional(values.get(18).copied()),
+        charging: parse_optional(values.get(19).copied()),
+        thermal_status: parse_optional(values.get(20).copied()),
+        unmetered_network: parse_optional(values.get(21).copied()),
     })
+}
+
+fn parse_optional<T: std::str::FromStr>(value: Option<&str>) -> Option<T> {
+    value.filter(|value| *value != "-")?.parse().ok()
 }
 
 fn is_newer(candidate: &str, current: &str) -> bool {
@@ -3340,6 +3376,7 @@ mod tests {
         assert_eq!(resources.allocatable_memory_bytes, 8_589_934_592);
         assert_eq!(resources.effective_cpu_score, 110.0);
         assert!(!resources.contribution_paused);
+        assert_eq!(resources.battery_percent, None);
 
         let paused_fields = fields
             .iter()
@@ -3348,6 +3385,17 @@ mod tests {
             .collect::<Vec<_>>();
         let paused = parse_resource_view(&paused_fields).expect("valid 0.7 resource event");
         assert!(paused.contribution_paused);
+
+        let mobile_fields = paused_fields
+            .iter()
+            .copied()
+            .chain(["82", "true", "1", "true"])
+            .collect::<Vec<_>>();
+        let mobile = parse_resource_view(&mobile_fields).expect("valid mobile resource event");
+        assert_eq!(mobile.battery_percent, Some(82));
+        assert_eq!(mobile.charging, Some(true));
+        assert_eq!(mobile.thermal_status, Some(1));
+        assert_eq!(mobile.unmetered_network, Some(true));
     }
 
     #[test]

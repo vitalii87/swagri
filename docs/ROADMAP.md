@@ -38,6 +38,9 @@ data.
 - trust allowlists for the user's devices;
 - task queue, cancellation, deadlines, and retry policy;
 - [x] runtime contribution pause and advertised resource budgets;
+- [x] reusable Agent library and initial Android arm64 foreground-session host;
+- [x] mobile battery, charging, thermal, and network policy signals;
+- Android physical-device interoperability and lifecycle test matrix;
 - hard OS-enforced resource quotas;
 - [x] local-first placement for bounded CPU benchmark and matrix tasks;
 - [x] operator-visible in-memory task lifecycle and result history;

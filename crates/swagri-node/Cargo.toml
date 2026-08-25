@@ -7,6 +7,11 @@ rust-version.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[lib]
+name = "swagri_agent"
+path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
@@ -25,6 +30,9 @@ swagri-storage = { path = "../swagri-storage" }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
 
 [[bin]]
 name = "swagri-agent"

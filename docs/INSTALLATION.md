@@ -1,6 +1,7 @@
 # Installation and test builds
 
-Swagri currently provides two Windows x64 applications.
+Swagri provides two Windows x64 applications and an experimental Android arm64
+test Agent.
 
 - **Swagri Agent** is the lightweight, headless peer for computers that donate
   resources. It contains no GUI.
@@ -27,6 +28,39 @@ unzipped anywhere and run directly.
 For development branches, open the repository's **Actions**, choose **Windows
 packages**, run the workflow, and download its `swagri-windows-x64` artifact.
 Tagged versions can later publish the same files as release assets.
+
+## Android 0.14.0-alpha test APK
+
+The **Android APK** workflow produces `app-debug.apk` in the
+`swagri-android-arm64` artifact. The first build supports 64-bit ARM devices on
+Android 10 or newer and is intended for private LAN testing, not Play Store
+distribution.
+
+1. Download the workflow artifact and transfer `app-debug.apk` to the phone or
+   tablet.
+2. Permit installation from the selected file-manager source and install it.
+3. Connect Android and the Windows devices to the same private Wi-Fi network.
+4. Open Swagri, accept notification permission, keep the default conservative
+   limits, and tap **Start agent**.
+5. Android shows a persistent notification while its P2P session is active.
+   Tap **Stop agent** or the notification's **Stop** action to end it.
+6. Tap **Find / refresh**. If multicast is blocked by the router, paste the
+   Windows Agent's complete `/ip4/.../udp/.../quic-v1/p2p/...` address into the
+   peer field and tap **Connect**.
+
+Mobile contribution pauses automatically unless the device is charging, at
+least 50% charged, connected to unmetered Wi-Fi, and below severe Android
+thermal status. The node remains available for identity/resource diagnostics
+while contribution is paused. Android update serving is disabled; new APKs
+require normal Android installation confirmation.
+
+To build locally, install JDK 17, Android SDK platform/build-tools 35, NDK
+27.2.12479018, Gradle 8.10.2, the Rust `aarch64-linux-android` target, and
+`cargo-ndk`, then run from `android/`:
+
+```console
+gradle :app:assembleDebug
+```
 
 ## Test with two computers
 
