@@ -33,13 +33,13 @@ jobs:
 
       - name: Create packages
         shell: pwsh
-        run: ./scripts/package-windows.ps1 -Version "0.14.2-alpha"
+        run: ./scripts/package-windows.ps1 -Version "0.14.3-alpha"
 
       - name: Upload packages
         uses: actions/upload-artifact@v5
         with:
           name: swagri-windows-x64
           path: |
-            dist/0.14.2-alpha/*.exe
-            dist/0.14.2-alpha/*.zip
+            dist/0.14.3-alpha/*.exe
+            dist/0.14.3-alpha/*.zip
           if-no-files-found: error

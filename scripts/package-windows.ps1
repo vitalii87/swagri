@@ -1,6 +1,7 @@
 param(
-    [string]$Version = "0.14.2-alpha",
-    [string]$Configuration = "release"
+    [string]$Version = "0.14.3-alpha",
+    [string]$Configuration = "release",
+    [string]$RuntimeDirectory = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -56,6 +57,17 @@ Set-Content -LiteralPath (Join-Path $packageDirectory "README.txt") -Value $read
 $binaryVersion = $Version.Split('-')[0]
 Set-Content -LiteralPath (Join-Path $packageDirectory "swagri-debugger.version") -Value $binaryVersion -Encoding ascii
 
+$runtimeFiles = @()
+if ($RuntimeDirectory) {
+    $resolvedRuntimeDirectory = [System.IO.Path]::GetFullPath($RuntimeDirectory)
+    $libunwind = Join-Path $resolvedRuntimeDirectory "libunwind.dll"
+    if (-not (Test-Path -LiteralPath $libunwind)) {
+        throw "Runtime directory was supplied, but libunwind.dll was not found: $libunwind"
+    }
+    Copy-Item -LiteralPath $libunwind -Destination $packageDirectory -Force
+    $runtimeFiles += "libunwind.dll"
+}
+
 $agentPortable = Join-Path $outputDirectory "agent-portable"
 $debuggerPortable = Join-Path $outputDirectory "debugger-portable"
 New-Item -ItemType Directory -Path $agentPortable, $debuggerPortable -Force | Out-Null
@@ -67,6 +79,10 @@ Copy-Item -LiteralPath (Join-Path $buildDirectory "swagri-updater.exe") -Destina
 Copy-Item -LiteralPath (Join-Path $packageDirectory "README.txt") -Destination $agentPortable
 Copy-Item -LiteralPath (Join-Path $packageDirectory "README.txt") -Destination $debuggerPortable
 Copy-Item -LiteralPath (Join-Path $packageDirectory "swagri-debugger.version") -Destination $debuggerPortable
+foreach ($runtimeFile in $runtimeFiles) {
+    Copy-Item -LiteralPath (Join-Path $packageDirectory $runtimeFile) -Destination $agentPortable -Force
+    Copy-Item -LiteralPath (Join-Path $packageDirectory $runtimeFile) -Destination $debuggerPortable -Force
+}
 
 Compress-Archive -Path (Join-Path $agentPortable "*") -DestinationPath (Join-Path $outputDirectory "Swagri-Agent-Portable-x64.zip") -Force
 Compress-Archive -Path (Join-Path $debuggerPortable "*") -DestinationPath (Join-Path $outputDirectory "Swagri-Debugger-Portable-x64.zip") -Force

@@ -29,7 +29,7 @@ For development branches, open the repository's **Actions**, choose **Windows
 packages**, run the workflow, and download its `swagri-windows-x64` artifact.
 Tagged versions can later publish the same files as release assets.
 
-## Android 0.14.2-alpha test APK
+## Android 0.14.3-alpha test APK
 
 The **Android APK** workflow produces `app-debug.apk` in the
 `swagri-android-arm64` artifact. The first build supports 64-bit ARM devices on
@@ -334,7 +334,15 @@ cargo build --release -p swagri-agent -p swagri-debugger -p swagri-updater
 .\scripts\package-windows.ps1
 ```
 
-The four packages are written to `dist\`.
+The four packages are written to a versioned directory under `dist\`. A
+GNU-LLVM build also needs its runtime copied into the packages:
+
+```powershell
+.\scripts\package-windows.ps1 -RuntimeDirectory C:\path\to\llvm-mingw\bin
+```
+
+The script then includes `libunwind.dll` beside every executable that may need
+it. Standard MSVC builds can omit this parameter.
 
 ## Can Swagri work without installers?
 

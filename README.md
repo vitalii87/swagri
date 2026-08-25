@@ -73,6 +73,10 @@ battery, charging, thermal, and unmetered-network signals; conservative policy
 pauses contribution outside safe conditions. Swagri does not execute shell
 commands, downloaded binaries, or arbitrary remote code.
 
+Version 0.14.3-alpha also packages the LLVM-MinGW `libunwind.dll` runtime next
+to Windows GNU-LLVM builds, keeping both installers and portable archives
+self-contained on computers without a Rust or Visual Studio installation.
+
 ## Technology
 
 - Rust workspace
