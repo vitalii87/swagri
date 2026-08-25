@@ -11,6 +11,9 @@
 
     <application
         android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="false"
+        android:icon="@drawable/app_icon"
         android:label="Swagri Android Agent"
         android:supportsRtl="true"
         android:theme="@style/AppTheme">

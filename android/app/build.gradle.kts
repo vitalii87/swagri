@@ -7,6 +7,11 @@ android {
     namespace = "com.swagri.android"
     compileSdk = 35
 
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
     defaultConfig {
         applicationId = "com.swagri.android"
         minSdk = 29
