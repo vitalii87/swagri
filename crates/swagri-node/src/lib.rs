@@ -792,8 +792,7 @@ fn mobile_safe_to_contribute(
     thermal_status: Option<u8>,
     unmetered_network: Option<bool>,
 ) -> bool {
-    charging.unwrap_or(false)
-        && battery_percent.is_some_and(|battery| battery >= 50)
+    battery_percent.is_some_and(|battery| battery >= 50 || charging.unwrap_or(false))
         && thermal_status.is_some_and(|thermal| thermal < 3)
         && unmetered_network.unwrap_or(false)
 }
@@ -4485,21 +4484,33 @@ mod tests {
     }
 
     #[test]
-    fn mobile_policy_requires_power_battery_wifi_and_safe_thermal_state() {
+    fn mobile_policy_allows_high_battery_or_power_with_safe_wifi_and_thermal() {
         assert!(mobile_safe_to_contribute(
             Some(80),
             Some(true),
             Some(1),
             Some(true)
         ));
-        assert!(!mobile_safe_to_contribute(
+        assert!(mobile_safe_to_contribute(
             Some(49),
             Some(true),
             Some(1),
             Some(true)
         ));
-        assert!(!mobile_safe_to_contribute(
+        assert!(mobile_safe_to_contribute(
             Some(80),
+            Some(false),
+            Some(1),
+            Some(true)
+        ));
+        assert!(mobile_safe_to_contribute(
+            Some(50),
+            Some(false),
+            Some(1),
+            Some(true)
+        ));
+        assert!(!mobile_safe_to_contribute(
+            Some(49),
             Some(false),
             Some(1),
             Some(true)
@@ -4514,6 +4525,18 @@ mod tests {
             Some(80),
             Some(true),
             None,
+            Some(true)
+        ));
+        assert!(!mobile_safe_to_contribute(
+            Some(80),
+            Some(true),
+            Some(1),
+            Some(false)
+        ));
+        assert!(!mobile_safe_to_contribute(
+            None,
+            Some(true),
+            Some(1),
             Some(true)
         ));
     }

@@ -78,7 +78,7 @@ only after every block and the complete artifact digest pass verification.
 ### `swagri-node`
 
 Owns peer identity, discovery, transport, request/response coordination, and
-the interactive CLI. Since 0.14.0-alpha it builds both an `rlib` and Android
+the interactive CLI. Since 0.14.1-alpha it builds both an `rlib` and Android
 `cdylib`; the CLI and Android foreground host feed commands into the same event
 loop instead of maintaining separate protocol implementations.
 
@@ -233,11 +233,12 @@ remaining owner-configured memory budget. The operator can pause contribution
 at runtime: the Agent advertises zero effective CPU and allocatable memory and
 rejects new compute requests while continuing to answer resource/version
 queries. Already-running work is allowed to finish. These limits are scheduler
-signals, not OS-enforced hard quotas yet. Android 0.14.0-alpha appends battery
+signals, not OS-enforced hard quotas yet. Android 0.14.1-alpha appends battery
 percentage, charging state, simplified thermal status, and unmetered-network
-state as optional backward-compatible fields. Mobile contribution defaults to
-paused unless the device is charging, has at least 50% battery, uses unmetered
-Wi-Fi, and remains below severe thermal status. Desktop temperature,
+state as optional backward-compatible fields. Mobile contribution works
+without external power at 50% battery or above; below 50%, charging is
+required. Unmetered Wi-Fi and a temperature below severe thermal status remain
+mandatory. Desktop temperature,
 accelerators, network-quality measurements, and workload-specific benchmarks
 remain planned inputs.
 

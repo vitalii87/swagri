@@ -65,7 +65,7 @@ Version 0.13.0 discovers matching content IDs in the inventories of trusted
 Agents and fetches up to four missing blocks concurrently, rotating requests
 across as many as eight providers. A failed provider is removed without
 discarding verified blocks or stopping healthy sources. Durability replication
-remains a future step. Version 0.14.0-alpha begins the heterogeneous mobile
+remains a future step. Version 0.14.1-alpha begins the heterogeneous mobile
 stage: the Agent is now also a reusable Rust library, and an Android arm64 app
 can run the same identity, QUIC, typed-task, resource, trust, and artifact
 protocol inside an explicitly started foreground session. Mobile snapshots add

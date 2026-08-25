@@ -29,7 +29,7 @@ For development branches, open the repository's **Actions**, choose **Windows
 packages**, run the workflow, and download its `swagri-windows-x64` artifact.
 Tagged versions can later publish the same files as release assets.
 
-## Android 0.14.0-alpha test APK
+## Android 0.14.1-alpha test APK
 
 The **Android APK** workflow produces `app-debug.apk` in the
 `swagri-android-arm64` artifact. The first build supports 64-bit ARM devices on
@@ -48,11 +48,11 @@ distribution.
    Windows Agent's complete `/ip4/.../udp/.../quic-v1/p2p/...` address into the
    peer field and tap **Connect**.
 
-Mobile contribution pauses automatically unless the device is charging, at
-least 50% charged, connected to unmetered Wi-Fi, and below severe Android
-thermal status. The node remains available for identity/resource diagnostics
-while contribution is paused. Android update serving is disabled; new APKs
-require normal Android installation confirmation.
+Mobile contribution works without a charger at 50% battery or above. Below
+50%, external power is required. Unmetered Wi-Fi and a temperature below the
+severe Android thermal state are always required. The node remains available
+for identity/resource diagnostics while contribution is paused. Android update
+serving is disabled; new APKs require normal Android installation confirmation.
 
 To build locally, install JDK 17, Android SDK platform/build-tools 35, NDK
 27.2.12479018, Gradle 8.10.2, the Rust `aarch64-linux-android` target, and

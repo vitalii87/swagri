@@ -16,3 +16,4 @@ Thumbs.db
 /android/app/build/
 /android/app/src/main/jniLibs/
 /.tooling/
+/.codex-remote-attachments/

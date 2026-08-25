@@ -88,7 +88,7 @@ class MainActivity : Activity() {
             setPadding(dp(14), dp(12), dp(14), dp(24))
         }
         page.addView(TextView(this).apply {
-            text = "Swagri Android Agent · 0.14.0-alpha"
+            text = "Swagri Android Agent · 0.14.1-alpha"
             textSize = 22f
             setTextColor(Color.rgb(16, 90, 68))
         })
@@ -111,7 +111,7 @@ class MainActivity : Activity() {
             actionButton("Start agent") { startAgent() },
             actionButton("Stop agent") { stopAgent() },
         ))
-        page.addView(label("Contribution automatically pauses below 50% battery, without charging, outside unmetered Wi-Fi, or at severe thermal status."))
+        page.addView(label("Contribution works at 50% battery or above without a charger. Below 50%, connect power. Unmetered Wi-Fi and safe temperature are always required."))
 
         page.addView(section("Peers and trust"))
         peersView = label("Found agents: 0")

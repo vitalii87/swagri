@@ -102,7 +102,11 @@ class AgentService : Service() {
             capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
 
         NativeBridge.nativeUpdateEnvironment(batteryPercent, charging, thermal, unmetered)
-        updateWakeLock(charging && unmetered && batteryPercent >= 50 && thermal < PowerManager.THERMAL_STATUS_SEVERE)
+        val contributionAllowed = batteryPercent >= 0 &&
+            (batteryPercent >= 50 || charging) &&
+            unmetered &&
+            thermal < PowerManager.THERMAL_STATUS_SEVERE
+        updateWakeLock(contributionAllowed)
         val state = "Battery ${if (batteryPercent >= 0) "$batteryPercent%" else "?"} · " +
             "thermal $thermal · ${if (unmetered) "Wi-Fi" else "paused network"}"
         getSystemService(NotificationManager::class.java)
