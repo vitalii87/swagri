@@ -78,7 +78,7 @@ only after every block and the complete artifact digest pass verification.
 ### `swagri-node`
 
 Owns peer identity, discovery, transport, request/response coordination, and
-the interactive CLI. Since 0.14.1-alpha it builds both an `rlib` and Android
+the interactive CLI. Since 0.14.2-alpha it builds both an `rlib` and Android
 `cdylib`; the CLI and Android foreground host feed commands into the same event
 loop instead of maintaining separate protocol implementations.
 
@@ -140,6 +140,14 @@ cannot be armed by a remote peer. Non-matrix tasks do not consume them, and the
 atomic state resets as soon as one inbound chunk takes it. This makes retry and
 disconnect tests repeatable on two physical devices without weakening task
 authorization.
+
+Version 0.14.2 keeps a recent verified resource observation across transient
+QUIC connection closures instead of deleting it immediately. The existing
+20-second freshness TTL still excludes stale devices, while request dispatch
+can redial a known peer. Multiple established connections are tracked before a
+peer is marked disconnected. This prevents the Debugger's visible resource
+table and the matrix scheduler's eligible-worker set from disagreeing during a
+short transport reconnect.
 
 ## Content-addressed artifact storage
 
@@ -233,7 +241,7 @@ remaining owner-configured memory budget. The operator can pause contribution
 at runtime: the Agent advertises zero effective CPU and allocatable memory and
 rejects new compute requests while continuing to answer resource/version
 queries. Already-running work is allowed to finish. These limits are scheduler
-signals, not OS-enforced hard quotas yet. Android 0.14.1-alpha appends battery
+signals, not OS-enforced hard quotas yet. Android 0.14.2-alpha appends battery
 percentage, charging state, simplified thermal status, and unmetered-network
 state as optional backward-compatible fields. Mobile contribution works
 without external power at 50% battery or above; below 50%, charging is

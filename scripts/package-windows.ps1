@@ -1,12 +1,16 @@
 param(
-    [string]$Version = "0.14.1-alpha",
+    [string]$Version = "0.14.2-alpha",
     [string]$Configuration = "release"
 )
 
 $ErrorActionPreference = "Stop"
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 $buildDirectory = Join-Path $repoRoot "target\$Configuration"
-$outputDirectory = Join-Path $repoRoot "dist"
+$distRoot = Join-Path $repoRoot "dist"
+if ($Version -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') {
+    throw "Version contains unsupported path characters: $Version"
+}
+$outputDirectory = Join-Path $distRoot $Version
 $packageDirectory = Join-Path $outputDirectory "package-files"
 
 if (-not (Test-Path -LiteralPath (Join-Path $buildDirectory "swagri-agent.exe"))) {
@@ -20,11 +24,9 @@ if (-not (Test-Path -LiteralPath (Join-Path $buildDirectory "swagri-updater.exe"
 }
 
 $resolvedOutput = [System.IO.Path]::GetFullPath($outputDirectory)
-if (-not $resolvedOutput.StartsWith($repoRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
-    throw "Refusing to package outside the repository."
-}
-if (Test-Path -LiteralPath $outputDirectory) {
-    Remove-Item -LiteralPath $outputDirectory -Recurse -Force
+$resolvedDistRoot = [System.IO.Path]::GetFullPath($distRoot).TrimEnd('\') + '\'
+if (-not $resolvedOutput.StartsWith($resolvedDistRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "Refusing to package outside the versioned dist directory."
 }
 New-Item -ItemType Directory -Path $packageDirectory -Force | Out-Null
 
@@ -66,8 +68,8 @@ Copy-Item -LiteralPath (Join-Path $packageDirectory "README.txt") -Destination $
 Copy-Item -LiteralPath (Join-Path $packageDirectory "README.txt") -Destination $debuggerPortable
 Copy-Item -LiteralPath (Join-Path $packageDirectory "swagri-debugger.version") -Destination $debuggerPortable
 
-Compress-Archive -Path (Join-Path $agentPortable "*") -DestinationPath (Join-Path $outputDirectory "Swagri-Agent-Portable-x64.zip")
-Compress-Archive -Path (Join-Path $debuggerPortable "*") -DestinationPath (Join-Path $outputDirectory "Swagri-Debugger-Portable-x64.zip")
+Compress-Archive -Path (Join-Path $agentPortable "*") -DestinationPath (Join-Path $outputDirectory "Swagri-Agent-Portable-x64.zip") -Force
+Compress-Archive -Path (Join-Path $debuggerPortable "*") -DestinationPath (Join-Path $outputDirectory "Swagri-Debugger-Portable-x64.zip") -Force
 
 $makensis = Get-Command "makensis.exe" -ErrorAction SilentlyContinue
 if (-not $makensis) {

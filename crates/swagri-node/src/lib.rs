@@ -666,14 +666,9 @@ pub async fn run_cli() -> Result<()> {
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         let mut lines = BufReader::new(tokio::io::stdin()).lines();
-        loop {
-            match lines.next_line().await {
-                Ok(Some(line)) => {
-                    if command_tx.send(line).is_err() {
-                        break;
-                    }
-                }
-                _ => break,
+        while let Ok(Some(line)) = lines.next_line().await {
+            if command_tx.send(line).is_err() {
+                break;
             }
         }
     });
@@ -765,7 +760,7 @@ pub fn update_mobile_environment(
         Ordering::Relaxed,
     );
     MOBILE_CHARGING.store(
-        charging.map_or(MOBILE_UNKNOWN, |value| u32::from(value)),
+        charging.map_or(MOBILE_UNKNOWN, u32::from),
         Ordering::Relaxed,
     );
     MOBILE_THERMAL_STATUS.store(
@@ -773,7 +768,7 @@ pub fn update_mobile_environment(
         Ordering::Relaxed,
     );
     MOBILE_UNMETERED_NETWORK.store(
-        unmetered_network.map_or(MOBILE_UNKNOWN, |value| u32::from(value)),
+        unmetered_network.map_or(MOBILE_UNKNOWN, u32::from),
         Ordering::Relaxed,
     );
 
@@ -1444,9 +1439,18 @@ fn handle_swarm_event(
             info!(peer = %peer_id, "peer connected");
             emit_event("PEER_CONNECTED", &[&peer_id.to_string()]);
         }
-        SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
-            connected_peers.remove(&peer_id);
-            peer_resources.remove(&peer_id);
+        SwarmEvent::ConnectionClosed {
+            peer_id,
+            cause,
+            num_established,
+            ..
+        } => {
+            if num_established == 0 {
+                connected_peers.remove(&peer_id);
+            }
+            // Resource observations intentionally survive transient transport
+            // closures. Scheduling already applies REMOTE_RESOURCE_MAX_AGE,
+            // and send_request can redial a known peer when work is dispatched.
             info!(peer = %peer_id, ?cause, "peer disconnected");
             emit_event("PEER_DISCONNECTED", &[&peer_id.to_string()]);
             fail_artifact_provider(
@@ -3693,32 +3697,7 @@ fn start_distributed_matrix(
         return;
     }
 
-    let mut workers = Vec::<(MatrixWorker, f64)>::new();
-    if !resources.contribution_paused && resources.effective_cpu_score > 0.0 {
-        workers.push((MatrixWorker::Local, resources.effective_cpu_score));
-    }
-    workers.extend(
-        peer_resources
-            .iter()
-            .filter(|(_, observation)| observation.received_at.elapsed() <= REMOTE_RESOURCE_MAX_AGE)
-            .filter(|(_, observation)| observation.protocol_version >= NODE_PROTOCOL_VERSION)
-            .filter(|(_, observation)| {
-                !observation.snapshot.contribution_paused
-                    && observation.snapshot.effective_cpu_score > 0.0
-            })
-            .map(|(peer, observation)| {
-                (
-                    MatrixWorker::Remote(*peer),
-                    observation.snapshot.effective_cpu_score,
-                )
-            }),
-    );
-    workers.sort_by(|left, right| {
-        right
-            .1
-            .partial_cmp(&left.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    let workers = eligible_matrix_workers(resources, peer_resources);
 
     let sequence = request_counter.fetch_add(1, Ordering::Relaxed);
     let id = format!("{local_peer_id}-distributed-{sequence}");
@@ -3751,10 +3730,7 @@ fn start_distributed_matrix(
             }
         })
         .collect::<VecDeque<_>>();
-    let available_workers = workers
-        .into_iter()
-        .map(|(worker, _)| worker)
-        .collect::<VecDeque<_>>();
+    let available_workers = workers.into_iter().collect::<VecDeque<_>>();
     emit_event(
         "MATRIX_PLAN",
         &[
@@ -3778,6 +3754,39 @@ fn start_distributed_matrix(
             in_flight: 0,
         },
     );
+}
+
+fn eligible_matrix_workers(
+    resources: &ResourceSnapshot,
+    peer_resources: &BTreeMap<PeerId, PeerResourceObservation>,
+) -> Vec<MatrixWorker> {
+    let mut workers = Vec::<(MatrixWorker, f64)>::new();
+    if !resources.contribution_paused && resources.effective_cpu_score > 0.0 {
+        workers.push((MatrixWorker::Local, resources.effective_cpu_score));
+    }
+    workers.extend(
+        peer_resources
+            .iter()
+            .filter(|(_, observation)| observation.received_at.elapsed() <= REMOTE_RESOURCE_MAX_AGE)
+            .filter(|(_, observation)| observation.protocol_version >= NODE_PROTOCOL_VERSION)
+            .filter(|(_, observation)| {
+                !observation.snapshot.contribution_paused
+                    && observation.snapshot.effective_cpu_score > 0.0
+            })
+            .map(|(peer, observation)| {
+                (
+                    MatrixWorker::Remote(*peer),
+                    observation.snapshot.effective_cpu_score,
+                )
+            }),
+    );
+    workers.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    workers.into_iter().map(|(worker, _)| worker).collect()
 }
 
 struct MatrixDispatch {
@@ -4403,6 +4412,33 @@ mod tests {
 
     use super::*;
 
+    fn resource_snapshot(score: f64, paused: bool) -> ResourceSnapshot {
+        ResourceSnapshot {
+            observed_at_unix_ms: 0,
+            os: "test".into(),
+            arch: "test".into(),
+            cpu_brand: "test".into(),
+            physical_cores: 1,
+            logical_cores: 1,
+            total_memory_bytes: 1,
+            available_memory_bytes: 1,
+            host_cpu_percent: 0.0,
+            agent_cpu_percent: 0.0,
+            agent_memory_bytes: 0,
+            active_tasks: 0,
+            cpu_limit_percent: 100.0,
+            memory_limit_percent: 100.0,
+            allocatable_memory_bytes: 1,
+            calibrated_cpu_score: score,
+            effective_cpu_score: score,
+            contribution_paused: paused,
+            battery_percent: None,
+            charging: None,
+            thermal_status: None,
+            unmetered_network: None,
+        }
+    }
+
     fn signed_manifest(keypair: &identity::Keypair, version: &str) -> SignedUpdateManifest {
         let manifest = UpdateManifest {
             version: version.into(),
@@ -4539,6 +4575,36 @@ mod tests {
             Some(1),
             Some(true)
         ));
+    }
+
+    #[test]
+    fn matrix_workers_keep_recent_remote_observations_and_sort_by_capacity() {
+        let fast = PeerId::from(identity::Keypair::generate_ed25519().public());
+        let slow = PeerId::from(identity::Keypair::generate_ed25519().public());
+        let paused_local = resource_snapshot(9_000.0, true);
+        let observations = BTreeMap::from([
+            (
+                slow,
+                PeerResourceObservation {
+                    snapshot: resource_snapshot(165.0, false),
+                    received_at: Instant::now(),
+                    protocol_version: NODE_PROTOCOL_VERSION,
+                },
+            ),
+            (
+                fast,
+                PeerResourceObservation {
+                    snapshot: resource_snapshot(9_044.0, false),
+                    received_at: Instant::now(),
+                    protocol_version: NODE_PROTOCOL_VERSION,
+                },
+            ),
+        ]);
+
+        assert_eq!(
+            eligible_matrix_workers(&paused_local, &observations),
+            vec![MatrixWorker::Remote(fast), MatrixWorker::Remote(slow)]
+        );
     }
 
     #[test]

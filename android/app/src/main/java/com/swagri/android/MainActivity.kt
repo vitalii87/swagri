@@ -38,9 +38,13 @@ class MainActivity : Activity() {
     private val handler = Handler(Looper.getMainLooper())
     private val logs = ArrayDeque<String>()
     private val peers = linkedSetOf<String>()
+    private val activeInboundTasks = linkedMapOf<String, String>()
+    private var completedInboundTasks = 0
+    private var lastWork = "No tasks received"
     private lateinit var stateView: TextView
     private lateinit var identityView: TextView
     private lateinit var resourcesView: TextView
+    private lateinit var workView: TextView
     private lateinit var peersView: TextView
     private lateinit var logView: TextView
     private lateinit var logScroll: ScrollView
@@ -53,11 +57,13 @@ class MainActivity : Activity() {
 
     private val pollEvents = object : Runnable {
         override fun run() {
-            runCatching { NativeBridge.nativePoll() }
+            val events = runCatching { NativeBridge.nativePoll() }
                 .getOrDefault("")
                 .lineSequence()
                 .filter(String::isNotBlank)
-                .forEach(::acceptEvent)
+                .toList()
+            events.forEach(::acceptEvent)
+            if (events.isNotEmpty()) renderLog()
             updateRunningState()
             handler.postDelayed(this, 500L)
         }
@@ -85,19 +91,21 @@ class MainActivity : Activity() {
     private fun buildUi(): View {
         val page = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(14), dp(12), dp(14), dp(24))
+            setPadding(dp(14), dp(12), dp(14), dp(72))
         }
         page.addView(TextView(this).apply {
-            text = "Swagri Android Agent · 0.14.1-alpha"
+            text = "Swagri Android Agent · 0.14.2-alpha"
             textSize = 22f
             setTextColor(Color.rgb(16, 90, 68))
         })
         stateView = label("STOPPED · contribution session is not active")
         identityView = label("Peer ID: —")
         resourcesView = label("Mobile resources: waiting for the first sample")
+        workView = label("Work: IDLE · completed locally: 0 · No tasks received")
         page.addView(stateView)
         page.addView(identityView)
         page.addView(resourcesView)
+        page.addView(workView)
 
         page.addView(section("Safe contribution settings"))
         nodeNameInput = input("Node name")
@@ -218,9 +226,15 @@ class MainActivity : Activity() {
             kind.contains("DISCONNECTED") || kind.contains("PAUSED") || kind.contains("PROVIDER_FAILED") -> "WARN"
             else -> "EVENT"
         }
-        addLocalLog(level, "AGENT", raw)
+        addLocalLog(level, "AGENT", raw, render = false)
         when (kind) {
-            "STARTED" -> identityView.text = "Peer ID: ${fields.getOrNull(2) ?: "—"}"
+            "STARTED" -> {
+                identityView.text = "Peer ID: ${fields.getOrNull(2) ?: "—"}"
+                activeInboundTasks.clear()
+                completedInboundTasks = 0
+                lastWork = "No tasks received"
+                updateWorkState()
+            }
             "PEER_DISCOVERED", "PEER_CONNECTED" -> fields.getOrNull(2)?.let {
                 peers.add(it)
                 peersView.text = "Found agents: ${peers.size}\n" + peers.joinToString("\n")
@@ -241,14 +255,47 @@ class MainActivity : Activity() {
                     "battery $battery% · charging $charging · thermal $thermal · " +
                     if (paused) "PAUSED" else "CONTRIBUTING"
             }
+            "TASK_STARTED" -> {
+                val id = fields.getOrNull(2)
+                val description = fields.getOrNull(3) ?: "Task"
+                val direction = fields.getOrNull(5)
+                if (id != null && direction == "inbound") {
+                    activeInboundTasks[id] = description
+                    lastWork = description
+                    updateWorkState()
+                }
+            }
+            "TASK_RESULT", "TASK_FAILED" -> {
+                val id = fields.getOrNull(3)
+                if (id != null && activeInboundTasks.remove(id) != null) {
+                    completedInboundTasks += 1
+                    lastWork = if (kind == "TASK_RESULT") {
+                        "Completed: ${fields.getOrNull(5) ?: id}"
+                    } else {
+                        "Failed: ${fields.getOrNull(5) ?: id}"
+                    }
+                    updateWorkState()
+                }
+            }
         }
     }
 
-    private fun addLocalLog(level: String, source: String, message: String) {
+    private fun updateWorkState() {
+        val state = if (activeInboundTasks.isEmpty()) "IDLE" else "BUSY"
+        val active = activeInboundTasks.values.lastOrNull()
+        val current = active?.let { " · now: $it" } ?: " · $lastWork"
+        workView.text = "Work: $state · active: ${activeInboundTasks.size} · " +
+            "completed locally: $completedInboundTasks$current"
+        workView.setTextColor(
+            if (activeInboundTasks.isEmpty()) Color.rgb(70, 90, 80) else Color.rgb(205, 115, 0),
+        )
+    }
+
+    private fun addLocalLog(level: String, source: String, message: String, render: Boolean = true) {
         val timestamp = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US).format(Date())
         logs.addLast("$timestamp  $level  $source  $message")
         while (logs.size > MAX_LOG_LINES) logs.removeFirst()
-        renderLog()
+        if (render) renderLog()
     }
 
     private fun renderLog() {
@@ -270,6 +317,11 @@ class MainActivity : Activity() {
         val running = runCatching { NativeBridge.nativeIsRunning() }.getOrDefault(false)
         stateView.text = if (running) "RUNNING · foreground contribution session" else "STOPPED"
         stateView.setTextColor(if (running) Color.rgb(0, 150, 80) else Color.rgb(190, 45, 45))
+        if (!running && activeInboundTasks.isNotEmpty()) {
+            activeInboundTasks.clear()
+            lastWork = "Agent stopped"
+            updateWorkState()
+        }
     }
 
     private fun chooseArtifact() {
