@@ -11,6 +11,7 @@ object NativeBridge {
         maxCpuPercent: Float,
         maxMemoryPercent: Float,
         artifactQuotaBytes: Long,
+        androidUpdateSource: String,
     ): Boolean
 
     external fun nativeSend(command: String): Boolean

@@ -11,9 +11,58 @@ permissions:
   contents: read
 
 jobs:
+  android-apk:
+    name: Build Android APK for Debugger distribution
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal --target aarch64-linux-android
+
+      - name: Select Rust toolchain
+        run: rustup default stable
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Configure Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform and NDK
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
+
+      - name: Select Android NDK
+        run: echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.2.12479018" >> "$GITHUB_ENV"
+
+      - name: Configure Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+
+      - name: Build APK
+        working-directory: android
+        run: gradle :app:assembleDebug --stacktrace
+
+      - name: Upload APK for Windows packaging
+        uses: actions/upload-artifact@v5
+        with:
+          name: swagri-android-package-input
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
   windows-packages:
     name: Build Windows installers and portable packages
     runs-on: windows-latest
+    needs: android-apk
 
     steps:
       - name: Check out repository
@@ -31,15 +80,21 @@ jobs:
       - name: Install NSIS
         run: choco install nsis -y --no-progress
 
+      - name: Download Android APK
+        uses: actions/download-artifact@v5
+        with:
+          name: swagri-android-package-input
+          path: android-package
+
       - name: Create packages
         shell: pwsh
-        run: ./scripts/package-windows.ps1 -Version "0.14.4-alpha"
+        run: ./scripts/package-windows.ps1 -Version "0.15.0-alpha" -AndroidApk "./android-package/app-debug.apk"
 
       - name: Upload packages
         uses: actions/upload-artifact@v5
         with:
           name: swagri-windows-x64
           path: |
-            dist/0.14.4-alpha/*.exe
-            dist/0.14.4-alpha/*.zip
+            dist/0.15.0-alpha/*.exe
+            dist/0.15.0-alpha/*.zip
           if-no-files-found: error

@@ -17,6 +17,9 @@ Section "Swagri Debugger" SecDebugger
 !ifdef RUNTIME_DLL
   File "${RUNTIME_DLL}"
 !endif
+!ifdef ANDROID_APK
+  File "${ANDROID_APK}"
+!endif
   File "${PACKAGE_DIR}\swagri-debugger.version"
   File "${PACKAGE_DIR}\README.txt"
   WriteUninstaller "$INSTDIR\Uninstall.exe"
@@ -34,6 +37,7 @@ Section "Uninstall"
   Delete "$INSTDIR\swagri-agent.exe"
   Delete "$INSTDIR\swagri-updater.exe"
   Delete "$INSTDIR\libunwind.dll"
+  Delete "$INSTDIR\Swagri-Android-Agent.apk"
   Delete "$INSTDIR\swagri-agent.previous.exe"
   Delete "$INSTDIR\swagri-agent.swagri-new"
   Delete "$INSTDIR\swagri-debugger.version"

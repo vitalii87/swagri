@@ -71,6 +71,7 @@ class AgentService : Service() {
                     cpu,
                     memory,
                     storageMiB.toLong() * 1024L * 1024L,
+                    applicationInfo.sourceDir,
                 )
             }.getOrDefault(false)
             if (!started) {

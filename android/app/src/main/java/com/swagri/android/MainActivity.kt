@@ -14,6 +14,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.provider.OpenableColumns
+import android.provider.Settings
 import android.text.Editable
 import android.text.TextWatcher
 import android.view.View
@@ -28,6 +29,7 @@ import java.text.SimpleDateFormat
 import java.util.ArrayDeque
 import java.util.Date
 import java.util.Locale
+import java.security.MessageDigest
 
 class MainActivity : Activity() {
     companion object {
@@ -46,6 +48,8 @@ class MainActivity : Activity() {
     private lateinit var resourcesView: TextView
     private lateinit var workView: TextView
     private lateinit var peersView: TextView
+    private lateinit var updateStatusView: TextView
+    private lateinit var installUpdateButton: Button
     private lateinit var logView: TextView
     private lateinit var logScroll: ScrollView
     private lateinit var searchInput: EditText
@@ -54,6 +58,7 @@ class MainActivity : Activity() {
     private lateinit var cpuInput: EditText
     private lateinit var memoryInput: EditText
     private lateinit var storageInput: EditText
+    private var readyUpdateFile: File? = null
 
     private val pollEvents = object : Runnable {
         override fun run() {
@@ -94,7 +99,7 @@ class MainActivity : Activity() {
             setPadding(dp(14), dp(12), dp(14), dp(72))
         }
         page.addView(TextView(this).apply {
-            text = "Swagri Android Agent · 0.14.4-alpha"
+            text = "Swagri Android Agent · 0.15.0-alpha"
             textSize = 22f
             setTextColor(Color.rgb(16, 90, 68))
         })
@@ -136,6 +141,19 @@ class MainActivity : Activity() {
             actionButton("Resources") { peerCommand("resources") },
             actionButton("Matrix 192") { peerCommand("matrix", suffix = " 192") },
         ))
+
+        page.addView(section("App updates"))
+        updateStatusView = label("No Android update downloaded")
+        page.addView(updateStatusView)
+        installUpdateButton = actionButton("Install downloaded APK") { installReadyUpdate() }.apply {
+            isEnabled = false
+        }
+        page.addView(horizontal(
+            actionButton("Peer version") { peerCommand("resources") },
+            actionButton("Trust & download") { downloadAndroidUpdate() },
+            installUpdateButton,
+        ))
+        page.addView(label("Swagri verifies the trusted peer signature and SHA-256 first. Android then verifies the package name, newer version, and app signing certificate. Final installation always needs system confirmation."))
 
         page.addView(section("Artifacts"))
         page.addView(horizontal(
@@ -218,6 +236,19 @@ class MainActivity : Activity() {
         send("$actual $peer$suffix")
     }
 
+    private fun downloadAndroidUpdate() {
+        val peer = peerInput.text.toString().trim()
+        if (peer.isEmpty() || peer.startsWith("/")) {
+            toast("Select a discovered Peer ID first")
+            return
+        }
+        readyUpdateFile = null
+        installUpdateButton.isEnabled = false
+        updateStatusView.text = "Requesting a signed Android update from ${shortPeer(peer)}…"
+        send("trust $peer")
+        send("download-android-update $peer")
+    }
+
     private fun acceptEvent(raw: String) {
         val fields = raw.split('\t')
         val kind = fields.getOrNull(1) ?: "EVENT"
@@ -277,6 +308,25 @@ class MainActivity : Activity() {
                     updateWorkState()
                 }
             }
+            "ANDROID_UPDATE_REQUESTED" -> {
+                updateStatusView.text = "Checking the trusted peer update manifest…"
+            }
+            "ANDROID_UPDATE_PROGRESS" -> {
+                val received = fields.getOrNull(3)?.toLongOrNull() ?: 0L
+                val total = fields.getOrNull(4)?.toLongOrNull() ?: 0L
+                val percent = if (total > 0L) received * 100L / total else 0L
+                updateStatusView.text = "Downloading verified APK: $percent% (${formatBytesCompact(received)} / ${formatBytesCompact(total)})"
+            }
+            "ANDROID_UPDATE_READY" -> {
+                val version = fields.getOrNull(3) ?: "?"
+                val path = fields.getOrNull(4)
+                if (path != null) prepareDownloadedUpdate(version, File(path))
+            }
+            "ANDROID_UPDATE_FAILED" -> {
+                readyUpdateFile = null
+                installUpdateButton.isEnabled = false
+                updateStatusView.text = "Update failed: ${fields.getOrNull(3) ?: "unknown error"}"
+            }
         }
     }
 
@@ -322,6 +372,97 @@ class MainActivity : Activity() {
             lastWork = "Agent stopped"
             updateWorkState()
         }
+    }
+
+    private fun prepareDownloadedUpdate(version: String, downloaded: File) {
+        updateStatusView.text = "Network verification complete. Checking Android package…"
+        Thread {
+            runCatching {
+                require(downloaded.isFile) { "Downloaded APK is missing" }
+                val updateDirectory = filesDir.resolve("agent/updates").apply(File::mkdirs)
+                val safeVersion = version.replace(Regex("[^0-9A-Za-z._-]"), "_")
+                val ready = updateDirectory.resolve("Swagri-Android-$safeVersion.apk")
+                if (downloaded.canonicalFile != ready.canonicalFile) {
+                    if (ready.exists()) ready.delete()
+                    if (!downloaded.renameTo(ready)) {
+                        downloaded.copyTo(ready, overwrite = true)
+                        downloaded.delete()
+                    }
+                }
+                verifyAndroidPackage(ready)
+                updateDirectory.listFiles()
+                    ?.filter { it != ready && it.name.startsWith("Swagri-Android-") && it.extension == "apk" }
+                    ?.forEach(File::delete)
+                ready
+            }.onSuccess { ready ->
+                runOnUiThread {
+                    readyUpdateFile = ready
+                    installUpdateButton.isEnabled = true
+                    updateStatusView.text = "Verified Android update $version is ready. Tap Install and confirm in Android."
+                }
+            }.onFailure { error ->
+                runOnUiThread {
+                    readyUpdateFile = null
+                    installUpdateButton.isEnabled = false
+                    updateStatusView.text = "APK rejected: ${error.message}"
+                }
+            }
+        }.start()
+    }
+
+    @Suppress("DEPRECATION")
+    private fun verifyAndroidPackage(apk: File) {
+        val flags = PackageManager.GET_SIGNING_CERTIFICATES
+        val candidate = packageManager.getPackageArchiveInfo(apk.absolutePath, flags)
+            ?: error("Android could not read the downloaded APK")
+        val installed = packageManager.getPackageInfo(packageName, flags)
+        require(candidate.packageName == packageName) { "Package ID does not match Swagri" }
+        require(candidate.longVersionCode > installed.longVersionCode) {
+            "Downloaded APK is not newer than the installed app"
+        }
+        val candidateSigners = signingDigests(candidate)
+        val installedSigners = signingDigests(installed)
+        require(candidateSigners.isNotEmpty() && candidateSigners == installedSigners) {
+            "APK signing certificate does not match the installed Swagri app"
+        }
+    }
+
+    private fun signingDigests(info: android.content.pm.PackageInfo): Set<String> {
+        val signatures = info.signingInfo?.apkContentsSigners ?: return emptySet()
+        return signatures.mapTo(linkedSetOf()) { signature ->
+            MessageDigest.getInstance("SHA-256")
+                .digest(signature.toByteArray())
+                .joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
+        }
+    }
+
+    private fun installReadyUpdate() {
+        val apk = readyUpdateFile?.takeIf(File::isFile) ?: run {
+            toast("Download and verify an update first")
+            return
+        }
+        if (!packageManager.canRequestPackageInstalls()) {
+            updateStatusView.text = "Allow Swagri to install unknown apps, then return and tap Install again."
+            startActivity(
+                Intent(
+                    Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                    Uri.parse("package:$packageName"),
+                ),
+            )
+            return
+        }
+        val uri = Uri.Builder()
+            .scheme("content")
+            .authority("$packageName.updates")
+            .appendPath(apk.name)
+            .build()
+        startActivity(
+            Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, "application/vnd.android.package-archive")
+                clipData = ClipData.newRawUri("Swagri Android update", uri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+            },
+        )
     }
 
     private fun chooseArtifact() {
@@ -439,4 +580,5 @@ class MainActivity : Activity() {
     private fun toast(message: String) = Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
     private fun shortPeer(peer: String) = if (peer.length <= 18) peer else "${peer.take(10)}…${peer.takeLast(6)}"
     private fun formatBytes(bytes: Long): String = "%.2f GiB".format(Locale.US, bytes / 1024.0 / 1024.0 / 1024.0)
+    private fun formatBytesCompact(bytes: Long): String = "%.1f MiB".format(Locale.US, bytes / 1024.0 / 1024.0)
 }

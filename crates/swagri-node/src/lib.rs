@@ -99,6 +99,10 @@ struct Args {
     #[arg(long)]
     updater: Option<PathBuf>,
 
+    /// Optional Android APK offered to trusted peers as a signed mobile update.
+    #[arg(long)]
+    android_update_source: Option<PathBuf>,
+
     /// Keep running when standard input is closed (used after self-update).
     #[arg(long)]
     daemon: bool,
@@ -139,6 +143,7 @@ pub struct MobileAgentConfig {
     pub max_cpu_percent: f32,
     pub max_memory_percent: f32,
     pub artifact_quota_bytes: u64,
+    pub android_update_source: PathBuf,
 }
 
 impl MobileAgentConfig {
@@ -152,10 +157,11 @@ impl MobileAgentConfig {
             listen,
             dial: Vec::new(),
             request_timeout_seconds: 30,
-            update_policy: UpdatePolicy::Disabled,
+            update_policy: UpdatePolicy::Manual,
             update_trust: Some(self.data_dir.join("trusted-update-peers.txt")),
             update_staging: Some(self.data_dir.join("updates")),
             updater: Some(self.data_dir.join("unsupported-updater")),
+            android_update_source: Some(self.android_update_source),
             daemon: true,
             max_cpu_percent: self.max_cpu_percent,
             max_memory_percent: self.max_memory_percent,
@@ -404,6 +410,7 @@ struct UpdateSource {
 enum UpdateComponent {
     Agent,
     Debugger,
+    Android,
 }
 
 struct PendingDownload {
@@ -424,6 +431,7 @@ struct UpdateManager {
     trusted: BTreeSet<PeerId>,
     source: Option<UpdateSource>,
     debugger_source: Option<UpdateSource>,
+    android_source: Option<UpdateSource>,
     requested: Option<(PeerId, UpdateComponent, bool)>,
     pending: Option<PendingDownload>,
 }
@@ -802,7 +810,7 @@ pub fn drain_mobile_events() -> Vec<String> {
 }
 
 async fn run_agent(
-    args: Args,
+    mut args: Args,
     mut command_rx: mpsc::UnboundedReceiver<String>,
     handle_signals: bool,
 ) -> Result<()> {
@@ -820,6 +828,9 @@ async fn run_agent(
         .clone()
         .unwrap_or_else(default_update_staging);
     let updater = args.updater.clone().unwrap_or_else(default_updater_path);
+    if args.android_update_source.is_none() {
+        args.android_update_source = sibling_android_update_source();
+    }
     let calibration_path = args
         .calibration
         .clone()
@@ -861,6 +872,19 @@ async fn run_agent(
     } else {
         build_debugger_update_source(&keypair)?
     };
+    let android_source = args
+        .android_update_source
+        .as_ref()
+        .filter(|path| path.is_file())
+        .map(|path| {
+            build_signed_update_source(
+                path.clone(),
+                env!("CARGO_PKG_VERSION"),
+                &keypair,
+                UpdateComponent::Android,
+            )
+        })
+        .transpose()?;
     let mut updates = UpdateManager::new(
         args.update_policy,
         trust_path,
@@ -868,6 +892,7 @@ async fn run_agent(
         updater,
         source,
         debugger_source,
+        android_source,
     )?;
 
     let mut swarm = build_swarm(keypair, &args.name, request_timeout)?;
@@ -1148,6 +1173,16 @@ fn debugger_filename() -> &'static str {
     }
 }
 
+fn sibling_android_update_source() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| {
+            path.parent()
+                .map(|parent| parent.join("Swagri-Android-Agent.apk"))
+        })
+        .filter(|path| path.is_file())
+}
+
 fn build_update_source(keypair: &identity::Keypair) -> Result<UpdateSource> {
     let path = std::env::current_exe().context("could not locate running agent executable")?;
     build_signed_update_source(
@@ -1195,16 +1230,23 @@ fn build_signed_update_source(
         }
         hasher.update(&buffer[..read]);
     }
+    let (target_os, target_arch) = match component {
+        UpdateComponent::Android => ("android", "aarch64"),
+        UpdateComponent::Agent | UpdateComponent::Debugger => {
+            (std::env::consts::OS, std::env::consts::ARCH)
+        }
+    };
     let manifest = UpdateManifest {
         version: version.into(),
-        target_os: std::env::consts::OS.into(),
-        target_arch: std::env::consts::ARCH.into(),
+        target_os: target_os.into(),
+        target_arch: target_arch.into(),
         size,
         sha256_hex: hex::encode(hasher.finalize()),
     };
     let signing_payload = match component {
         UpdateComponent::Agent => manifest.signing_payload(),
         UpdateComponent::Debugger => manifest.debugger_signing_payload(),
+        UpdateComponent::Android => manifest.android_signing_payload(),
     };
     let signature = keypair
         .sign(&signing_payload)
@@ -1227,6 +1269,7 @@ impl UpdateManager {
         updater: PathBuf,
         source: Option<UpdateSource>,
         debugger_source: Option<UpdateSource>,
+        android_source: Option<UpdateSource>,
     ) -> Result<Self> {
         fs::create_dir_all(&staging)
             .with_context(|| format!("could not create update staging at {}", staging.display()))?;
@@ -1239,6 +1282,7 @@ impl UpdateManager {
             trusted,
             source,
             debugger_source,
+            android_source,
             requested: None,
             pending: None,
         })
@@ -1318,6 +1362,10 @@ fn restart_arguments(
         args.artifact_storage_percent.to_string(),
         "--daemon".into(),
     ];
+    if let Some(path) = &args.android_update_source {
+        result.push("--android-update-source".into());
+        result.push(path.to_string_lossy().into_owned());
+    }
     for address in &args.dial {
         result.push("--dial".into());
         result.push(address.to_string());
@@ -1866,6 +1914,14 @@ fn begin_debugger_update_request(
     begin_component_update_request(swarm, updates, peer, UpdateComponent::Debugger, false);
 }
 
+fn begin_android_update_request(
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    updates: &mut UpdateManager,
+    peer: PeerId,
+) {
+    begin_component_update_request(swarm, updates, peer, UpdateComponent::Android, false);
+}
+
 fn begin_component_update_request(
     swarm: &mut libp2p::Swarm<Behaviour>,
     updates: &mut UpdateManager,
@@ -1896,6 +1952,7 @@ fn begin_component_update_request(
     let request = match component {
         UpdateComponent::Agent => UpdateRequest::Manifest,
         UpdateComponent::Debugger => UpdateRequest::DebuggerManifest,
+        UpdateComponent::Android => UpdateRequest::AndroidManifest,
     };
     swarm.behaviour_mut().updates.send_request(&peer, request);
     emit_event(
@@ -1914,6 +1971,10 @@ fn component_event(component: UpdateComponent, suffix: &str) -> &'static str {
         (UpdateComponent::Debugger, "PROGRESS") => "DEBUGGER_UPDATE_PROGRESS",
         (UpdateComponent::Debugger, "READY") => "DEBUGGER_UPDATE_READY",
         (UpdateComponent::Debugger, "FAILED") => "DEBUGGER_UPDATE_FAILED",
+        (UpdateComponent::Android, "REQUESTED") => "ANDROID_UPDATE_REQUESTED",
+        (UpdateComponent::Android, "PROGRESS") => "ANDROID_UPDATE_PROGRESS",
+        (UpdateComponent::Android, "READY") => "ANDROID_UPDATE_READY",
+        (UpdateComponent::Android, "FAILED") => "ANDROID_UPDATE_FAILED",
         _ => "UPDATE_FAILED",
     }
 }
@@ -1971,6 +2032,7 @@ fn handle_update_event(
                 let component_name = match component {
                     UpdateComponent::Agent => "agent",
                     UpdateComponent::Debugger => "debugger",
+                    UpdateComponent::Android => "android.apk",
                 };
                 let filename = format!(
                     "swagri-{component_name}-{}-{}.download",
@@ -2132,6 +2194,14 @@ fn serve_update_request(request: &UpdateRequest, updates: &UpdateManager) -> Upd
                 signed: source.signed.clone(),
             },
         ),
+        UpdateRequest::AndroidManifest => updates.android_source.as_ref().map_or_else(
+            || UpdateResponse::Error {
+                message: "this peer does not have an Android APK to share".into(),
+            },
+            |source| UpdateResponse::Manifest {
+                signed: source.signed.clone(),
+            },
+        ),
         UpdateRequest::Chunk {
             version,
             offset,
@@ -2149,6 +2219,16 @@ fn serve_update_request(request: &UpdateRequest, updates: &UpdateManager) -> Upd
         } => updates.debugger_source.as_ref().map_or_else(
             || UpdateResponse::Error {
                 message: "this peer does not have a Debugger binary to share".into(),
+            },
+            |source| serve_update_chunk(source, version, *offset, *length),
+        ),
+        UpdateRequest::AndroidChunk {
+            version,
+            offset,
+            length,
+        } => updates.android_source.as_ref().map_or_else(
+            || UpdateResponse::Error {
+                message: "this peer does not have an Android APK to share".into(),
             },
             |source| serve_update_chunk(source, version, *offset, *length),
         ),
@@ -2714,6 +2794,11 @@ fn request_next_update_chunk(swarm: &mut libp2p::Swarm<Behaviour>, updates: &Upd
                 offset: pending.received,
                 length: UPDATE_CHUNK_BYTES,
             },
+            UpdateComponent::Android => UpdateRequest::AndroidChunk {
+                version: pending.signed.manifest.version.clone(),
+                offset: pending.received,
+                length: UPDATE_CHUNK_BYTES,
+            },
         };
         swarm
             .behaviour_mut()
@@ -2728,8 +2813,13 @@ fn verify_update_manifest(
     component: UpdateComponent,
 ) -> Result<()> {
     let manifest = &signed.manifest;
-    if manifest.target_os != std::env::consts::OS || manifest.target_arch != std::env::consts::ARCH
-    {
+    let (expected_os, expected_arch) = match component {
+        UpdateComponent::Android => ("android", "aarch64"),
+        UpdateComponent::Agent | UpdateComponent::Debugger => {
+            (std::env::consts::OS, std::env::consts::ARCH)
+        }
+    };
+    if manifest.target_os != expected_os || manifest.target_arch != expected_arch {
         bail!("update target does not match this device");
     }
     if manifest.size == 0 || manifest.size > MAX_UPDATE_BYTES {
@@ -2738,7 +2828,9 @@ fn verify_update_manifest(
     if Version::parse(&manifest.version).is_err() {
         bail!("offered update version is invalid");
     }
-    if component == UpdateComponent::Agent && !is_newer_version(&manifest.version) {
+    if matches!(component, UpdateComponent::Agent | UpdateComponent::Android)
+        && !is_newer_version(&manifest.version)
+    {
         bail!("offered version is not newer than the running agent");
     }
     let public = identity::PublicKey::try_decode_protobuf(&signed.signer_public_key)
@@ -2749,6 +2841,7 @@ fn verify_update_manifest(
     let signing_payload = match component {
         UpdateComponent::Agent => manifest.signing_payload(),
         UpdateComponent::Debugger => manifest.debugger_signing_payload(),
+        UpdateComponent::Android => manifest.android_signing_payload(),
     };
     if !public.verify(&signing_payload, &signed.signature) {
         bail!("update manifest signature is invalid");
@@ -3163,6 +3256,10 @@ fn handle_command(
         "download-debugger-update" => match parse_peer(&mut parts) {
             Ok(peer) => begin_debugger_update_request(swarm, updates, peer),
             Err(error) => println!("Invalid Debugger update command: {error:#}"),
+        },
+        "download-android-update" => match parse_peer(&mut parts) {
+            Ok(peer) => begin_android_update_request(swarm, updates, peer),
+            Err(error) => println!("Invalid Android update command: {error:#}"),
         },
         "apply-update" => {
             let peer = parse_peer(&mut parts);
@@ -4222,6 +4319,7 @@ fn print_help() {
          update <peer-id>                  Download, verify, apply, and restart\n\
          download-update <peer-id>         Download and verify without applying\n\
          download-debugger-update <peer>   Download and verify the peer Debugger\n\
+         download-android-update <peer>    Download and verify the peer Android APK\n\
          connect <peer-id>                 Connect using a discovered address\n\
          dial <multiaddr>                  Connect using an explicit address\n\
          pause-resources                   Reject new compute work on this Agent\n\
@@ -4323,16 +4421,20 @@ mod android_jni {
         max_cpu_percent: jfloat,
         max_memory_percent: jfloat,
         artifact_quota_bytes: jlong,
+        android_update_source: JString<'_>,
     ) -> jboolean {
         let result = (|| -> Result<()> {
             let data_dir = PathBuf::from(java_string(&mut env, data_dir)?);
             let name = java_string(&mut env, name)?;
+            let android_update_source =
+                PathBuf::from(java_string(&mut env, android_update_source)?);
             start_mobile_agent(MobileAgentConfig {
                 name,
                 data_dir,
                 max_cpu_percent,
                 max_memory_percent,
                 artifact_quota_bytes: artifact_quota_bytes.max(1024 * 1024) as u64,
+                android_update_source,
             })
         })();
         match result {
@@ -4482,6 +4584,35 @@ mod tests {
         let signed = signed_manifest(&signer, "999.0.0");
 
         assert!(verify_update_manifest(peer, &signed, UpdateComponent::Debugger).is_err());
+    }
+
+    #[test]
+    fn agent_signature_cannot_be_replayed_as_android_update() {
+        let signer = identity::Keypair::generate_ed25519();
+        let peer = PeerId::from(signer.public());
+        let signed = signed_manifest(&signer, "999.0.0");
+
+        assert!(verify_update_manifest(peer, &signed, UpdateComponent::Android).is_err());
+    }
+
+    #[test]
+    fn accepts_signed_android_apk_for_arm64_target() {
+        let signer = identity::Keypair::generate_ed25519();
+        let peer = PeerId::from(signer.public());
+        let manifest = UpdateManifest {
+            version: "999.0.0".into(),
+            target_os: "android".into(),
+            target_arch: "aarch64".into(),
+            size: 64,
+            sha256_hex: "00".repeat(32),
+        };
+        let signed = SignedUpdateManifest {
+            signature: signer.sign(&manifest.android_signing_payload()).unwrap(),
+            signer_public_key: signer.public().encode_protobuf(),
+            manifest,
+        };
+
+        assert!(verify_update_manifest(peer, &signed, UpdateComponent::Android).is_ok());
     }
 
     #[test]

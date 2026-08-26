@@ -25,11 +25,15 @@ The installers do not require administrator privileges. They add Start Menu
 shortcuts; the Debugger also adds a desktop shortcut. Portable packages can be
 unzipped anywhere and run directly.
 
+Starting with 0.15.0-alpha, release Debugger packages may also contain
+`Swagri-Android-Agent.apk`. Its bundled Agent automatically offers that APK as
+a separately signed Android update to trusted peers.
+
 For development branches, open the repository's **Actions**, choose **Windows
 packages**, run the workflow, and download its `swagri-windows-x64` artifact.
 Tagged versions can later publish the same files as release assets.
 
-## Android 0.14.4-alpha test APK
+## Android 0.15.0-alpha test APK
 
 The **Android APK** workflow produces `app-debug.apk` in the
 `swagri-android-arm64` artifact. The first build supports 64-bit ARM devices on
@@ -51,8 +55,14 @@ distribution.
 Mobile contribution works without a charger at 50% battery or above. Below
 50%, external power is required. Unmetered Wi-Fi and a temperature below the
 severe Android thermal state are always required. The node remains available
-for identity/resource diagnostics while contribution is paused. Android update
-serving is disabled; new APKs require normal Android installation confirmation.
+for identity/resource diagnostics while contribution is paused. Android updates
+can be downloaded from a trusted peer with **Trust & download**. Swagri
+checks the peer signature and SHA-256, then Android checks the application ID,
+versionCode, and signing certificate. Tap **Install downloaded APK**, permit
+this installation source if Android asks, and confirm the system installer.
+Silent installation is intentionally not attempted. Version 0.15.0-alpha must
+be installed manually once on existing devices; later compatible APKs can use
+this P2P flow.
 
 To build locally, install JDK 17, Android SDK platform/build-tools 35, NDK
 27.2.12479018, Gradle 8.10.2, the Rust `aarch64-linux-android` target, and
@@ -343,6 +353,13 @@ GNU-LLVM build also needs its runtime copied into the packages:
 
 The script then includes `libunwind.dll` beside every executable that may need
 it. Standard MSVC builds can omit this parameter.
+
+To let a Debugger package distribute the matching Android build, pass the APK
+after assembling it:
+
+```powershell
+.\scripts\package-windows.ps1 -AndroidApk .\android\app\build\outputs\apk\debug\app-debug.apk
+```
 
 ## Can Swagri work without installers?
 

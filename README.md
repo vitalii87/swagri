@@ -78,6 +78,10 @@ to Windows GNU-LLVM builds, keeping both installers and portable archives
 self-contained on computers without a Rust or Visual Studio installation.
 Version 0.14.4-alpha statically links that runtime into GNU-LLVM executables,
 so Agent and Debugger P2P updates remain complete single-file replacements.
+Version 0.15.0-alpha adds signed Android APK distribution: a trusted Debugger
+with the release APK, or another updated Android node, can transfer the APK in
+verified chunks. Android checks the package identity, newer version, and app
+signing certificate before opening the mandatory system installer confirmation.
 
 ## Technology
 

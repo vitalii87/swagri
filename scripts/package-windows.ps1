@@ -1,7 +1,8 @@
 param(
-    [string]$Version = "0.14.4-alpha",
+    [string]$Version = "0.15.0-alpha",
     [string]$Configuration = "release",
-    [string]$RuntimeDirectory = ""
+    [string]$RuntimeDirectory = "",
+    [string]$AndroidApk = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -51,6 +52,8 @@ Trusted peers can list artifacts and resume-download only missing verified block
 Updates: both packages include swagri-updater.exe. Trust a specific Peer ID
 before receiving signed P2P updates. Debugger packages can share both Agent and
 GUI updates; headless packages share Agent only. Use trusted test networks.
+When Swagri-Android-Agent.apk is included, the Debugger Agent can also serve it
+to trusted Android peers; Android verifies it and requires install confirmation.
 Documentation: https://github.com/vitalii87/swagri
 "@
 Set-Content -LiteralPath (Join-Path $packageDirectory "README.txt") -Value $readme -Encoding utf8
@@ -68,6 +71,15 @@ if ($RuntimeDirectory) {
     $runtimeFiles += "libunwind.dll"
 }
 
+$androidApkSource = $null
+if ($AndroidApk) {
+    $androidApkSource = [System.IO.Path]::GetFullPath($AndroidApk)
+    if (-not (Test-Path -LiteralPath $androidApkSource -PathType Leaf)) {
+        throw "Android APK was supplied, but the file was not found: $androidApkSource"
+    }
+    Copy-Item -LiteralPath $androidApkSource -Destination (Join-Path $packageDirectory "Swagri-Android-Agent.apk") -Force
+}
+
 $agentPortable = Join-Path $outputDirectory "agent-portable"
 $debuggerPortable = Join-Path $outputDirectory "debugger-portable"
 New-Item -ItemType Directory -Path $agentPortable, $debuggerPortable -Force | Out-Null
@@ -79,6 +91,9 @@ Copy-Item -LiteralPath (Join-Path $buildDirectory "swagri-updater.exe") -Destina
 Copy-Item -LiteralPath (Join-Path $packageDirectory "README.txt") -Destination $agentPortable
 Copy-Item -LiteralPath (Join-Path $packageDirectory "README.txt") -Destination $debuggerPortable
 Copy-Item -LiteralPath (Join-Path $packageDirectory "swagri-debugger.version") -Destination $debuggerPortable
+if ($androidApkSource) {
+    Copy-Item -LiteralPath (Join-Path $packageDirectory "Swagri-Android-Agent.apk") -Destination $debuggerPortable -Force
+}
 foreach ($runtimeFile in $runtimeFiles) {
     Copy-Item -LiteralPath (Join-Path $packageDirectory $runtimeFile) -Destination $agentPortable -Force
     Copy-Item -LiteralPath (Join-Path $packageDirectory $runtimeFile) -Destination $debuggerPortable -Force
@@ -105,6 +120,9 @@ $defines = @(
 )
 if ($runtimeFiles -contains "libunwind.dll") {
     $defines += "/DRUNTIME_DLL=$packageDirectory\libunwind.dll"
+}
+if ($androidApkSource) {
+    $defines += "/DANDROID_APK=$packageDirectory\Swagri-Android-Agent.apk"
 }
 & $makensis @defines (Join-Path $repoRoot "packaging\windows\agent.nsi")
 if ($LASTEXITCODE -ne 0) { throw "Agent installer creation failed." }

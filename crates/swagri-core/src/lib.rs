@@ -188,6 +188,16 @@ impl UpdateManifest {
         )
         .into_bytes()
     }
+
+    /// Stable bytes used for an Android APK. A separate domain prevents an
+    /// Agent or Debugger binary from being replayed as a mobile application.
+    pub fn android_signing_payload(&self) -> Vec<u8> {
+        format!(
+            "swagri-android-update-v1\n{}\n{}\n{}\n{}\n{}\n",
+            self.version, self.target_os, self.target_arch, self.size, self.sha256_hex
+        )
+        .into_bytes()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -204,12 +214,18 @@ pub struct SignedUpdateManifest {
 pub enum UpdateRequest {
     Manifest,
     DebuggerManifest,
+    AndroidManifest,
     Chunk {
         version: String,
         offset: u64,
         length: u32,
     },
     DebuggerChunk {
+        version: String,
+        offset: u64,
+        length: u32,
+    },
+    AndroidChunk {
         version: String,
         offset: u64,
         length: u32,
@@ -522,6 +538,10 @@ mod tests {
         assert_eq!(
             manifest.debugger_signing_payload(),
             b"swagri-debugger-update-v1\n1.2.3\nwindows\nx86_64\n42\nabc\n"
+        );
+        assert_eq!(
+            manifest.android_signing_payload(),
+            b"swagri-android-update-v1\n1.2.3\nwindows\nx86_64\n42\nabc\n"
         );
     }
 

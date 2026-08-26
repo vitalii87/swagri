@@ -149,6 +149,15 @@ peer is marked disconnected. This prevents the Debugger's visible resource
 table and the matrix scheduler's eligible-worker set from disagreeing during a
 short transport reconnect.
 
+Version 0.15.0 extends the signed update protocol with a separate Android APK
+domain and request type. This prevents signed desktop Agent or Debugger bytes
+from being replayed as a mobile update. The receiving Android node verifies the
+peer identity signature, target, size, and SHA-256 while downloading; the app
+then asks Android PackageManager to verify the package ID, monotonically newer
+versionCode, and installed signing certificate. Only then is a read-only,
+single-file content URI granted to the system package installer. Android still
+requires explicit user confirmation and Swagri does not attempt silent install.
+
 ## Content-addressed artifact storage
 
 Version 0.12.0 deliberately separates storage correctness from network
