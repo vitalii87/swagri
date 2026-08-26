@@ -13,7 +13,9 @@ Section "Swagri Agent" SecAgent
   SetOutPath "$INSTDIR"
   File "${BUILD_DIR}\swagri-agent.exe"
   File "${BUILD_DIR}\swagri-updater.exe"
-  File /nonfatal "${PACKAGE_DIR}\libunwind.dll"
+!ifdef RUNTIME_DLL
+  File "${RUNTIME_DLL}"
+!endif
   File "${PACKAGE_DIR}\README.txt"
   WriteUninstaller "$INSTDIR\Uninstall.exe"
   CreateDirectory "$SMPROGRAMS\Swagri"

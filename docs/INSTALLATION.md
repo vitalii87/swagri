@@ -29,7 +29,7 @@ For development branches, open the repository's **Actions**, choose **Windows
 packages**, run the workflow, and download its `swagri-windows-x64` artifact.
 Tagged versions can later publish the same files as release assets.
 
-## Android 0.14.3-alpha test APK
+## Android 0.14.4-alpha test APK
 
 The **Android APK** workflow produces `app-debug.apk` in the
 `swagri-android-arm64` artifact. The first build supports 64-bit ARM devices on

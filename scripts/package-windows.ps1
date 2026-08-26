@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "0.14.3-alpha",
+    [string]$Version = "0.14.4-alpha",
     [string]$Configuration = "release",
     [string]$RuntimeDirectory = ""
 )
@@ -103,6 +103,9 @@ $defines = @(
     "/DOUTPUT_DIR=$outputDirectory",
     "/DPACKAGE_DIR=$packageDirectory"
 )
+if ($runtimeFiles -contains "libunwind.dll") {
+    $defines += "/DRUNTIME_DLL=$packageDirectory\libunwind.dll"
+}
 & $makensis @defines (Join-Path $repoRoot "packaging\windows\agent.nsi")
 if ($LASTEXITCODE -ne 0) { throw "Agent installer creation failed." }
 & $makensis @defines (Join-Path $repoRoot "packaging\windows\debugger.nsi")
