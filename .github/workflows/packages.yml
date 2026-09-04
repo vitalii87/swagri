@@ -53,7 +53,7 @@ jobs:
         run: gradle :app:assembleDebug --stacktrace
 
       - name: Upload APK for Windows packaging
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: swagri-android-package-input
           path: android/app/build/outputs/apk/debug/app-debug.apk
@@ -91,7 +91,7 @@ jobs:
         run: ./scripts/package-windows.ps1 -Version "0.15.0-alpha" -AndroidApk "./android-package/app-debug.apk"
 
       - name: Upload packages
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: swagri-windows-x64
           path: |
