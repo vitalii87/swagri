@@ -53,7 +53,7 @@ eframe = { version = "0.35", default-features = false, features = [
     "wayland",
     "x11",
 ] }
-egui_plot = "0.36"
+egui_plot = "0.37"
 sysinfo = "0.39"
 rfd = "0.15"
 semver = "1"
