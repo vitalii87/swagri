@@ -81,7 +81,7 @@ jobs:
         run: choco install nsis -y --no-progress
 
       - name: Download Android APK
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           name: swagri-android-package-input
           path: android-package
