@@ -99,7 +99,7 @@ class MainActivity : Activity() {
             setPadding(dp(14), dp(12), dp(14), dp(72))
         }
         page.addView(TextView(this).apply {
-            text = "Swagri Android Agent · 0.15.0-alpha"
+            text = "Swagri Android Agent · 0.16.0-alpha"
             textSize = 22f
             setTextColor(Color.rgb(16, 90, 68))
         })

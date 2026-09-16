@@ -134,6 +134,13 @@ remain future work. Other running tasks show elapsed wall time rather
 than an invented percentage. The database is Debugger-local and stores task
 metadata/results only; resource measurement persistence remains a later step.
 
+Version 0.16 re-ranks the job's available workers at each dispatch using the
+latest effective CPU score, which reflects load and contribution policy. A
+paused, stale, incompatible, or zero-capacity worker does not receive another
+chunk. The job fails explicitly if pending chunks have no eligible worker and
+no chunk is in flight. Running chunks are not preempted, and new peers do not
+join a job after its initial worker selection.
+
 Version 0.11.1 exposes two one-shot diagnostics through the local Agent stdin:
 fail or delay the next inbound matrix chunk. They are not network requests and
 cannot be armed by a remote peer. Non-matrix tasks do not consume them, and the

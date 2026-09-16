@@ -983,6 +983,8 @@ async fn run_agent(
                             &mut matrix_jobs,
                             &mut swarm,
                             local_peer_id,
+                            &resources.snapshot,
+                            &peer_resources,
                             &mut outbound_tasks,
                             &local_completed_tx,
                             &active_tasks,
@@ -1018,6 +1020,8 @@ async fn run_agent(
                     &mut matrix_jobs,
                     &mut swarm,
                     local_peer_id,
+                    &resources.snapshot,
+                    &peer_resources,
                     &mut outbound_tasks,
                     &local_completed_tx,
                     &active_tasks,
@@ -1053,6 +1057,8 @@ async fn run_agent(
                         &mut matrix_jobs,
                         &mut swarm,
                         local_peer_id,
+                        &resources.snapshot,
+                        &peer_resources,
                         &mut outbound_tasks,
                         &local_completed_tx,
                         &active_tasks,
@@ -1065,6 +1071,16 @@ async fn run_agent(
             _ = resource_tick.tick() => {
                 resources.refresh();
                 emit_resource_event("LOCAL_RESOURCES", &local_peer_id.to_string(), &resources.snapshot);
+                dispatch_matrix_jobs(
+                    &mut matrix_jobs,
+                    &mut swarm,
+                    local_peer_id,
+                    &resources.snapshot,
+                    &peer_resources,
+                    &mut outbound_tasks,
+                    &local_completed_tx,
+                    &active_tasks,
+                );
                 for peer in &connected_peers {
                     submit_task(
                         &mut swarm,
@@ -3894,13 +3910,49 @@ struct MatrixDispatch {
     chunk: MatrixChunkPlan,
 }
 
-fn take_matrix_dispatches(job: &mut DistributedMatrixJob) -> Vec<MatrixDispatch> {
+fn matrix_worker_score(
+    worker: MatrixWorker,
+    resources: &ResourceSnapshot,
+    peer_resources: &BTreeMap<PeerId, PeerResourceObservation>,
+) -> Option<f64> {
+    let snapshot = match worker {
+        MatrixWorker::Local => resources,
+        MatrixWorker::Remote(peer) => {
+            let observation = peer_resources.get(&peer)?;
+            if observation.received_at.elapsed() > REMOTE_RESOURCE_MAX_AGE
+                || observation.protocol_version < NODE_PROTOCOL_VERSION
+            {
+                return None;
+            }
+            &observation.snapshot
+        }
+    };
+    (!snapshot.contribution_paused
+        && snapshot.effective_cpu_score.is_finite()
+        && snapshot.effective_cpu_score > 0.0)
+        .then_some(snapshot.effective_cpu_score)
+}
+
+fn take_matrix_dispatches(
+    job: &mut DistributedMatrixJob,
+    resources: &ResourceSnapshot,
+    peer_resources: &BTreeMap<PeerId, PeerResourceObservation>,
+) -> Vec<MatrixDispatch> {
     let mut dispatches = Vec::new();
-    while let Some(worker) = job.available_workers.pop_front() {
+    let mut ranked = job
+        .available_workers
+        .iter()
+        .filter_map(|worker| {
+            matrix_worker_score(*worker, resources, peer_resources).map(|score| (*worker, score))
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| right.1.total_cmp(&left.1));
+    for (worker, _) in ranked {
         let Some(mut chunk) = job.pending.pop_front() else {
-            job.available_workers.push_front(worker);
             break;
         };
+        job.available_workers
+            .retain(|candidate| *candidate != worker);
         chunk.attempts += 1;
         job.in_flight += 1;
         let task_id = if chunk.attempts == 1 {
@@ -3928,17 +3980,38 @@ fn take_matrix_dispatches(job: &mut DistributedMatrixJob) -> Vec<MatrixDispatch>
     dispatches
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_matrix_jobs(
     matrix_jobs: &mut BTreeMap<String, DistributedMatrixJob>,
     swarm: &mut libp2p::Swarm<Behaviour>,
     local_peer_id: PeerId,
+    resources: &ResourceSnapshot,
+    peer_resources: &BTreeMap<PeerId, PeerResourceObservation>,
     outbound_tasks: &mut HashMap<request_response::OutboundRequestId, OutboundTaskMeta>,
     local_completed_tx: &mpsc::UnboundedSender<CompletedLocalTask>,
     active_tasks: &Arc<AtomicU32>,
 ) {
     let mut dispatches = Vec::new();
+    let mut unavailable = Vec::new();
     for job in matrix_jobs.values_mut() {
-        dispatches.extend(take_matrix_dispatches(job));
+        dispatches.extend(take_matrix_dispatches(job, resources, peer_resources));
+        if !job.pending.is_empty()
+            && job.in_flight == 0
+            && !job
+                .available_workers
+                .iter()
+                .any(|worker| matrix_worker_score(*worker, resources, peer_resources).is_some())
+        {
+            unavailable.push(job.id.clone());
+        }
+    }
+    for job_id in unavailable {
+        fail_matrix_job(
+            &job_id,
+            "no eligible matrix worker remains after resource or policy changes",
+            local_peer_id,
+            matrix_jobs,
+        );
     }
 
     for dispatch in dispatches {
@@ -4847,7 +4920,11 @@ mod tests {
         };
 
         for expected in 1..=8 {
-            let dispatches = take_matrix_dispatches(&mut job);
+            let dispatches = take_matrix_dispatches(
+                &mut job,
+                &resource_snapshot(100.0, false),
+                &BTreeMap::new(),
+            );
             assert_eq!(dispatches.len(), 1);
             assert_eq!(
                 dispatches[0].task_id,
@@ -4860,6 +4937,132 @@ mod tests {
 
         assert!(job.pending.is_empty());
         assert_eq!(job.available_workers, VecDeque::from([MatrixWorker::Local]));
+    }
+
+    #[test]
+    fn matrix_dispatch_reranks_workers_from_current_capacity() {
+        let peer = PeerId::from(identity::Keypair::generate_ed25519().public());
+        let mut job = DistributedMatrixJob {
+            id: "adaptive-matrix".into(),
+            size: 32,
+            total_chunks: 2,
+            completed_chunks: 0,
+            checksum: 0,
+            started_at: Instant::now(),
+            pending: VecDeque::from([
+                MatrixChunkPlan {
+                    index: 0,
+                    row_start: 0,
+                    row_end: 16,
+                    attempts: 0,
+                },
+                MatrixChunkPlan {
+                    index: 1,
+                    row_start: 16,
+                    row_end: 32,
+                    attempts: 0,
+                },
+            ]),
+            available_workers: VecDeque::from([MatrixWorker::Local, MatrixWorker::Remote(peer)]),
+            in_flight: 0,
+        };
+        let mut observations = BTreeMap::from([(
+            peer,
+            PeerResourceObservation {
+                snapshot: resource_snapshot(200.0, false),
+                received_at: Instant::now(),
+                protocol_version: NODE_PROTOCOL_VERSION,
+            },
+        )]);
+        let first =
+            take_matrix_dispatches(&mut job, &resource_snapshot(100.0, false), &observations);
+        assert_eq!(
+            first.iter().map(|item| item.worker).collect::<Vec<_>>(),
+            vec![MatrixWorker::Remote(peer), MatrixWorker::Local]
+        );
+
+        job.available_workers
+            .extend(first.iter().map(|item| item.worker));
+        job.pending = VecDeque::from([
+            MatrixChunkPlan {
+                index: 0,
+                row_start: 0,
+                row_end: 16,
+                attempts: 0,
+            },
+            MatrixChunkPlan {
+                index: 1,
+                row_start: 16,
+                row_end: 32,
+                attempts: 0,
+            },
+        ]);
+        observations
+            .get_mut(&peer)
+            .unwrap()
+            .snapshot
+            .effective_cpu_score = 50.0;
+        let second =
+            take_matrix_dispatches(&mut job, &resource_snapshot(100.0, false), &observations);
+        assert_eq!(
+            second.iter().map(|item| item.worker).collect::<Vec<_>>(),
+            vec![MatrixWorker::Local, MatrixWorker::Remote(peer)]
+        );
+    }
+
+    #[test]
+    fn matrix_dispatch_skips_paused_and_stale_workers() {
+        let peer = PeerId::from(identity::Keypair::generate_ed25519().public());
+        let mut job = DistributedMatrixJob {
+            id: "policy-matrix".into(),
+            size: 32,
+            total_chunks: 1,
+            completed_chunks: 0,
+            checksum: 0,
+            started_at: Instant::now(),
+            pending: VecDeque::from([MatrixChunkPlan {
+                index: 0,
+                row_start: 0,
+                row_end: 32,
+                attempts: 0,
+            }]),
+            available_workers: VecDeque::from([MatrixWorker::Local, MatrixWorker::Remote(peer)]),
+            in_flight: 0,
+        };
+        let mut observations = BTreeMap::from([(
+            peer,
+            PeerResourceObservation {
+                snapshot: resource_snapshot(200.0, false),
+                received_at: Instant::now() - REMOTE_RESOURCE_MAX_AGE - Duration::from_secs(1),
+                protocol_version: NODE_PROTOCOL_VERSION,
+            },
+        )]);
+        let dispatches =
+            take_matrix_dispatches(&mut job, &resource_snapshot(100.0, false), &observations);
+        assert_eq!(dispatches.len(), 1);
+        assert_eq!(dispatches[0].worker, MatrixWorker::Local);
+        assert_eq!(
+            job.available_workers,
+            VecDeque::from([MatrixWorker::Remote(peer)])
+        );
+
+        job.pending.push_back(MatrixChunkPlan {
+            index: 1,
+            row_start: 0,
+            row_end: 32,
+            attempts: 0,
+        });
+        observations.get_mut(&peer).unwrap().received_at = Instant::now();
+        observations
+            .get_mut(&peer)
+            .unwrap()
+            .snapshot
+            .contribution_paused = true;
+        assert!(
+            take_matrix_dispatches(&mut job, &resource_snapshot(0.0, true), &observations)
+                .is_empty()
+        );
+        assert_eq!(job.pending.len(), 1);
     }
 
     #[test]
@@ -4900,7 +5103,8 @@ mod tests {
         let job = jobs.get_mut("distributed-retry").unwrap();
         assert_eq!(job.in_flight, 0);
         assert_eq!(job.pending, VecDeque::from([chunk]));
-        let dispatches = take_matrix_dispatches(job);
+        let dispatches =
+            take_matrix_dispatches(job, &resource_snapshot(100.0, false), &BTreeMap::new());
         assert_eq!(dispatches.len(), 1);
         assert_eq!(dispatches[0].worker, MatrixWorker::Local);
         assert_eq!(dispatches[0].chunk.attempts, 2);
