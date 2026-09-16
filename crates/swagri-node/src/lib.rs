@@ -3980,6 +3980,7 @@ fn take_matrix_dispatches(
     dispatches
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_matrix_jobs(
     matrix_jobs: &mut BTreeMap<String, DistributedMatrixJob>,
     swarm: &mut libp2p::Swarm<Behaviour>,
