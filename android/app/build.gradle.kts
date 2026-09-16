@@ -16,8 +16,8 @@ android {
         applicationId = "com.swagri.android"
         minSdk = 29
         targetSdk = 35
-        versionCode = 19
-        versionName = "0.15.0-alpha"
+        versionCode = 20
+        versionName = "0.16.0-alpha"
 
         ndk {
             abiFilters += "arm64-v8a"

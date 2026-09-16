@@ -88,13 +88,13 @@ jobs:
 
       - name: Create packages
         shell: pwsh
-        run: ./scripts/package-windows.ps1 -Version "0.15.0-alpha" -AndroidApk "./android-package/app-debug.apk"
+        run: ./scripts/package-windows.ps1 -Version "0.16.0-alpha" -AndroidApk "./android-package/app-debug.apk"
 
       - name: Upload packages
         uses: actions/upload-artifact@v5
         with:
           name: swagri-windows-x64
           path: |
-            dist/0.15.0-alpha/*.exe
-            dist/0.15.0-alpha/*.zip
+            dist/0.16.0-alpha/*.exe
+            dist/0.16.0-alpha/*.zip
           if-no-files-found: error

@@ -33,7 +33,7 @@ For development branches, open the repository's **Actions**, choose **Windows
 packages**, run the workflow, and download its `swagri-windows-x64` artifact.
 Tagged versions can later publish the same files as release assets.
 
-## Android 0.15.0-alpha test APK
+## Android 0.16.0-alpha test APK
 
 The **Android APK** workflow produces `app-debug.apk` in the
 `swagri-android-arm64` artifact. The first build supports 64-bit ARM devices on
@@ -60,9 +60,9 @@ can be downloaded from a trusted peer with **Trust & download**. Swagri
 checks the peer signature and SHA-256, then Android checks the application ID,
 versionCode, and signing certificate. Tap **Install downloaded APK**, permit
 this installation source if Android asks, and confirm the system installer.
-Silent installation is intentionally not attempted. Version 0.15.0-alpha must
-be installed manually once on existing devices; later compatible APKs can use
-this P2P flow.
+Silent installation is intentionally not attempted. Devices older than
+0.15.0-alpha must install a compatible APK manually once; later compatible
+APKs, including 0.16.0-alpha, can use this P2P flow.
 
 To build locally, install JDK 17, Android SDK platform/build-tools 35, NDK
 27.2.12479018, Gradle 8.10.2, the Rust `aarch64-linux-android` target, and

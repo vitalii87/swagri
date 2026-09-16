@@ -82,6 +82,10 @@ Version 0.15.0-alpha adds signed Android APK distribution: a trusted Debugger
 with the release APK, or another updated Android node, can transfer the APK in
 verified chunks. Android checks the package identity, newer version, and app
 signing certificate before opening the mandatory system installer confirmation.
+Version 0.16.0-alpha re-ranks available matrix workers before each chunk using
+fresh effective-capacity observations. Paused, stale, incompatible, or zero-
+capacity workers receive no new chunks; a job fails explicitly if no eligible
+worker remains. This does not preempt chunks already running.
 
 ## Technology
 

@@ -45,7 +45,7 @@ data.
 - [x] local-first placement for bounded CPU benchmark and matrix tasks;
 - [x] operator-visible in-memory task lifecycle and result history;
 - [x] persistent local SQLite history for task lifecycle and results;
-- thermal/load-aware chunk assignment;
+- [x] Re-rank available matrix workers from fresh load/policy snapshots before each chunk assignment;
 - broader SQLite event and resource-measurement store;
 - benchmark suite for scheduler decisions.
 
