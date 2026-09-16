@@ -61,8 +61,14 @@ checks the peer signature and SHA-256, then Android checks the application ID,
 versionCode, and signing certificate. Tap **Install downloaded APK**, permit
 this installation source if Android asks, and confirm the system installer.
 Silent installation is intentionally not attempted. Devices older than
-0.15.0-alpha must install a compatible APK manually once; later compatible
-APKs, including 0.16.0-alpha, can use this P2P flow.
+0.15.0-alpha must install a compatible APK manually once. The current CI builds
+debug APKs with runner-local signing keys, so APKs from different CI runs are
+not guaranteed to have the same certificate. In particular, a 0.16.0-alpha
+debug APK may download successfully through P2P but cannot replace an installed
+0.15.0-alpha debug APK signed by a different key. Do not uninstall an Android
+installation without first preserving its identity and other app data. A stable,
+secret-backed release signing key is required before cross-release Android P2P
+installation can be claimed as supported.
 
 To build locally, install JDK 17, Android SDK platform/build-tools 35, NDK
 27.2.12479018, Gradle 8.10.2, the Rust `aarch64-linux-android` target, and

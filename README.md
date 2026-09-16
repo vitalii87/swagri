@@ -85,7 +85,9 @@ signing certificate before opening the mandatory system installer confirmation.
 Version 0.16.0-alpha re-ranks available matrix workers before each chunk using
 fresh effective-capacity observations. Paused, stale, incompatible, or zero-
 capacity workers receive no new chunks; a job fails explicitly if no eligible
-worker remains. This does not preempt chunks already running.
+worker remains. This does not preempt chunks already running. CI-built Android
+debug APKs currently use ephemeral signing keys, so cross-release P2P APK
+installation is not yet supported without a stable release signing key.
 
 ## Technology
 
